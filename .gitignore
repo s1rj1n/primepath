@@ -1,0 +1,27 @@
+# Xcode
+build/
+DerivedData/
+*.xcuserdata
+*.xcworkspace
+xcuserdata/
+*.pbxuser
+*.mode1v3
+*.mode2v3
+*.perspectivev3
+*.moved-aside
+
+# Build artifacts
+*.o
+*.d
+*.app
+*.dmg
+*.dSYM/
+test_engine
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Distribution
+dist/

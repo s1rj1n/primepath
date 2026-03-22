@@ -1,0 +1,293 @@
+// !$*UTF8*$!
+{
+	archiveVersion = 1;
+	classes = {
+	};
+	objectVersion = 56;
+	objects = {
+
+/* Begin PBXBuildFile section */
+		AA00000100000001 /* main.m in Sources */ = {isa = PBXBuildFile; fileRef = BB00000100000001; };
+		AA00000200000002 /* AppDelegate.mm in Sources */ = {isa = PBXBuildFile; fileRef = BB00000200000002; };
+		AA00000300000003 /* PrimeEngine.cpp in Sources */ = {isa = PBXBuildFile; fileRef = BB00000300000003; };
+		AA00000400000004 /* Cocoa.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = BB00000600000006; };
+		AA00000500000005 /* Metal.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = BB00001000000010; };
+		AA00000700000007 /* MetalCompute.mm in Sources */ = {isa = PBXBuildFile; fileRef = BB00000900000009; };
+		AA00000800000008 /* MetalBridge.mm in Sources */ = {isa = PBXBuildFile; fileRef = BB00001100000011; };
+		AA00000900000009 /* TaskManager.cpp in Sources */ = {isa = PBXBuildFile; fileRef = BB00000B0000000B; };
+		AA00001000000010 /* PrimeShaders.metal in Sources */ = {isa = PBXBuildFile; fileRef = BB00000D0000000D; };
+		AA00001100000011 /* GPUBackend.cpp in Sources */ = {isa = PBXBuildFile; fileRef = BB00001200000012; };
+		AA00001200000012 /* MetalBackend.mm in Sources */ = {isa = PBXBuildFile; fileRef = BB00001300000013; };
+		AA00001300000013 /* MatrixSieve.cpp in Sources */ = {isa = PBXBuildFile; fileRef = BB00001500000015; };
+		AA00001400000014 /* Accelerate.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = BB00001800000018; };
+		AA00001500000015 /* Benchmark.cpp in Sources */ = {isa = PBXBuildFile; fileRef = BB0000220000001C; };
+/* End PBXBuildFile section */
+
+/* Begin PBXFileReference section */
+		BB00000100000001 /* main.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = main.m; sourceTree = "<group>"; };
+		BB00000200000002 /* AppDelegate.mm */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.objcpp; path = AppDelegate.mm; sourceTree = "<group>"; };
+		BB00000300000003 /* PrimeEngine.cpp */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.cpp; path = PrimeEngine.cpp; sourceTree = "<group>"; };
+		BB00000400000004 /* PrimeEngine.hpp */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.h; path = PrimeEngine.hpp; sourceTree = "<group>"; };
+		BB00000500000005 /* AppDelegate.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = AppDelegate.h; sourceTree = "<group>"; };
+		BB00000600000006 /* Cocoa.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = Cocoa.framework; path = System/Library/Frameworks/Cocoa.framework; sourceTree = SDKROOT; };
+		BB00000700000007 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
+		BB00000800000008 /* MetalCompute.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = MetalCompute.h; sourceTree = "<group>"; };
+		BB00000900000009 /* MetalCompute.mm */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.objcpp; path = MetalCompute.mm; sourceTree = "<group>"; };
+		BB00000A0000000A /* TaskManager.hpp */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.h; path = TaskManager.hpp; sourceTree = "<group>"; };
+		BB00000B0000000B /* TaskManager.cpp */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.cpp; path = TaskManager.cpp; sourceTree = "<group>"; };
+		BB00000D0000000D /* PrimeShaders.metal */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.metal; path = PrimeShaders.metal; sourceTree = "<group>"; };
+		BB00000E0000000E /* PrimePath.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = PrimePath.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		BB00001000000010 /* Metal.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = Metal.framework; path = System/Library/Frameworks/Metal.framework; sourceTree = SDKROOT; };
+		BB00001100000011 /* MetalBridge.mm */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.objcpp; path = MetalBridge.mm; sourceTree = "<group>"; };
+		BB00001200000012 /* GPUBackend.cpp */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.cpp; path = GPUBackend.cpp; sourceTree = "<group>"; };
+		BB00001300000013 /* MetalBackend.mm */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.objcpp; path = MetalBackend.mm; sourceTree = "<group>"; };
+		BB00001400000014 /* GPUBackend.hpp */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.h; path = GPUBackend.hpp; sourceTree = "<group>"; };
+		BB00001500000015 /* MatrixSieve.cpp */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.cpp; path = MatrixSieve.cpp; sourceTree = "<group>"; };
+		BB00001600000016 /* MatrixSieve.hpp */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.h; path = MatrixSieve.hpp; sourceTree = "<group>"; };
+		BB00001700000017 /* ThreadPool.hpp */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.h; path = ThreadPool.hpp; sourceTree = "<group>"; };
+		BB00001900000019 /* KnownPrimes.hpp */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.h; path = KnownPrimes.hpp; sourceTree = "<group>"; };
+		BB0000200000001A /* PseudoprimePredictor.hpp */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.h; path = PseudoprimePredictor.hpp; sourceTree = "<group>"; };
+		BB0000210000001B /* EvenShadow.hpp */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.h; path = EvenShadow.hpp; sourceTree = "<group>"; };
+		BB00001800000018 /* Accelerate.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = Accelerate.framework; path = System/Library/Frameworks/Accelerate.framework; sourceTree = SDKROOT; };
+		BB0000220000001C /* Benchmark.cpp */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.cpp; path = Benchmark.cpp; sourceTree = "<group>"; };
+		BB0000230000001D /* Benchmark.hpp */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.h; path = Benchmark.hpp; sourceTree = "<group>"; };
+/* End PBXFileReference section */
+
+/* Begin PBXFrameworksBuildPhase section */
+		CC00000100000001 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				AA00000400000004 /* Cocoa.framework in Frameworks */,
+				AA00000500000005 /* Metal.framework in Frameworks */,
+				AA00001400000014 /* Accelerate.framework in Frameworks */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXFrameworksBuildPhase section */
+
+/* Begin PBXGroup section */
+		DD00000100000001 = {
+			isa = PBXGroup;
+			children = (
+				DD00000200000002 /* PrimePath */,
+				DD00000300000003 /* Frameworks */,
+				DD00000400000004 /* Products */,
+			);
+			sourceTree = "<group>";
+		};
+		DD00000200000002 /* PrimePath */ = {
+			isa = PBXGroup;
+			children = (
+				BB00000100000001 /* main.m */,
+				BB00000500000005 /* AppDelegate.h */,
+				BB00000200000002 /* AppDelegate.mm */,
+				BB00000400000004 /* PrimeEngine.hpp */,
+				BB00000300000003 /* PrimeEngine.cpp */,
+				BB00000800000008 /* MetalCompute.h */,
+				BB00000900000009 /* MetalCompute.mm */,
+				BB00001100000011 /* MetalBridge.mm */,
+				BB00000A0000000A /* TaskManager.hpp */,
+				BB00000B0000000B /* TaskManager.cpp */,
+				BB00000D0000000D /* PrimeShaders.metal */,
+				BB00001400000014 /* GPUBackend.hpp */,
+				BB00001200000012 /* GPUBackend.cpp */,
+				BB00001300000013 /* MetalBackend.mm */,
+				BB00001600000016 /* MatrixSieve.hpp */,
+				BB00001500000015 /* MatrixSieve.cpp */,
+				BB00001700000017 /* ThreadPool.hpp */,
+				BB00001900000019 /* KnownPrimes.hpp */,
+				BB0000200000001A /* PseudoprimePredictor.hpp */,
+				BB0000210000001B /* EvenShadow.hpp */,
+				BB0000230000001D /* Benchmark.hpp */,
+				BB0000220000001C /* Benchmark.cpp */,
+				BB00000700000007 /* Info.plist */,
+			);
+			path = PrimePath;
+			sourceTree = "<group>";
+		};
+		DD00000300000003 /* Frameworks */ = {
+			isa = PBXGroup;
+			children = (
+				BB00000600000006 /* Cocoa.framework */,
+				BB00001000000010 /* Metal.framework */,
+				BB00001800000018 /* Accelerate.framework */,
+			);
+			name = Frameworks;
+			sourceTree = "<group>";
+		};
+		DD00000400000004 /* Products */ = {
+			isa = PBXGroup;
+			children = (
+				BB00000E0000000E /* PrimePath.app */,
+			);
+			name = Products;
+			sourceTree = "<group>";
+		};
+/* End PBXGroup section */
+
+/* Begin PBXNativeTarget section */
+		EE00000100000001 /* PrimePath */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = GG00000100000001;
+			buildPhases = (
+				FF00000100000001 /* Sources */,
+				CC00000100000001 /* Frameworks */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			name = PrimePath;
+			productName = PrimePath;
+			productReference = BB00000E0000000E /* PrimePath.app */;
+			productType = "com.apple.product-type.application";
+		};
+/* End PBXNativeTarget section */
+
+/* Begin PBXProject section */
+		HH00000100000001 /* Project object */ = {
+			isa = PBXProject;
+			attributes = {
+				BuildIndependentTargetsInParallel = 1;
+				LastUpgradeCheck = 1500;
+			};
+			buildConfigurationList = GG00000200000002;
+			compatibilityVersion = "Xcode 14.0";
+			developmentRegion = en;
+			hasScannedForEncodings = 0;
+			knownRegions = (
+				en,
+				Base,
+			);
+			mainGroup = DD00000100000001;
+			productRefGroup = DD00000400000004 /* Products */;
+			projectDirPath = "";
+			projectRoot = "";
+			targets = (
+				EE00000100000001 /* PrimePath */,
+			);
+		};
+/* End PBXProject section */
+
+/* Begin PBXSourcesBuildPhase section */
+		FF00000100000001 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				AA00000100000001 /* main.m in Sources */,
+				AA00000200000002 /* AppDelegate.mm in Sources */,
+				AA00000300000003 /* PrimeEngine.cpp in Sources */,
+				AA00000700000007 /* MetalCompute.mm in Sources */,
+				AA00000800000008 /* MetalBridge.mm in Sources */,
+				AA00000900000009 /* TaskManager.cpp in Sources */,
+				AA00001000000010 /* PrimeShaders.metal in Sources */,
+				AA00001100000011 /* GPUBackend.cpp in Sources */,
+				AA00001200000012 /* MetalBackend.mm in Sources */,
+				AA00001300000013 /* MatrixSieve.cpp in Sources */,
+				AA00001500000015 /* Benchmark.cpp in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXSourcesBuildPhase section */
+
+/* Begin XCBuildConfiguration section */
+		II00000100000001 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				CLANG_CXX_LANGUAGE_STANDARD = "c++17";
+				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				COPY_PHASE_STRIP = NO;
+				DEBUG_INFORMATION_FORMAT = dwarf;
+				GCC_OPTIMIZATION_LEVEL = 0;
+				GCC_PREPROCESSOR_DEFINITIONS = (
+					"DEBUG=1",
+					"$(inherited)",
+				);
+				MACOSX_DEPLOYMENT_TARGET = 13.0;
+				MTL_ENABLE_DEBUG_INFO = INCLUDE_SOURCE;
+				ONLY_ACTIVE_ARCH = YES;
+				SDKROOT = macosx;
+			};
+			name = Debug;
+		};
+		II00000200000002 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				CLANG_CXX_LANGUAGE_STANDARD = "c++17";
+				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				COPY_PHASE_STRIP = NO;
+				DEBUG_INFORMATION_FORMAT = "dwarf-with-dsym";
+				ENABLE_NS_ASSERTIONS = NO;
+				GCC_OPTIMIZATION_LEVEL = 3;
+				MACOSX_DEPLOYMENT_TARGET = 13.0;
+				MTL_ENABLE_DEBUG_INFO = NO;
+				SDKROOT = macosx;
+				MTL_FAST_MATH = YES;
+			};
+			name = Release;
+		};
+		II00000300000003 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				CODE_SIGN_STYLE = Automatic;
+				COMBINE_HIDPI_IMAGES = YES;
+				INFOPLIST_FILE = PrimePath/Info.plist;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/../Frameworks",
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = com.primes.PrimePath;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				MTL_HEADER_SEARCH_PATHS = "$(SRCROOT)/PrimePath";
+			};
+			name = Debug;
+		};
+		II00000400000004 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				CODE_SIGN_STYLE = Automatic;
+				COMBINE_HIDPI_IMAGES = YES;
+				INFOPLIST_FILE = PrimePath/Info.plist;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/../Frameworks",
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = com.primes.PrimePath;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				MTL_HEADER_SEARCH_PATHS = "$(SRCROOT)/PrimePath";
+			};
+			name = Release;
+		};
+/* End XCBuildConfiguration section */
+
+/* Begin XCConfigurationList section */
+		GG00000100000001 /* Build configuration list for PBXNativeTarget "PrimePath" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				II00000300000003 /* Debug */,
+				II00000400000004 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		GG00000200000002 /* Build configuration list for PBXProject "PrimePath" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				II00000100000001 /* Debug */,
+				II00000200000002 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+/* End XCConfigurationList section */
+
+	};
+	rootObject = HH00000100000001 /* Project object */;
+}
