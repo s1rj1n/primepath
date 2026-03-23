@@ -6,6 +6,7 @@
 #import "Benchmark.hpp"
 #include <string>
 #include <mach/mach.h>
+#include <sys/resource.h>
 #include <thread>
 #include <atomic>
 #include <algorithm>
@@ -21,6 +22,131 @@ static NSString *formatNumber(uint64_t n) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════
+// EQBarView — Graphic equalizer-style vertical bar visualizer
+// ═══════════════════════════════════════════════════════════════════════
+
+static const int EQ_HISTORY = 32; // number of vertical bars (time history)
+
+@interface EQBarView : NSView {
+    double _history[EQ_HISTORY];
+    double _peaks[EQ_HISTORY];
+    int _head;
+    NSString *_title;
+    NSString *_detail;
+    NSColor *_barColor;
+    NSColor *_peakColor;
+}
+- (instancetype)initWithFrame:(NSRect)frame title:(NSString *)title color:(NSColor *)color;
+- (void)pushValue:(double)pct; // 0-100
+- (void)setDetail:(NSString *)detail;
+@end
+
+@implementation EQBarView
+
+- (instancetype)initWithFrame:(NSRect)frame title:(NSString *)title color:(NSColor *)color {
+    self = [super initWithFrame:frame];
+    if (self) {
+        _title = title;
+        _detail = @"";
+        _barColor = color;
+        _peakColor = [NSColor colorWithSRGBRed:1.0 green:1.0 blue:1.0 alpha:0.7];
+        _head = 0;
+        memset(_history, 0, sizeof(_history));
+        memset(_peaks, 0, sizeof(_peaks));
+    }
+    return self;
+}
+
+- (void)pushValue:(double)pct {
+    pct = fmax(0, fmin(100, pct));
+    _history[_head] = pct;
+    // Peak hold with decay
+    if (pct >= _peaks[_head]) {
+        _peaks[_head] = pct;
+    }
+    _head = (_head + 1) % EQ_HISTORY;
+    // Decay all peaks
+    for (int i = 0; i < EQ_HISTORY; i++) {
+        _peaks[i] *= 0.97;
+    }
+    [self setNeedsDisplay:YES];
+}
+
+- (void)setDetail:(NSString *)detail {
+    _detail = detail;
+    [self setNeedsDisplay:YES];
+}
+
+- (void)drawRect:(NSRect)dirtyRect {
+    NSRect b = self.bounds;
+
+    // Dark background
+    [[NSColor colorWithSRGBRed:0.08 green:0.08 blue:0.12 alpha:1.0] set];
+    NSBezierPath *bg = [NSBezierPath bezierPathWithRoundedRect:b xRadius:4 yRadius:4];
+    [bg fill];
+
+    // Title (top-left)
+    NSDictionary *titleAttrs = @{
+        NSFontAttributeName: [NSFont boldSystemFontOfSize:8],
+        NSForegroundColorAttributeName: [NSColor colorWithWhite:0.7 alpha:1.0]
+    };
+    [_title drawAtPoint:NSMakePoint(b.origin.x + 4, b.origin.y + b.size.height - 12) withAttributes:titleAttrs];
+
+    // Detail (top-right)
+    if (_detail.length > 0) {
+        NSDictionary *detailAttrs = @{
+            NSFontAttributeName: [NSFont monospacedSystemFontOfSize:7 weight:NSFontWeightRegular],
+            NSForegroundColorAttributeName: [NSColor colorWithWhite:0.5 alpha:1.0]
+        };
+        NSSize ds = [_detail sizeWithAttributes:detailAttrs];
+        [_detail drawAtPoint:NSMakePoint(b.origin.x + b.size.width - ds.width - 4,
+            b.origin.y + b.size.height - 11) withAttributes:detailAttrs];
+    }
+
+    // Draw EQ bars
+    CGFloat barArea = b.size.width - 8;  // padding
+    CGFloat barH = b.size.height - 16;   // leave room for title
+    CGFloat barW = barArea / EQ_HISTORY;
+    CGFloat gap = fmax(1.0, barW * 0.15);
+    barW -= gap;
+    if (barW < 1) barW = 1;
+
+    for (int i = 0; i < EQ_HISTORY; i++) {
+        int idx = (_head + i) % EQ_HISTORY;
+        double val = _history[idx];
+        double peak = _peaks[idx];
+
+        CGFloat x = b.origin.x + 4 + i * (barW + gap);
+        CGFloat h = (val / 100.0) * barH;
+        CGFloat peakY = (peak / 100.0) * barH;
+
+        // Color gradient: green -> yellow -> red based on value
+        NSColor *c;
+        if (val > 80) {
+            c = [NSColor colorWithSRGBRed:0.9 green:0.2 blue:0.15 alpha:0.9];
+        } else if (val > 50) {
+            CGFloat t = (val - 50) / 30.0;
+            c = [NSColor colorWithSRGBRed:0.2 + 0.7*t green:0.8 - 0.3*t blue:0.1 alpha:0.9];
+        } else {
+            c = [_barColor colorWithAlphaComponent:0.7 + 0.3 * (val / 50.0)];
+        }
+        [c set];
+
+        NSRect barRect = NSMakeRect(x, b.origin.y + 2, barW, fmax(1, h));
+        [[NSBezierPath bezierPathWithRoundedRect:barRect xRadius:1 yRadius:1] fill];
+
+        // Peak indicator (thin line)
+        if (peak > 2 && peakY > h + 2) {
+            [_peakColor set];
+            NSRect peakRect = NSMakeRect(x, b.origin.y + 2 + peakY - 1, barW, 1.5);
+            [NSBezierPath fillRect:peakRect];
+        }
+    }
+}
+
+@end
+
+// ═══════════════════════════════════════════════════════════════════════
 // PrimePath v0.5 — Metal GPU + Multi-Core Prime Discovery
 // ═══════════════════════════════════════════════════════════════════════
 
@@ -34,6 +160,9 @@ static NSString *formatNumber(uint64_t n) {
     // CPU monitoring delta state
     uint64_t _prevIdleTicks;
     uint64_t _prevTotalTicks;
+    // Disk I/O monitoring
+    uint64_t _prevDiskReadBytes;
+    uint64_t _prevDiskWriteBytes;
     // PrimeLocation predicted primes list (persists after test ends)
     std::vector<uint64_t> _predictedPrimes;
 }
@@ -50,15 +179,23 @@ static NSString *formatNumber(uint64_t n) {
 @property (strong) NSButton *taskStartBtn;            // Start/Pause for selected test
 @property (strong) NSTextField *activeTaskListLabel;  // compact list of running/paused tasks
 
-// Resource visualizer
+// EQ-style resource visualizers
+@property (strong) EQBarView *cpuEQ;
+@property (strong) EQBarView *gpuEQ;
+@property (strong) EQBarView *neonEQ;
+@property (strong) EQBarView *memEQ;
+@property (strong) EQBarView *diskEQ;
+@property (strong) NSTextField *statusLabel2;       // secondary status line
+@property (strong) NSButton *disableVisualizerBtn;
+
+// Keep these for backward compat with updateResourceMonitor
 @property (strong) NSProgressIndicator *cpuBar;
 @property (strong) NSTextField *cpuLabel;
 @property (strong) NSProgressIndicator *memBar;
 @property (strong) NSTextField *memLabel;
 @property (strong) NSTextField *gpuStatusLabel;
-@property (strong) NSTextField *gpuDetailLabel;   // GPU utilization %, threads, batches
-@property (strong) NSTextField *aluDetailLabel;    // NEON/SIMD stats from MatrixSieve
-@property (strong) NSButton *disableVisualizerBtn; // checkbox to disable resource monitor
+@property (strong) NSTextField *gpuDetailLabel;
+@property (strong) NSTextField *aluDetailLabel;
 
 // Start-point controls
 @property (strong) NSPopUpButton *startTaskPopup;
@@ -202,68 +339,64 @@ static NSString *formatNumber(uint64_t n) {
     [cv addSubview:subLbl];
     y -= 18;
 
-    // ── SYSTEM RESOURCES ─────────────────────────────────────────────
-    CGFloat resY = y; // save for autoresizing
-    CGFloat rx = M;
+    // ── EQ VISUALIZERS ────────────────────────────────────────────────
+    CGFloat eqH = 44;  // height per EQ bar
+    CGFloat eqGap = 3;
+    CGFloat eqW = (CW - 4 * eqGap) / 5.0; // 5 bars across
 
-    NSTextField *cpuLbl = [self labelAt:NSMakeRect(rx, y - 14, 28, 14) text:@"CPU" bold:YES size:9.5];
-    cpuLbl.autoresizingMask = NSViewMinYMargin;
-    [cv addSubview:cpuLbl];
-    rx += 28;
-    self.cpuBar = [[NSProgressIndicator alloc] initWithFrame:NSMakeRect(rx, y - 12, 120, 11)];
-    self.cpuBar.style = NSProgressIndicatorStyleBar;
-    self.cpuBar.indeterminate = NO; self.cpuBar.minValue = 0; self.cpuBar.maxValue = 100;
-    self.cpuBar.autoresizingMask = NSViewMinYMargin;
-    [cv addSubview:self.cpuBar];
-    rx += 123;
-    self.cpuLabel = [self labelAt:NSMakeRect(rx, y - 14, 38, 14) text:@"0%" bold:NO size:9.5];
-    self.cpuLabel.autoresizingMask = NSViewMinYMargin;
-    [cv addSubview:self.cpuLabel];
-    rx += 40;
+    NSColor *greenC = [NSColor colorWithSRGBRed:0.1 green:0.7 blue:0.3 alpha:1.0];
+    NSColor *blueC  = [NSColor colorWithSRGBRed:0.2 green:0.5 blue:0.9 alpha:1.0];
+    NSColor *cyanC  = [NSColor colorWithSRGBRed:0.1 green:0.7 blue:0.8 alpha:1.0];
+    NSColor *amberC = [NSColor colorWithSRGBRed:0.9 green:0.7 blue:0.1 alpha:1.0];
+    NSColor *magC   = [NSColor colorWithSRGBRed:0.7 green:0.3 blue:0.8 alpha:1.0];
 
-    NSTextField *memLbl = [self labelAt:NSMakeRect(rx, y - 14, 28, 14) text:@"Mem" bold:YES size:9.5];
-    memLbl.autoresizingMask = NSViewMinYMargin;
-    [cv addSubview:memLbl];
-    rx += 30;
-    self.memBar = [[NSProgressIndicator alloc] initWithFrame:NSMakeRect(rx, y - 12, 100, 11)];
-    self.memBar.style = NSProgressIndicatorStyleBar;
-    self.memBar.indeterminate = NO; self.memBar.minValue = 0; self.memBar.maxValue = 100;
-    self.memBar.autoresizingMask = NSViewMinYMargin;
-    [cv addSubview:self.memBar];
-    rx += 103;
-    self.memLabel = [self labelAt:NSMakeRect(rx, y - 14, 60, 14) text:@"0 MB" bold:NO size:9.5];
-    self.memLabel.autoresizingMask = NSViewMinYMargin;
-    [cv addSubview:self.memLabel];
-    rx += 64;
+    CGFloat ex = M;
+    self.cpuEQ = [[EQBarView alloc] initWithFrame:NSMakeRect(ex, y - eqH, eqW, eqH)
+        title:@"CPU" color:greenC];
+    self.cpuEQ.autoresizingMask = NSViewMinYMargin | NSViewWidthSizable;
+    [cv addSubview:self.cpuEQ];
+    ex += eqW + eqGap;
 
-    self.gpuStatusLabel = [self labelAt:NSMakeRect(rx, y - 14, 200, 14)
-        text:@"GPU: idle" bold:NO size:9.5];
-    self.gpuStatusLabel.textColor = [NSColor secondaryLabelColor];
-    self.gpuStatusLabel.autoresizingMask = NSViewMinYMargin;
-    [cv addSubview:self.gpuStatusLabel];
+    self.gpuEQ = [[EQBarView alloc] initWithFrame:NSMakeRect(ex, y - eqH, eqW, eqH)
+        title:@"GPU" color:blueC];
+    self.gpuEQ.autoresizingMask = NSViewMinYMargin | NSViewWidthSizable;
+    [cv addSubview:self.gpuEQ];
+    ex += eqW + eqGap;
+
+    self.neonEQ = [[EQBarView alloc] initWithFrame:NSMakeRect(ex, y - eqH, eqW, eqH)
+        title:@"NEON/SIMD" color:cyanC];
+    self.neonEQ.autoresizingMask = NSViewMinYMargin | NSViewWidthSizable;
+    [cv addSubview:self.neonEQ];
+    ex += eqW + eqGap;
+
+    self.memEQ = [[EQBarView alloc] initWithFrame:NSMakeRect(ex, y - eqH, eqW, eqH)
+        title:@"MEMORY" color:amberC];
+    self.memEQ.autoresizingMask = NSViewMinYMargin | NSViewWidthSizable;
+    [cv addSubview:self.memEQ];
+    ex += eqW + eqGap;
+
+    self.diskEQ = [[EQBarView alloc] initWithFrame:NSMakeRect(ex, y - eqH, eqW, eqH)
+        title:@"DISK I/O" color:magC];
+    self.diskEQ.autoresizingMask = NSViewMinYMargin | NSViewWidthSizable;
+    [cv addSubview:self.diskEQ];
 
     self.disableVisualizerBtn = [NSButton checkboxWithTitle:@"Hide"
         target:self action:@selector(toggleVisualizer:)];
-    self.disableVisualizerBtn.frame = NSMakeRect(W - M - 44, y - 14, 44, 14);
+    self.disableVisualizerBtn.frame = NSMakeRect(W - M - 44, y + 2, 44, 14);
     self.disableVisualizerBtn.font = [NSFont systemFontOfSize:9];
     self.disableVisualizerBtn.state = NSControlStateValueOff;
     self.disableVisualizerBtn.autoresizingMask = NSViewMinYMargin | NSViewMinXMargin;
     [cv addSubview:self.disableVisualizerBtn];
-    y -= 16;
+    y -= (eqH + 4);
 
-    // Detail row
-    self.gpuDetailLabel = [self labelAt:NSMakeRect(M + 28, y - 12, 400, 11)
-        text:@"" bold:NO size:8.5];
-    self.gpuDetailLabel.textColor = [NSColor tertiaryLabelColor];
-    self.gpuDetailLabel.autoresizingMask = NSViewMinYMargin | NSViewWidthSizable;
-    [cv addSubview:self.gpuDetailLabel];
-
-    self.aluDetailLabel = [self labelAt:NSMakeRect(440, y - 12, 440, 11)
-        text:@"" bold:NO size:8.5];
-    self.aluDetailLabel.textColor = [NSColor tertiaryLabelColor];
-    self.aluDetailLabel.autoresizingMask = NSViewMinYMargin | NSViewMinXMargin;
-    [cv addSubview:self.aluDetailLabel];
-    y -= 14;
+    // Hidden labels for backward compat (updateResourceMonitor still writes to them)
+    self.cpuBar = [[NSProgressIndicator alloc] init]; // unused but kept
+    self.cpuLabel = [[NSTextField alloc] init];
+    self.memBar = [[NSProgressIndicator alloc] init];
+    self.memLabel = [[NSTextField alloc] init];
+    self.gpuStatusLabel = [[NSTextField alloc] init];
+    self.gpuDetailLabel = [[NSTextField alloc] init];
+    self.aluDetailLabel = [[NSTextField alloc] init];
 
     // Status bar
     self.statusLabel = [self labelAt:NSMakeRect(M, y - 14, CW, 13)
@@ -1969,28 +2102,25 @@ static NSString *formatNumber(uint64_t n) {
 
     if (_checkRunning.load()) running++;
 
-    self.statusLabel.stringValue = [NSString stringWithFormat:
-        @"Running: %d | Total discoveries: %@ | GPU: %@",
-        running, formatNumber(total_found),
-        [NSString stringWithUTF8String:_gpu->name().c_str()]];
+    if (running > 0) {
+        self.statusLabel.stringValue = [NSString stringWithFormat:
+            @"Running: %d | Discoveries: %@", running, formatNumber(total_found)];
+    }
 }
 
 - (void)toggleVisualizer:(id)sender {
     BOOL disabled = (self.disableVisualizerBtn.state == NSControlStateValueOn);
-    self.cpuBar.hidden = disabled;
-    self.cpuLabel.hidden = disabled;
-    self.memBar.hidden = disabled;
-    self.memLabel.hidden = disabled;
-    self.gpuStatusLabel.hidden = disabled;
-    self.gpuDetailLabel.hidden = disabled;
-    self.aluDetailLabel.hidden = disabled;
+    self.cpuEQ.hidden = disabled;
+    self.gpuEQ.hidden = disabled;
+    self.neonEQ.hidden = disabled;
+    self.memEQ.hidden = disabled;
+    self.diskEQ.hidden = disabled;
 }
 
 - (void)updateResourceMonitor {
-    // Skip updates if visualizer is disabled (saves CPU cycles for max speed)
     if (self.disableVisualizerBtn.state == NSControlStateValueOn) return;
 
-    // ── CPU usage (system-wide) ──
+    // ── CPU ──
     host_cpu_load_info_data_t cpuinfo;
     mach_msg_type_number_t count = HOST_CPU_LOAD_INFO_COUNT;
     if (host_statistics(mach_host_self(), HOST_CPU_LOAD_INFO,
@@ -1999,127 +2129,100 @@ static NSString *formatNumber(uint64_t n) {
         for (int i = 0; i < CPU_STATE_MAX; i++)
             totalTicks += cpuinfo.cpu_ticks[i];
         uint64_t idleTicks = cpuinfo.cpu_ticks[CPU_STATE_IDLE];
-
         if (_prevTotalTicks > 0) {
             uint64_t totalDelta = totalTicks - _prevTotalTicks;
             uint64_t idleDelta = idleTicks - _prevIdleTicks;
             if (totalDelta > 0) {
                 double cpuPct = 100.0 * (1.0 - (double)idleDelta / (double)totalDelta);
-                self.cpuBar.doubleValue = cpuPct;
-                self.cpuLabel.stringValue = [NSString stringWithFormat:@"%.0f%%", cpuPct];
-                if (cpuPct > 80) {
-                    self.cpuLabel.textColor = [NSColor systemRedColor];
-                } else if (cpuPct > 50) {
-                    self.cpuLabel.textColor = [NSColor systemOrangeColor];
-                } else {
-                    self.cpuLabel.textColor = [NSColor colorWithSRGBRed:0.0 green:0.55 blue:0.0 alpha:1.0];
-                }
+                [self.cpuEQ pushValue:cpuPct];
+                [self.cpuEQ setDetail:[NSString stringWithFormat:@"%.0f%%", cpuPct]];
             }
         }
         _prevTotalTicks = totalTicks;
         _prevIdleTicks = idleTicks;
     }
 
-    // ── App memory usage ──
+    // ── Memory ──
     struct mach_task_basic_info info;
     mach_msg_type_number_t infoCount = MACH_TASK_BASIC_INFO_COUNT;
     if (task_info(mach_task_self(), MACH_TASK_BASIC_INFO,
                   (task_info_t)&info, &infoCount) == KERN_SUCCESS) {
         uint64_t mb = info.resident_size / (1024 * 1024);
         double memPct = std::min(100.0, (double)mb / 2048.0 * 100.0);
-        self.memBar.doubleValue = memPct;
-        self.memLabel.stringValue = [NSString stringWithFormat:@"%@ MB", formatNumber(mb)];
-        if (mb > 1024) {
-            self.memLabel.textColor = [NSColor systemRedColor];
-        } else if (mb > 512) {
-            self.memLabel.textColor = [NSColor systemOrangeColor];
-        } else {
-            self.memLabel.textColor = [NSColor labelColor];
-        }
+        [self.memEQ pushValue:memPct];
+        [self.memEQ setDetail:[NSString stringWithFormat:@"%lluMB", (unsigned long long)mb]];
     }
 
-    // ── GPU status + detail ──
-    int runningTasks = 0, gpuTasks = 0, cpuOnlyTasks = 0;
+    // ── GPU ──
+    int runningTasks = 0, gpuTasks = 0;
     uint64_t totalRate = 0;
     auto& tasks = _taskMgr->tasks();
     for (auto& [type, task] : tasks) {
         if (task.status == prime::TaskStatus::Running) {
             runningTasks++;
             totalRate += (uint64_t)task.rate;
-            // GPU-using tasks: Wieferich, WallSunSun, Sophie, Wilson
             if (type == prime::TaskType::Wieferich ||
                 type == prime::TaskType::WallSunSun ||
                 type == prime::TaskType::SophieGermain ||
-                type == prime::TaskType::Wilson) {
+                type == prime::TaskType::Wilson ||
+                type == prime::TaskType::MersenneTrial ||
+                type == prime::TaskType::FermatFactor) {
                 gpuTasks++;
-            } else {
-                cpuOnlyTasks++;
             }
         }
     }
 
-    // GPU utilization from Metal command buffer timing
     double gpuUtil = _gpu->gpu_utilization() * 100.0;
-    uint64_t gpuThreads = _gpu->total_threads_dispatched();
     uint64_t gpuBatches = _gpu->total_batches_dispatched();
     double avgMs = _gpu->avg_gpu_time_ms();
-
+    [self.gpuEQ pushValue:gpuUtil];
     if (gpuBatches > 0) {
-        self.gpuDetailLabel.stringValue = [NSString stringWithFormat:
-            @"GPU: %.1f%% util | %@ threads | %@ batches | %.2fms/batch",
-            gpuUtil, formatNumber(gpuThreads), formatNumber(gpuBatches), avgMs];
-    } else if (gpuTasks > 0) {
-        self.gpuDetailLabel.stringValue = [NSString stringWithFormat:
-            @"GPU: accumulating (%d GPU tasks) — dispatches when buffer fills",
-            gpuTasks];
-    } else if (runningTasks > 0) {
-        self.gpuDetailLabel.stringValue = [NSString stringWithFormat:
-            @"GPU: idle — %d running tasks are CPU-only (start Wieferich/WallSunSun/Sophie for GPU)",
-            cpuOnlyTasks];
+        [self.gpuEQ setDetail:[NSString stringWithFormat:@"%.0f%% %.1fms", gpuUtil, avgMs]];
     } else {
-        self.gpuDetailLabel.stringValue = @"GPU: no tasks running";
+        [self.gpuEQ setDetail:gpuTasks > 0 ? @"filling" : @"idle"];
     }
 
-    if (gpuUtil > 50) {
-        self.gpuDetailLabel.textColor = [NSColor colorWithSRGBRed:0.0 green:0.55 blue:0.0 alpha:1.0];
-    } else if (gpuUtil > 10 || gpuTasks > 0) {
-        self.gpuDetailLabel.textColor = [NSColor systemOrangeColor];
-    } else {
-        self.gpuDetailLabel.textColor = [NSColor tertiaryLabelColor];
-    }
-
-    // ALU/NEON stats from MatrixSieve + Pseudoprime Predictor
+    // ── NEON/SIMD ──
     auto* ms = _taskMgr->matrix_sieve();
-    auto* pp = _taskMgr->predictor();
     if (ms) {
         uint64_t tested = ms->total_tested();
         uint64_t rejected = ms->total_rejected();
         double rejPct = tested > 0 ? (100.0 * rejected / tested) : 0.0;
-        NSString *ppStr = @"";
-        if (pp && pp->count() > 0) {
-            ppStr = [NSString stringWithFormat:@" | Predictor: %zu Carm + %zu SPRP2 → %@",
-                     pp->carmichael_count(), pp->sprp2_count(),
-                     formatNumber(pp->frontier())];
-        }
-        self.aluDetailLabel.stringValue = [NSString stringWithFormat:
-            @"ALU/NEON: %@ tested, %@ rejected (%.1f%%)%@",
-            formatNumber(tested), formatNumber(rejected), rejPct, ppStr];
-        if (tested > 0) {
-            self.aluDetailLabel.textColor = [NSColor colorWithSRGBRed:0.0 green:0.55 blue:0.0 alpha:1.0];
-        }
+        // Use rejection rate as "activity" - higher rejection = more NEON work
+        double neonActivity = std::min(100.0, rejPct);
+        [self.neonEQ pushValue:tested > 0 ? neonActivity : 0];
+        [self.neonEQ setDetail:[NSString stringWithFormat:@"%.1f%% rej", rejPct]];
+    } else {
+        [self.neonEQ pushValue:0];
     }
 
-    if (runningTasks > 0 && _gpu->available()) {
-        self.gpuStatusLabel.stringValue = [NSString stringWithFormat:
-            @"GPU: %d tasks | %@/s", runningTasks, formatNumber(totalRate)];
-        self.gpuStatusLabel.textColor = [NSColor colorWithSRGBRed:0.0 green:0.55 blue:0.0 alpha:1.0];
-    } else if (runningTasks > 0) {
-        self.gpuStatusLabel.stringValue = [NSString stringWithFormat:
-            @"CPU: %d tasks | %@/s", runningTasks, formatNumber(totalRate)];
-        self.gpuStatusLabel.textColor = [NSColor systemOrangeColor];
+    // ── Disk I/O ──
+    // Use rusage for I/O stats (block operations)
+    struct rusage ru;
+    if (getrusage(RUSAGE_SELF, &ru) == 0) {
+        uint64_t reads = (uint64_t)ru.ru_inblock;
+        uint64_t writes = (uint64_t)ru.ru_oublock;
+        uint64_t deltaR = reads - _prevDiskReadBytes;
+        uint64_t deltaW = writes - _prevDiskWriteBytes;
+        // Scale: each block op ~ some activity, cap at 100
+        double diskPct = std::min(100.0, (double)(deltaR + deltaW) * 5.0);
+        [self.diskEQ pushValue:diskPct];
+        [self.diskEQ setDetail:[NSString stringWithFormat:@"R:%llu W:%llu",
+            (unsigned long long)deltaR, (unsigned long long)deltaW]];
+        _prevDiskReadBytes = reads;
+        _prevDiskWriteBytes = writes;
+    }
+
+    // ── Status ──
+    if (runningTasks > 0) {
+        self.statusLabel.stringValue = [NSString stringWithFormat:
+            @"Running: %d tasks | %@/s | GPU: %@",
+            runningTasks, formatNumber(totalRate),
+            [NSString stringWithUTF8String:_gpu->name().c_str()]];
+        self.statusLabel.textColor = [NSColor colorWithSRGBRed:0.0 green:0.55 blue:0.0 alpha:1.0];
     } else {
-        self.gpuStatusLabel.stringValue = @"GPU: idle";
-        self.gpuStatusLabel.textColor = [NSColor secondaryLabelColor];
+        self.statusLabel.stringValue = @"Ready";
+        self.statusLabel.textColor = [NSColor secondaryLabelColor];
     }
 }
 

@@ -1,0 +1,30 @@
+name: Build & Test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  build:
+    runs-on: macos-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build test engine
+        run: clang++ -std=c++17 -O2 -I. test_engine.cpp PrimePath/PrimeEngine.cpp -o test_engine -lpthread
+
+      - name: Run tests
+        run: ./test_engine
+
+      - name: Build Xcode project (Debug)
+        run: >
+          xcodebuild
+          -project PrimePath.xcodeproj
+          -scheme PrimePath
+          -configuration Debug
+          -derivedDataPath build
+          CODE_SIGN_IDENTITY=-
+          CODE_SIGNING_ALLOWED=NO
