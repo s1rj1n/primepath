@@ -46,6 +46,9 @@ static NSString *formatNumber(uint64_t n) {
 @property (strong) id eventMonitor;
 @property (strong) NSMutableDictionary<NSNumber *, NSButton *> *taskButtons;
 @property (strong) NSMutableDictionary<NSNumber *, NSTextField *> *taskLabels;
+@property (strong) NSPopUpButton *taskSelectPopup;   // dropdown to pick which test to start
+@property (strong) NSButton *taskStartBtn;            // Start/Pause for selected test
+@property (strong) NSTextField *activeTaskListLabel;  // compact list of running/paused tasks
 
 // Resource visualizer
 @property (strong) NSProgressIndicator *cpuBar;
@@ -154,235 +157,275 @@ static NSString *formatNumber(uint64_t n) {
 }
 
 - (void)buildUI {
-    NSRect frame = NSMakeRect(80, 40, 920, 1000);
+    // Standard macOS window positioning - cascade from top-left
+    NSRect frame = NSMakeRect(80, 100, 920, 760);
     self.mainWindow = [[NSWindow alloc]
         initWithContentRect:frame
         styleMask:(NSWindowStyleMaskTitled | NSWindowStyleMaskClosable |
                    NSWindowStyleMaskMiniaturizable | NSWindowStyleMaskResizable)
         backing:NSBackingStoreBuffered defer:NO];
     [self.mainWindow setTitle:@"PrimePath v0.5 — Metal GPU Prime Discovery"];
-    [self.mainWindow setMinSize:NSMakeSize(820, 500)];
-    // Total document height — controls ~480px + log 350px + margins
-    CGFloat DOC_H = 940;
-    CGFloat LOG_H = 350;
+    [self.mainWindow setMinSize:NSMakeSize(720, 400)];
+    [self.mainWindow center]; // standard macOS centering
 
-    // Main scroll view wraps everything so window is always scrollable
-    NSView *rootView = self.mainWindow.contentView;
-    rootView.wantsLayer = YES;
-    NSScrollView *mainScroll = [[NSScrollView alloc] initWithFrame:rootView.bounds];
-    mainScroll.hasVerticalScroller = YES;
-    mainScroll.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
-    mainScroll.drawsBackground = NO;
-    mainScroll.autohidesScrollers = YES;
-
-    NSView *cv = [[NSView alloc] initWithFrame:NSMakeRect(0, 0, frame.size.width, DOC_H)];
-    mainScroll.documentView = cv;
-    [rootView addSubview:mainScroll];
+    // Use content view directly - no wrapping scroll view.
+    // Controls are pinned to top (NSViewMinYMargin), log fills the rest.
+    NSView *cv = self.mainWindow.contentView;
+    cv.wantsLayer = YES;
 
     self.taskButtons = [NSMutableDictionary new];
     self.taskLabels = [NSMutableDictionary new];
 
     CGFloat W = frame.size.width;
-    CGFloat M = 16;          // margin
-    CGFloat CW = W - 2 * M;  // content width
-    CGFloat y = DOC_H - 20;
+    CGFloat M = 12;
+    CGFloat CW = W - 2 * M;
+    CGFloat cvH = frame.size.height;
+    CGFloat y = cvH - 8; // start from top
 
-    // ═══════════════════════════════════════════════════════════════════
-    // HEADER
-    // ═══════════════════════════════════════════════════════════════════
-    NSTextField *title = [self labelAt:NSMakeRect(M, y, CW, 22)
-        text:@"PrimePath — Metal GPU Multi-Core Prime Discovery" bold:YES size:15];
+    // All controls use NSViewMinYMargin so they stick to the top edge on resize.
+    // The log scroll view uses NSViewWidthSizable | NSViewHeightSizable to fill remaining space.
+
+    // ── HEADER ───────────────────────────────────────────────────────
+    NSTextField *title = [self labelAt:NSMakeRect(M, y - 18, CW, 20)
+        text:@"PrimePath — Metal GPU Prime Discovery" bold:YES size:14];
+    title.autoresizingMask = NSViewMinYMargin | NSViewWidthSizable;
     [cv addSubview:title];
-    y -= 20;
+    y -= 18;
 
     NSString *gpuName = [NSString stringWithUTF8String:_gpu->name().c_str()];
     NSString *subtitle = [NSString stringWithFormat:
-        @"%@ | %u threads | Sieve → MatrixCRT → Miller-Rabin(12)",
+        @"%@ | %u threads | Sieve -> MatrixCRT -> Miller-Rabin(12)",
         _gpu->available() ? gpuName : @"GPU: N/A (CPU fallback)",
         std::thread::hardware_concurrency()];
-    [cv addSubview:[self labelAt:NSMakeRect(M, y, CW, 14) text:subtitle bold:NO size:10]];
-    y -= 22;
+    NSTextField *subLbl = [self labelAt:NSMakeRect(M, y - 14, CW, 13) text:subtitle bold:NO size:9.5];
+    subLbl.autoresizingMask = NSViewMinYMargin | NSViewWidthSizable;
+    [cv addSubview:subLbl];
+    y -= 18;
 
-    // ═══════════════════════════════════════════════════════════════════
-    // SYSTEM RESOURCES — compact single bar row
-    // ═══════════════════════════════════════════════════════════════════
+    // ── SYSTEM RESOURCES ─────────────────────────────────────────────
+    CGFloat resY = y; // save for autoresizing
     CGFloat rx = M;
-    [cv addSubview:[self labelAt:NSMakeRect(rx, y, 30, 14) text:@"CPU" bold:YES size:10]];
-    rx += 30;
-    self.cpuBar = [[NSProgressIndicator alloc] initWithFrame:NSMakeRect(rx, y + 1, 140, 12)];
+
+    NSTextField *cpuLbl = [self labelAt:NSMakeRect(rx, y - 14, 28, 14) text:@"CPU" bold:YES size:9.5];
+    cpuLbl.autoresizingMask = NSViewMinYMargin;
+    [cv addSubview:cpuLbl];
+    rx += 28;
+    self.cpuBar = [[NSProgressIndicator alloc] initWithFrame:NSMakeRect(rx, y - 12, 120, 11)];
     self.cpuBar.style = NSProgressIndicatorStyleBar;
     self.cpuBar.indeterminate = NO; self.cpuBar.minValue = 0; self.cpuBar.maxValue = 100;
+    self.cpuBar.autoresizingMask = NSViewMinYMargin;
     [cv addSubview:self.cpuBar];
-    rx += 144;
-    self.cpuLabel = [self labelAt:NSMakeRect(rx, y, 40, 14) text:@"0%" bold:NO size:10];
+    rx += 123;
+    self.cpuLabel = [self labelAt:NSMakeRect(rx, y - 14, 38, 14) text:@"0%" bold:NO size:9.5];
+    self.cpuLabel.autoresizingMask = NSViewMinYMargin;
     [cv addSubview:self.cpuLabel];
-    rx += 48;
+    rx += 40;
 
-    [cv addSubview:[self labelAt:NSMakeRect(rx, y, 30, 14) text:@"Mem" bold:YES size:10]];
-    rx += 32;
-    self.memBar = [[NSProgressIndicator alloc] initWithFrame:NSMakeRect(rx, y + 1, 120, 12)];
+    NSTextField *memLbl = [self labelAt:NSMakeRect(rx, y - 14, 28, 14) text:@"Mem" bold:YES size:9.5];
+    memLbl.autoresizingMask = NSViewMinYMargin;
+    [cv addSubview:memLbl];
+    rx += 30;
+    self.memBar = [[NSProgressIndicator alloc] initWithFrame:NSMakeRect(rx, y - 12, 100, 11)];
     self.memBar.style = NSProgressIndicatorStyleBar;
     self.memBar.indeterminate = NO; self.memBar.minValue = 0; self.memBar.maxValue = 100;
+    self.memBar.autoresizingMask = NSViewMinYMargin;
     [cv addSubview:self.memBar];
-    rx += 124;
-    self.memLabel = [self labelAt:NSMakeRect(rx, y, 70, 14) text:@"0 MB" bold:NO size:10];
+    rx += 103;
+    self.memLabel = [self labelAt:NSMakeRect(rx, y - 14, 60, 14) text:@"0 MB" bold:NO size:9.5];
+    self.memLabel.autoresizingMask = NSViewMinYMargin;
     [cv addSubview:self.memLabel];
-    rx += 78;
+    rx += 64;
 
-    self.gpuStatusLabel = [self labelAt:NSMakeRect(rx, y, 200, 14)
-        text:@"GPU: idle" bold:NO size:10];
+    self.gpuStatusLabel = [self labelAt:NSMakeRect(rx, y - 14, 200, 14)
+        text:@"GPU: idle" bold:NO size:9.5];
     self.gpuStatusLabel.textColor = [NSColor secondaryLabelColor];
+    self.gpuStatusLabel.autoresizingMask = NSViewMinYMargin;
     [cv addSubview:self.gpuStatusLabel];
 
     self.disableVisualizerBtn = [NSButton checkboxWithTitle:@"Hide"
         target:self action:@selector(toggleVisualizer:)];
-    self.disableVisualizerBtn.frame = NSMakeRect(W - M - 50, y, 50, 14);
+    self.disableVisualizerBtn.frame = NSMakeRect(W - M - 44, y - 14, 44, 14);
     self.disableVisualizerBtn.font = [NSFont systemFontOfSize:9];
     self.disableVisualizerBtn.state = NSControlStateValueOff;
+    self.disableVisualizerBtn.autoresizingMask = NSViewMinYMargin | NSViewMinXMargin;
     [cv addSubview:self.disableVisualizerBtn];
     y -= 16;
 
     // Detail row
-    self.gpuDetailLabel = [self labelAt:NSMakeRect(M + 30, y, 420, 12)
-        text:@"GPU: 0% | 0 batches | 0ms/batch" bold:NO size:9];
+    self.gpuDetailLabel = [self labelAt:NSMakeRect(M + 28, y - 12, 400, 11)
+        text:@"" bold:NO size:8.5];
     self.gpuDetailLabel.textColor = [NSColor tertiaryLabelColor];
+    self.gpuDetailLabel.autoresizingMask = NSViewMinYMargin | NSViewWidthSizable;
     [cv addSubview:self.gpuDetailLabel];
 
-    self.aluDetailLabel = [self labelAt:NSMakeRect(460, y, 420, 12)
-        text:@"MatrixSieve: 0 tested, 0 rejected (0%)" bold:NO size:9];
+    self.aluDetailLabel = [self labelAt:NSMakeRect(440, y - 12, 440, 11)
+        text:@"" bold:NO size:8.5];
     self.aluDetailLabel.textColor = [NSColor tertiaryLabelColor];
+    self.aluDetailLabel.autoresizingMask = NSViewMinYMargin | NSViewMinXMargin;
     [cv addSubview:self.aluDetailLabel];
-    y -= 16;
+    y -= 14;
 
     // Status bar
-    self.statusLabel = [self labelAt:NSMakeRect(M, y, CW, 14)
-        text:@"Ready — click Start on any task" bold:NO size:10];
+    self.statusLabel = [self labelAt:NSMakeRect(M, y - 14, CW, 13)
+        text:@"Ready" bold:NO size:9.5];
     self.statusLabel.textColor = [NSColor colorWithSRGBRed:0.0 green:0.55 blue:0.0 alpha:1.0];
+    self.statusLabel.autoresizingMask = NSViewMinYMargin | NSViewWidthSizable;
     [cv addSubview:self.statusLabel];
-    y -= 20;
+    y -= 16;
 
-    // ═══════════════════════════════════════════════════════════════════
-    // SEARCH TASKS
-    // ═══════════════════════════════════════════════════════════════════
-    // Thin separator
+    // ── SEARCH TASKS ─────────────────────────────────────────────────
     NSBox *sep1 = [[NSBox alloc] initWithFrame:NSMakeRect(M, y, CW, 1)];
     sep1.boxType = NSBoxSeparator;
+    sep1.autoresizingMask = NSViewMinYMargin | NSViewWidthSizable;
     [cv addSubview:sep1];
-    y -= 18;
+    y -= 4;
 
-    [cv addSubview:[self labelAt:NSMakeRect(M, y, 200, 16)
-        text:@"Search Tasks" bold:YES size:12]];
+    NSTextField *searchLbl = [self labelAt:NSMakeRect(M, y - 16, 90, 15)
+        text:@"Search Tasks" bold:YES size:11];
+    searchLbl.autoresizingMask = NSViewMinYMargin;
+    [cv addSubview:searchLbl];
 
-    NSButton *stopAllBtn = [self buttonAt:NSMakeRect(W - M - 80, y - 2, 80, 22)
+    NSButton *infoBtn = [[NSButton alloc] initWithFrame:NSMakeRect(M + 90, y - 15, 18, 18)];
+    infoBtn.bezelStyle = NSBezelStyleCircular;
+    infoBtn.title = @"?";
+    infoBtn.font = [NSFont boldSystemFontOfSize:10];
+    infoBtn.target = self;
+    infoBtn.action = @selector(showInfoPanel:);
+    infoBtn.toolTip = @"Log output glossary";
+    infoBtn.autoresizingMask = NSViewMinYMargin;
+    [cv addSubview:infoBtn];
+
+    NSButton *stopAllBtn = [self buttonAt:NSMakeRect(W - M - 70, y - 16, 70, 20)
         title:@"Stop All" action:@selector(stopAll:)];
     stopAllBtn.font = [NSFont systemFontOfSize:10];
+    stopAllBtn.autoresizingMask = NSViewMinYMargin | NSViewMinXMargin;
     [cv addSubview:stopAllBtn];
-    y -= 4;
+    y -= 20;
 
     using TT = prime::TaskType;
     TT types[] = {TT::Wieferich, TT::WallSunSun, TT::Wilson, TT::TwinPrime,
                   TT::SophieGermain, TT::CousinPrime, TT::SexyPrime, TT::GeneralPrime,
                   TT::Emirp, TT::MersenneTrial, TT::FermatFactor};
     const char *descs[] = {
-        "2^(p-1) = 1 (mod p^2) — only 2 known!",
-        "p^2 | F(p-(p/5)) — NONE known!",
-        "(p-1)! = -1 (mod p^2) — only 3 known",
+        "2^(p-1) = 1 (mod p^2) -- only 2 known!",
+        "p^2 | F(p-(p/5)) -- NONE known!",
+        "(p-1)! = -1 (mod p^2) -- only 3 known",
         "p, p+2 both prime",
         "p, 2p+1 both prime",
         "p, p+4 both prime",
         "p, p+6 both prime",
         "Count all primes in range",
         "p and reverse(p) both prime",
-        "Trial factor 2^p-1 — GPU Metal (first!)",
-        "Find factors of F_m = 2^(2^m)+1 — GPU Metal",
+        "Trial factor 2^p-1 -- GPU Metal",
+        "Factor F_m = 2^(2^m)+1 -- GPU Metal",
     };
     static const int NUM_TASKS = 11;
 
+    self.taskSelectPopup = [[NSPopUpButton alloc] initWithFrame:NSMakeRect(M, y - 22, 380, 22) pullsDown:NO];
     for (int i = 0; i < NUM_TASKS; i++) {
-        y -= 22;
-        TT t = types[i];
-        NSNumber *key = @((int)t);
-
-        NSButton *btn = [self buttonAt:NSMakeRect(M, y, 56, 20)
-            title:@"Start" action:@selector(taskToggle:)];
-        btn.font = [NSFont systemFontOfSize:10];
-        btn.tag = (int)t;
-        [cv addSubview:btn];
-        self.taskButtons[key] = btn;
-
-        NSString *name = [NSString stringWithFormat:@"%-13s %s",
-            prime::task_name(t), descs[i]];
-        [cv addSubview:[self labelAt:NSMakeRect(M + 62, y + 2, 380, 14)
-            text:name bold:NO size:10]];
-
-        NSTextField *stats = [self labelAt:NSMakeRect(460, y + 2, CW - 444, 14)
-            text:@"Idle" bold:NO size:10];
-        stats.textColor = [NSColor secondaryLabelColor];
-        stats.alignment = NSTextAlignmentRight;
-        [cv addSubview:stats];
-        self.taskLabels[key] = stats;
+        NSString *t = [NSString stringWithFormat:@"%s  --  %s",
+            prime::task_name(types[i]), descs[i]];
+        [self.taskSelectPopup addItemWithTitle:t];
+        self.taskSelectPopup.lastItem.tag = (int)types[i];
     }
+    self.taskSelectPopup.font = [NSFont systemFontOfSize:10];
+    self.taskSelectPopup.autoresizingMask = NSViewMinYMargin;
+    self.taskSelectPopup.target = self;
+    self.taskSelectPopup.action = @selector(taskSelectionChanged:);
+    [cv addSubview:self.taskSelectPopup];
 
-    y -= 26;
+    self.taskStartBtn = [self buttonAt:NSMakeRect(M + 386, y - 22, 56, 22)
+        title:@"Start" action:@selector(taskToggleSelected:)];
+    self.taskStartBtn.font = [NSFont systemFontOfSize:10];
+    self.taskStartBtn.autoresizingMask = NSViewMinYMargin;
+    [cv addSubview:self.taskStartBtn];
+    y -= 24;
 
-    // ── Set start point row ─────────────────────────────────────────
-    [cv addSubview:[self labelAt:NSMakeRect(M, y + 2, 200, 14)
-        text:@"Set Test Bounds" bold:YES size:11]];
-    y -= 22;
-    self.startTaskPopup = [[NSPopUpButton alloc] initWithFrame:NSMakeRect(M, y, 120, 20) pullsDown:NO];
+    // Start point row — directly below the test selector dropdown
+    NSTextField *startAtLbl = [self labelAt:NSMakeRect(M, y - 19, 52, 14) text:@"Start at:" bold:NO size:9.5];
+    startAtLbl.autoresizingMask = NSViewMinYMargin;
+    [cv addSubview:startAtLbl];
+
+    // Hidden startTaskPopup — synced to taskSelectPopup selection
+    self.startTaskPopup = [[NSPopUpButton alloc] initWithFrame:NSZeroRect pullsDown:NO];
     for (int i = 0; i < NUM_TASKS; i++) {
         [self.startTaskPopup addItemWithTitle:
             [NSString stringWithUTF8String:prime::task_name(types[i])]];
         self.startTaskPopup.lastItem.tag = (int)types[i];
     }
-    self.startTaskPopup.font = [NSFont systemFontOfSize:10];
-    self.startTaskPopup.target = self;
-    self.startTaskPopup.action = @selector(startTaskChanged:);
+    self.startTaskPopup.hidden = YES;
     [cv addSubview:self.startTaskPopup];
 
-    self.startNumberField = [[NSTextField alloc] initWithFrame:NSMakeRect(M + 126, y, 90, 20)];
+    self.startNumberField = [[NSTextField alloc] initWithFrame:NSMakeRect(M + 54, y - 20, 70, 20)];
     self.startNumberField.font = [NSFont monospacedSystemFontOfSize:10 weight:NSFontWeightRegular];
     self.startNumberField.placeholderString = @"2";
     self.startNumberField.stringValue = @"2";
+    self.startNumberField.autoresizingMask = NSViewMinYMargin;
     [cv addSubview:self.startNumberField];
 
-    [cv addSubview:[self labelAt:NSMakeRect(M + 220, y + 2, 10, 14) text:@"^" bold:YES size:11]];
+    NSTextField *caretLbl = [self labelAt:NSMakeRect(M + 128, y - 18, 10, 14) text:@"^" bold:YES size:11];
+    caretLbl.autoresizingMask = NSViewMinYMargin;
+    [cv addSubview:caretLbl];
 
-    self.startPowerField = [[NSTextField alloc] initWithFrame:NSMakeRect(M + 233, y, 40, 20)];
+    self.startPowerField = [[NSTextField alloc] initWithFrame:NSMakeRect(M + 140, y - 20, 36, 20)];
     self.startPowerField.font = [NSFont monospacedSystemFontOfSize:10 weight:NSFontWeightRegular];
     self.startPowerField.placeholderString = @"64";
     self.startPowerField.stringValue = @"64";
+    self.startPowerField.autoresizingMask = NSViewMinYMargin;
     [cv addSubview:self.startPowerField];
 
-    [cv addSubview:[self labelAt:NSMakeRect(M + 277, y + 2, 22, 14) text:@"+1" bold:NO size:10]];
+    NSTextField *plusLbl = [self labelAt:NSMakeRect(M + 180, y - 18, 18, 14) text:@"+1" bold:NO size:10];
+    plusLbl.autoresizingMask = NSViewMinYMargin;
+    [cv addSubview:plusLbl];
 
-    NSButton *setStartBtn = [self buttonAt:NSMakeRect(M + 304, y, 70, 20)
+    NSButton *setStartBtn = [self buttonAt:NSMakeRect(M + 200, y - 20, 64, 20)
         title:@"Set Start" action:@selector(setStartPoint:)];
     setStartBtn.font = [NSFont systemFontOfSize:10];
+    setStartBtn.autoresizingMask = NSViewMinYMargin;
     [cv addSubview:setStartBtn];
 
-    // Hint label (right of Set Start)
-    self.startHintLabel = [self labelAt:NSMakeRect(M + 382, y + 1, CW - 382, 14)
-        text:@"" bold:NO size:9];
+    self.startHintLabel = [self labelAt:NSMakeRect(M + 270, y - 19, CW - 270, 14)
+        text:@"" bold:NO size:8.5];
     self.startHintLabel.textColor = [NSColor secondaryLabelColor];
+    self.startHintLabel.autoresizingMask = NSViewMinYMargin | NSViewWidthSizable;
     [cv addSubview:self.startHintLabel];
     [self startTaskChanged:nil];
-    y -= 26;
-
-    // ═══════════════════════════════════════════════════════════════════
-    // CHECK / TOOLS
-    // ═══════════════════════════════════════════════════════════════════
-    NSBox *sep2 = [[NSBox alloc] initWithFrame:NSMakeRect(M, y, CW, 1)];
-    sep2.boxType = NSBoxSeparator;
-    [cv addSubview:sep2];
-    y -= 16;
-
-    [cv addSubview:[self labelAt:NSMakeRect(M, y, 200, 16)
-        text:@"Check & Tools" bold:YES size:12]];
     y -= 22;
 
-    // Mode popup
-    self.checkModePopup = [[NSPopUpButton alloc] initWithFrame:NSMakeRect(M, y, 140, 22) pullsDown:NO];
+    // Task status list
+    self.activeTaskListLabel = [self labelAt:NSMakeRect(M, y - 110, CW, 110)
+        text:@"No tasks running. Select a test above and click Start." bold:NO size:9];
+    self.activeTaskListLabel.font = [NSFont monospacedSystemFontOfSize:9 weight:NSFontWeightRegular];
+    self.activeTaskListLabel.maximumNumberOfLines = 0;
+    self.activeTaskListLabel.cell.wraps = YES;
+    self.activeTaskListLabel.cell.scrollable = NO;
+    self.activeTaskListLabel.autoresizingMask = NSViewMinYMargin | NSViewWidthSizable;
+    [cv addSubview:self.activeTaskListLabel];
+
+    for (int i = 0; i < NUM_TASKS; i++) {
+        NSNumber *key = @((int)types[i]);
+        NSButton *btn = [[NSButton alloc] init];
+        btn.tag = (int)types[i];
+        btn.title = @"Start";
+        self.taskButtons[key] = btn;
+        self.taskLabels[key] = [[NSTextField alloc] init];
+    }
+    y -= 114;
+
+    // ── CHECK & TOOLS ────────────────────────────────────────────────
+    NSBox *sep2 = [[NSBox alloc] initWithFrame:NSMakeRect(M, y, CW, 1)];
+    sep2.boxType = NSBoxSeparator;
+    sep2.autoresizingMask = NSViewMinYMargin | NSViewWidthSizable;
+    [cv addSubview:sep2];
+    y -= 4;
+
+    NSTextField *checkLbl = [self labelAt:NSMakeRect(M, y - 15, 100, 14)
+        text:@"Check & Tools" bold:YES size:10];
+    checkLbl.autoresizingMask = NSViewMinYMargin;
+    [cv addSubview:checkLbl];
+    y -= 18;
+
+    self.checkModePopup = [[NSPopUpButton alloc] initWithFrame:NSMakeRect(M, y - 22, 140, 22) pullsDown:NO];
     [self.checkModePopup addItemWithTitle:@"Check Single"];
     [self.checkModePopup addItemWithTitle:@"Check From Here"];
     [self.checkModePopup addItemWithTitle:@"Check Linear"];
@@ -390,27 +433,73 @@ static NSString *formatNumber(uint64_t n) {
     self.checkModePopup.target = self;
     self.checkModePopup.action = @selector(checkModeChanged:);
     self.checkModePopup.font = [NSFont systemFontOfSize:10];
+    self.checkModePopup.autoresizingMask = NSViewMinYMargin;
     [cv addSubview:self.checkModePopup];
 
-    // From field (multi-line NSTextView for paste support)
-    self.checkFromScroll = [[NSScrollView alloc] initWithFrame:NSMakeRect(M + 148, y - 16, 220, 40)];
-    self.checkFromScroll.hasVerticalScroller = YES;
+    self.checkGoButton = [self buttonAt:NSMakeRect(M + 146, y - 22, 50, 22)
+        title:@"Go" action:@selector(checkGo:)];
+    self.checkGoButton.font = [NSFont systemFontOfSize:10];
+    self.checkGoButton.autoresizingMask = NSViewMinYMargin;
+    [cv addSubview:self.checkGoButton];
+
+    self.checkStopButton = [self buttonAt:NSMakeRect(M + 200, y - 22, 50, 22)
+        title:@"Stop" action:@selector(checkStopAction:)];
+    self.checkStopButton.font = [NSFont systemFontOfSize:10];
+    self.checkStopButton.enabled = NO;
+    self.checkStopButton.autoresizingMask = NSViewMinYMargin;
+    [cv addSubview:self.checkStopButton];
+
+    self.benchmarkButton = [self buttonAt:NSMakeRect(M + 256, y - 22, 76, 22)
+        title:@"Benchmark" action:@selector(runBenchmark:)];
+    self.benchmarkButton.font = [NSFont systemFontOfSize:10];
+    self.benchmarkButton.autoresizingMask = NSViewMinYMargin;
+    [cv addSubview:self.benchmarkButton];
+
+    self.checkAtDiscoveryButton = [[NSButton alloc] initWithFrame:NSMakeRect(M + 340, y - 22, 150, 18)];
+    self.checkAtDiscoveryButton.buttonType = NSButtonTypeSwitch;
+    self.checkAtDiscoveryButton.title = @"CheckAtDiscovery";
+    self.checkAtDiscoveryButton.font = [NSFont systemFontOfSize:9];
+    self.checkAtDiscoveryButton.toolTip = @"Run Wieferich/WallSunSun/Wilson tests on each predicted prime";
+    self.checkAtDiscoveryButton.state = NSControlStateValueOff;
+    self.checkAtDiscoveryButton.autoresizingMask = NSViewMinYMargin;
+    [cv addSubview:self.checkAtDiscoveryButton];
+
+    self.primeFactorButton = [self buttonAt:NSMakeRect(M + 490, y - 22, 110, 20)
+        title:@"Run PrimeFactor" action:@selector(runPrimeFactor:)];
+    self.primeFactorButton.font = [NSFont systemFontOfSize:10];
+    self.primeFactorButton.hidden = YES;
+    self.primeFactorButton.autoresizingMask = NSViewMinYMargin;
+    [cv addSubview:self.primeFactorButton];
+
+    self.benchmarkStopButton = nil;
+    y -= 24;
+
+    // From field
+    NSTextField *fromLbl = [self labelAt:NSMakeRect(M, y - 18, 34, 14) text:@"From:" bold:NO size:9.5];
+    fromLbl.autoresizingMask = NSViewMinYMargin;
+    [cv addSubview:fromLbl];
+    self.checkFromScroll = [[NSScrollView alloc] initWithFrame:NSMakeRect(M + 36, y - 20, CW - 36, 22)];
+    self.checkFromScroll.hasVerticalScroller = NO;
     self.checkFromScroll.borderType = NSBezelBorder;
-    self.checkFromField = [[NSTextView alloc] initWithFrame:NSMakeRect(0, 0, 216, 36)];
+    self.checkFromScroll.autoresizingMask = NSViewMinYMargin | NSViewWidthSizable;
+    self.checkFromField = [[NSTextView alloc] initWithFrame:NSMakeRect(0, 0, CW - 40, 18)];
     self.checkFromField.font = [NSFont monospacedSystemFontOfSize:10 weight:NSFontWeightRegular];
     self.checkFromField.autoresizingMask = NSViewWidthSizable;
     self.checkFromField.richText = NO;
     self.checkFromField.allowsUndo = YES;
     self.checkFromScroll.documentView = self.checkFromField;
     [cv addSubview:self.checkFromScroll];
+    y -= 24;
 
-    // To label + field
-    self.checkToLabel = [self labelAt:NSMakeRect(M + 374, y + 2, 16, 14) text:@"to" bold:NO size:10];
+    // To field (hidden by default)
+    self.checkToLabel = [self labelAt:NSMakeRect(M, y - 18, 24, 14) text:@"To:" bold:NO size:9.5];
+    self.checkToLabel.autoresizingMask = NSViewMinYMargin;
     [cv addSubview:self.checkToLabel];
-    self.checkToScroll = [[NSScrollView alloc] initWithFrame:NSMakeRect(M + 394, y - 16, 180, 40)];
-    self.checkToScroll.hasVerticalScroller = YES;
+    self.checkToScroll = [[NSScrollView alloc] initWithFrame:NSMakeRect(M + 36, y - 20, CW - 36, 22)];
+    self.checkToScroll.hasVerticalScroller = NO;
     self.checkToScroll.borderType = NSBezelBorder;
-    self.checkToField = [[NSTextView alloc] initWithFrame:NSMakeRect(0, 0, 176, 36)];
+    self.checkToScroll.autoresizingMask = NSViewMinYMargin | NSViewWidthSizable;
+    self.checkToField = [[NSTextView alloc] initWithFrame:NSMakeRect(0, 0, CW - 40, 18)];
     self.checkToField.font = [NSFont monospacedSystemFontOfSize:10 weight:NSFontWeightRegular];
     self.checkToField.autoresizingMask = NSViewWidthSizable;
     self.checkToField.richText = NO;
@@ -419,58 +508,20 @@ static NSString *formatNumber(uint64_t n) {
     [cv addSubview:self.checkToScroll];
     self.checkToLabel.hidden = YES;
     self.checkToScroll.hidden = YES;
-
-    // Buttons — aligned right of fields
-    CGFloat bx = W - M - 200;
-    self.checkGoButton = [self buttonAt:NSMakeRect(bx, y, 56, 22)
-        title:@"Go" action:@selector(checkGo:)];
-    self.checkGoButton.font = [NSFont systemFontOfSize:10];
-    [cv addSubview:self.checkGoButton];
-
-    self.checkStopButton = [self buttonAt:NSMakeRect(bx + 62, y, 56, 22)
-        title:@"Stop" action:@selector(checkStopAction:)];
-    self.checkStopButton.font = [NSFont systemFontOfSize:10];
-    self.checkStopButton.enabled = NO;
-    [cv addSubview:self.checkStopButton];
-
-    self.benchmarkButton = [self buttonAt:NSMakeRect(bx + 124, y, 76, 22)
-        title:@"Benchmark" action:@selector(runBenchmark:)];
-    self.benchmarkButton.font = [NSFont systemFontOfSize:10];
-    [cv addSubview:self.benchmarkButton];
-
-    self.benchmarkStopButton = nil; // removed — Stop All covers it
-    y -= 6;
-
-    // Extras row
-    self.checkAtDiscoveryButton = [[NSButton alloc] initWithFrame:NSMakeRect(M, y, 160, 16)];
-    self.checkAtDiscoveryButton.buttonType = NSButtonTypeSwitch;
-    self.checkAtDiscoveryButton.title = @"CheckAtDiscovery";
-    self.checkAtDiscoveryButton.font = [NSFont systemFontOfSize:10];
-    self.checkAtDiscoveryButton.toolTip = @"Run Wieferich/WallSunSun/Wilson tests on each predicted prime";
-    self.checkAtDiscoveryButton.state = NSControlStateValueOff;
-    [cv addSubview:self.checkAtDiscoveryButton];
-
-    self.primeFactorButton = [self buttonAt:NSMakeRect(M + 170, y - 1, 120, 20)
-        title:@"Run PrimeFactor" action:@selector(runPrimeFactor:)];
-    self.primeFactorButton.font = [NSFont systemFontOfSize:10];
-    self.primeFactorButton.hidden = YES;
-    [cv addSubview:self.primeFactorButton];
-    y -= 6;
-
-    // ═══════════════════════════════════════════════════════════════════
-    // OUTPUT LOG
-    // ═══════════════════════════════════════════════════════════════════
-    NSBox *sep3 = [[NSBox alloc] initWithFrame:NSMakeRect(M, y, CW, 1)];
-    sep3.boxType = NSBoxSeparator;
-    [cv addSubview:sep3];
     y -= 4;
 
-    // Log fills from current y down to bottom margin
-    CGFloat logBottom = 10;
+    // ── OUTPUT LOG (fills remaining space) ───────────────────────────
+    NSBox *sep3 = [[NSBox alloc] initWithFrame:NSMakeRect(M, y, CW, 1)];
+    sep3.boxType = NSBoxSeparator;
+    sep3.autoresizingMask = NSViewMinYMargin | NSViewWidthSizable;
+    [cv addSubview:sep3];
+    y -= 2;
+
+    CGFloat logBottom = 4;
     CGFloat logHeight = y - logBottom;
-    if (logHeight < LOG_H) logHeight = LOG_H; // ensure minimum log height
     NSScrollView *scroll = [[NSScrollView alloc] initWithFrame:NSMakeRect(M, logBottom, CW, logHeight)];
     scroll.hasVerticalScroller = YES;
+    scroll.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
     self.resultView = [[NSTextView alloc] initWithFrame:NSMakeRect(0, 0, CW - 4, logHeight)];
     self.resultView.editable = NO;
     self.resultView.font = [NSFont monospacedSystemFontOfSize:10 weight:NSFontWeightRegular];
@@ -480,31 +531,30 @@ static NSString *formatNumber(uint64_t n) {
     [cv addSubview:scroll];
 
     // Welcome text
-    [self appendText:@"PrimePath v0.5.0 — Metal GPU Prime Discovery Engine\n"];
-    [self appendText:@"════════════════════════════════════════════════════\n"];
-    [self appendText:[NSString stringWithFormat:@"GPU: %@\n",
-        [NSString stringWithUTF8String:_gpu->name().c_str()]]];
-    [self appendText:[NSString stringWithFormat:@"Data: %@\n\n", DATA_DIR]];
+    [self appendText:@"PrimePath v0.5.0 -- Metal GPU Prime Discovery Engine\n"];
+    [self appendText:[NSString stringWithFormat:@"GPU: %@ | Data: %@\n",
+        [NSString stringWithUTF8String:_gpu->name().c_str()], DATA_DIR]];
 
-    // Show known primes database stats
     auto& kdb = prime::known_db();
     [self appendText:[NSString stringWithFormat:
-        @"Known primes database: %zu primes, %zu pseudoprimes loaded\n",
+        @"Known: %zu primes, %zu pseudoprimes\n",
         kdb.prime_count(), kdb.pseudoprime_count()]];
 
-    // Show known discoveries
-    [self appendText:@"Known discoveries (pre-loaded):\n"];
-    for (auto& d : _taskMgr->discoveries()) {
-        NSString *line = [NSString stringWithFormat:@"  %s: %llu",
-            prime::task_name(d.type), d.value];
-        if (d.value2 > 0) line = [line stringByAppendingFormat:@", %llu", d.value2];
-        [self appendText:[line stringByAppendingString:@"\n"]];
+    if (_taskMgr->discoveries().size() > 0) {
+        [self appendText:@"Discoveries: "];
+        bool first = true;
+        for (auto& d : _taskMgr->discoveries()) {
+            if (!first) [self appendText:@", "];
+            NSString *entry = [NSString stringWithFormat:@"%s(%llu",
+                prime::task_name(d.type), d.value];
+            if (d.value2 > 0) entry = [entry stringByAppendingFormat:@",%llu", d.value2];
+            entry = [entry stringByAppendingString:@")"];
+            [self appendText:entry];
+            first = false;
+        }
+        [self appendText:@"\n"];
     }
-    [self appendText:@"\nTarget primes:\n"];
-    [self appendText:@"  Wieferich   — frontier: 6.7x10^15, only 1093 & 3511 known\n"];
-    [self appendText:@"  Wall-Sun-Sun — frontier: 10^14, NONE ever found\n"];
-    [self appendText:@"  Wilson      — frontier: 2x10^13, only 5, 13, 563 known\n"];
-    [self appendText:@"\nCheck modes: Single | From Here | Linear | PrimeLocation\n\n"];
+    [self appendText:@"\nHelp menu or ? button for glossary. Ready.\n\n"];
 
     [self.mainWindow makeKeyAndOrderFront:nil];
 }
@@ -1417,6 +1467,18 @@ static NSString *formatNumber(uint64_t n) {
             self.startHintLabel.stringValue =
                 @"Emirps: ~10% of primes are emirps. Summary-only counting.";
             break;
+        case prime::TaskType::MersenneTrial:
+            self.startNumberField.stringValue = @"2";
+            self.startPowerField.stringValue = @"20";
+            self.startHintLabel.stringValue =
+                @"Mersenne TF: Trial factor 2^p-1 on GPU. GIMPS has tested small exponents.";
+            break;
+        case prime::TaskType::FermatFactor:
+            self.startNumberField.stringValue = @"2";
+            self.startPowerField.stringValue = @"0";
+            self.startHintLabel.stringValue =
+                @"Fermat Factor: Search for factors of F_m. Set base=m, power=0.";
+            break;
     }
 }
 
@@ -1502,7 +1564,6 @@ static NSString *formatNumber(uint64_t n) {
     auto it = tasks.find(t);
     if (it == tasks.end()) return;
 
-    // Use should_run (atomic, instant) instead of status (set by worker thread, delayed)
     if (it->second.should_run.load()) {
         _taskMgr->pause_task(t);
         sender.title = @"Start";
@@ -1512,6 +1573,179 @@ static NSString *formatNumber(uint64_t n) {
     }
 }
 
+- (void)taskSelectionChanged:(id)sender {
+    // Sync the hidden startTaskPopup to match the main dropdown
+    NSInteger idx = self.taskSelectPopup.indexOfSelectedItem;
+    [self.startTaskPopup selectItemAtIndex:idx];
+    [self startTaskChanged:nil];
+
+    // Update Start/Pause button state
+    auto t = (prime::TaskType)self.taskSelectPopup.selectedItem.tag;
+    auto& tasks = _taskMgr->tasks();
+    auto it = tasks.find(t);
+    if (it != tasks.end()) {
+        self.taskStartBtn.title = it->second.should_run.load() ? @"Pause" : @"Start";
+    }
+}
+
+- (void)taskToggleSelected:(NSButton *)sender {
+    auto t = (prime::TaskType)self.taskSelectPopup.selectedItem.tag;
+    auto& tasks = _taskMgr->tasks();
+    auto it = tasks.find(t);
+    if (it == tasks.end()) return;
+
+    if (it->second.should_run.load()) {
+        _taskMgr->pause_task(t);
+        self.taskStartBtn.title = @"Start";
+    } else {
+        _taskMgr->start_task(t);
+        self.taskStartBtn.title = @"Pause";
+    }
+}
+
+- (void)showAboutPanel:(id)sender {
+    NSDictionary *opts = @{
+        @"ApplicationName": @"PrimePath",
+        @"Copyright": @"Development by Sergei Nester\nsnester@viewbuild.com",
+        @"ApplicationVersion": @"0.5",
+        @"Version": @"0.5.0",
+    };
+    [[NSApplication sharedApplication] orderFrontStandardAboutPanelWithOptions:opts];
+}
+
+- (void)showInfoPanel:(id)sender {
+    NSAlert *alert = [[NSAlert alloc] init];
+    alert.messageText = @"Log Output Glossary";
+    alert.informativeText =
+        @"GPU flush: 281318 WSS → GPU | shadow: avg=128 [100-214] 26546 suspicious\n\n"
+
+        @"GPU flush — CPU sieve buffer is full, candidates sent to GPU for testing.\n\n"
+        @"281,318 — Number of candidate primes in this batch.\n\n"
+        @"WSS — Wall-Sun-Sun prime search. Looking for primes p where p² divides "
+        @"F(p-(p/5)). None have ever been found.\n\n"
+        @"→ GPU — Candidates dispatched to Metal GPU for modular arithmetic.\n\n"
+        @"shadow — Even-shadow pre-filter. Each candidate gets a score based on how "
+        @"well the divisors of p±1 constrain the computation. Higher = better.\n\n"
+        @"avg=128 — Average shadow score across all candidates in the batch.\n\n"
+        @"[100-214] — Score range: lowest 100, highest 214.\n\n"
+        @"suspicious — Candidates with low shadow scores (poor p±1 divisor structure). "
+        @"Less likely to be interesting but still tested. Reordered to back of batch.\n\n"
+
+        @"── Other terms ──\n\n"
+        @"pos: — Current search position (the number being tested).\n\n"
+        @"found: — Count of discoveries (primes/factors found so far).\n\n"
+        @"/s — Candidates tested per second.\n\n"
+        @"GPU util — Percentage of time the GPU is actively computing.\n\n"
+        @"threads — Total GPU threads dispatched since launch.\n\n"
+        @"batches — Number of GPU command buffers submitted.\n\n"
+        @"ms/batch — Average GPU execution time per batch.\n\n"
+        @"ALU/NEON — CPU SIMD sieve stats. 'tested' = candidates sieved, "
+        @"'rejected' = composites filtered out before GPU.\n\n"
+        @"Predictor — Pseudoprime predictor stats. Carm = Carmichael numbers, "
+        @"SPRP2 = strong probable primes base 2, frontier = highest value tested.";
+    alert.alertStyle = NSAlertStyleInformational;
+    [alert addButtonWithTitle:@"OK"];
+    [alert runModal];
+}
+
+- (void)showHelpPanel:(id)sender {
+    NSWindow *helpWin = [[NSWindow alloc]
+        initWithContentRect:NSMakeRect(200, 200, 600, 520)
+        styleMask:(NSWindowStyleMaskTitled | NSWindowStyleMaskClosable | NSWindowStyleMaskResizable)
+        backing:NSBackingStoreBuffered defer:NO];
+    helpWin.title = @"PrimePath Help";
+    helpWin.releasedWhenClosed = NO;
+
+    NSScrollView *sv = [[NSScrollView alloc] initWithFrame:helpWin.contentView.bounds];
+    sv.hasVerticalScroller = YES;
+    sv.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
+    NSTextView *tv = [[NSTextView alloc] initWithFrame:NSMakeRect(0, 0, 580, 800)];
+    tv.editable = NO;
+    tv.font = [NSFont systemFontOfSize:12];
+    tv.autoresizingMask = NSViewWidthSizable;
+    tv.textContainerInset = NSMakeSize(10, 10);
+    sv.documentView = tv;
+    [helpWin.contentView addSubview:sv];
+
+    tv.string =
+        @"PRIMEPATH HELP\n"
+        @"==============\n\n"
+        @"PrimePath is a prime number search engine that runs on Apple Silicon GPUs\n"
+        @"using Metal compute shaders. It is the first Metal implementation for\n"
+        @"Mersenne trial factoring and Fermat factor searching.\n\n"
+
+        @"SEARCH TASKS\n"
+        @"------------\n"
+        @"Select a search from the dropdown and click Start. Multiple searches can\n"
+        @"run simultaneously. Progress is saved automatically and restored on relaunch.\n\n"
+
+        @"  Wieferich      Primes where 2^(p-1) = 1 (mod p^2). Only two known: 1093, 3511.\n"
+        @"  Wall-Sun-Sun   Primes where p^2 divides Fibonacci(p-(p/5)). None known.\n"
+        @"  Wilson         Primes where (p-1)! = -1 (mod p^2). Only three: 5, 13, 563.\n"
+        @"  Twin           Pairs (p, p+2) both prime.\n"
+        @"  Sophie Germain Pairs where p and 2p+1 are both prime.\n"
+        @"  Cousin         Pairs (p, p+4) both prime.\n"
+        @"  Sexy           Pairs (p, p+6) both prime.\n"
+        @"  General        Count all primes in a range.\n"
+        @"  Emirp          Primes that are also prime when digits reversed.\n"
+        @"  Mersenne TF    Trial factor Mersenne numbers 2^p-1 on GPU.\n"
+        @"  Fermat Factor  Find factors of Fermat numbers F_m = 2^(2^m)+1 on GPU.\n\n"
+
+        @"LOG OUTPUT GLOSSARY\n"
+        @"-------------------\n"
+        @"  GPU flush      CPU sieve buffer full, batch sent to GPU.\n"
+        @"  WSS/Wief       Abbreviations for Wall-Sun-Sun / Wieferich.\n"
+        @"  -> GPU         Candidates dispatched to Metal GPU.\n"
+        @"  shadow         Even-shadow pre-filter score. Higher = better candidate.\n"
+        @"  avg/min/max    Shadow score statistics for the batch.\n"
+        @"  suspicious     Low-score candidates (poor p+/-1 divisor structure).\n"
+        @"  fully-factored Candidates whose p-1 is completely factored (best quality).\n"
+        @"  pos:           Current search position.\n"
+        @"  found:         Discoveries made so far.\n"
+        @"  /s             Candidates tested per second.\n\n"
+
+        @"RESOURCE MONITOR\n"
+        @"----------------\n"
+        @"  CPU bar        System-wide CPU usage.\n"
+        @"  Mem bar        App memory usage (resident size).\n"
+        @"  GPU util       Percentage of time GPU is actively computing.\n"
+        @"  threads        Total GPU threads dispatched since launch.\n"
+        @"  batches        Number of GPU command buffers submitted.\n"
+        @"  ms/batch       Average GPU execution time per batch.\n"
+        @"  ALU/NEON       CPU SIMD sieve statistics.\n"
+        @"                 tested = candidates sieved, rejected = composites filtered.\n"
+        @"  Predictor      Pseudoprime predictor. Carm = Carmichael numbers,\n"
+        @"                 SPRP2 = strong probable primes base 2.\n\n"
+
+        @"SET TEST BOUNDS\n"
+        @"---------------\n"
+        @"Set the starting position for any search. Enter base ^ exponent + 1.\n"
+        @"Example: 2 ^ 64 + 1 starts searching from 2^64 + 1.\n\n"
+
+        @"CHECK & TOOLS\n"
+        @"-------------\n"
+        @"  Check Single   Test if a single number is prime.\n"
+        @"  Check From     Find primes starting from a number.\n"
+        @"  Check Linear   Enumerate all primes in a range.\n"
+        @"  PrimeLocation  Predict prime locations using the PrimeLocation algorithm.\n"
+        @"  Benchmark      Run GPU and CPU performance benchmarks.\n"
+        @"  CheckAtDiscovery  Run special tests on each predicted prime as found.\n\n"
+
+        @"KEYBOARD SHORTCUTS\n"
+        @"------------------\n"
+        @"  Cmd+Q          Quit\n"
+        @"  Cmd+?          This help window\n"
+        @"  Cmd+C/V/X/A    Copy/Paste/Cut/Select All in text fields\n\n"
+
+        @"ABOUT\n"
+        @"-----\n"
+        @"Development by Sergei Nester\n"
+        @"snester@viewbuild.com\n"
+        @"https://github.com/s1rj1n/primepath\n";
+
+    [helpWin makeKeyAndOrderFront:nil];
+}
+
 - (void)stopAll:(id)sender {
     _taskMgr->stop_all();
     [self stopBackgroundCheck];
@@ -1519,6 +1753,7 @@ static NSString *formatNumber(uint64_t n) {
     for (NSButton *btn in self.taskButtons.allValues) {
         btn.title = @"Start";
     }
+    self.taskStartBtn.title = @"Start";
     [self appendText:@"All tasks stopped. Progress saved.\n"];
 }
 
@@ -1695,36 +1930,41 @@ static NSString *formatNumber(uint64_t n) {
     int running = 0;
     uint64_t total_found = 0;
 
+    NSMutableString *activeList = [NSMutableString new];
+
     for (auto& [type, task] : tasks) {
         NSNumber *key = @((int)type);
-        NSTextField *label = self.taskLabels[key];
         NSButton *btn = self.taskButtons[key];
-        if (!label) continue;
 
         if (task.should_run.load()) {
             running++;
-            label.stringValue = [NSString stringWithFormat:
-                @"pos: %@ | found: %@ | tested: %@ | %@/s",
+            [activeList appendFormat:@"[RUN]  %-14s  pos: %@  found: %@  %@/s\n",
+                prime::task_name(type),
                 formatNumber(task.current_pos),
                 formatNumber(task.found_count),
-                formatNumber(task.tested_count),
                 formatNumber((uint64_t)task.rate)];
-            label.textColor = [NSColor colorWithSRGBRed:0.0 green:0.55 blue:0.0 alpha:1.0];
-            btn.title = @"Pause";
+            if (btn) btn.title = @"Pause";
         } else if (task.tested_count > 0) {
-            label.stringValue = [NSString stringWithFormat:
-                @"paused at %@ | found: %@ | tested: %@",
+            [activeList appendFormat:@"[STOP] %-14s  at: %@  found: %@  tested: %@\n",
+                prime::task_name(type),
                 formatNumber(task.current_pos),
                 formatNumber(task.found_count),
                 formatNumber(task.tested_count)];
-            label.textColor = [NSColor systemOrangeColor];
-            btn.title = @"Start";
-        } else {
-            label.stringValue = @"Idle";
-            label.textColor = [NSColor secondaryLabelColor];
-            btn.title = @"Start";
+            if (btn) btn.title = @"Start";
         }
         total_found += task.found_count;
+    }
+
+    if (activeList.length == 0) {
+        [activeList appendString:@"No tasks running. Select a test above and click Start."];
+    }
+    self.activeTaskListLabel.stringValue = activeList;
+
+    // Update the Start/Pause button for the currently selected test
+    auto selectedType = (prime::TaskType)self.taskSelectPopup.selectedItem.tag;
+    auto sit = tasks.find(selectedType);
+    if (sit != tasks.end()) {
+        self.taskStartBtn.title = sit->second.should_run.load() ? @"Pause" : @"Start";
     }
 
     if (_checkRunning.load()) running++;

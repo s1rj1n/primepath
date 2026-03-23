@@ -14,13 +14,17 @@ int main(int argc, const char * argv[]) {
         // App menu
         NSMenuItem *appMenuItem = [[NSMenuItem alloc] init];
         [menubar addItem:appMenuItem];
-        NSMenu *appMenu = [[NSMenu alloc] init];
+        NSMenu *appMenu = [[NSMenu alloc] initWithTitle:@"PrimePath"];
+        [appMenu addItemWithTitle:@"About PrimePath"
+                           action:@selector(showAboutPanel:)
+                    keyEquivalent:@""];
+        [appMenu addItem:[NSMenuItem separatorItem]];
         [appMenu addItemWithTitle:@"Quit PrimePath"
                            action:@selector(terminate:)
                     keyEquivalent:@"q"];
         appMenuItem.submenu = appMenu;
 
-        // Edit menu — enables Cmd+C/V/X/A in text fields
+        // Hidden edit menu — keeps Cmd+C/V/X/A working in text fields
         NSMenuItem *editMenuItem = [[NSMenuItem alloc] init];
         [menubar addItem:editMenuItem];
         NSMenu *editMenu = [[NSMenu alloc] initWithTitle:@"Edit"];
@@ -32,6 +36,16 @@ int main(int argc, const char * argv[]) {
         [editMenu addItemWithTitle:@"Paste" action:@selector(paste:) keyEquivalent:@"v"];
         [editMenu addItemWithTitle:@"Select All" action:@selector(selectAll:) keyEquivalent:@"a"];
         editMenuItem.submenu = editMenu;
+        editMenuItem.hidden = YES;
+
+        // Help menu
+        NSMenuItem *helpMenuItem = [[NSMenuItem alloc] init];
+        [menubar addItem:helpMenuItem];
+        NSMenu *helpMenu = [[NSMenu alloc] initWithTitle:@"Help"];
+        [helpMenu addItemWithTitle:@"PrimePath Help"
+                            action:@selector(showHelpPanel:)
+                     keyEquivalent:@"?"];
+        helpMenuItem.submenu = helpMenu;
 
         [app setMainMenu:menubar];
 
