@@ -38,6 +38,16 @@ int main(int argc, const char * argv[]) {
         editMenuItem.submenu = editMenu;
         editMenuItem.hidden = YES;
 
+        // Network menu
+        NSMenuItem *networkMenuItem = [[NSMenuItem alloc] init];
+        [menubar addItem:networkMenuItem];
+        NSMenu *networkMenu = [[NSMenu alloc] initWithTitle:@"Network"];
+        NSMenuItem *distItem = [networkMenu addItemWithTitle:@"Distributed Setup..."
+                            action:@selector(showDistributedSetup:)
+                     keyEquivalent:@"D"];
+        distItem.keyEquivalentModifierMask = NSEventModifierFlagCommand | NSEventModifierFlagShift;
+        networkMenuItem.submenu = networkMenu;
+
         // Help menu
         NSMenuItem *helpMenuItem = [[NSMenuItem alloc] init];
         [menubar addItem:helpMenuItem];

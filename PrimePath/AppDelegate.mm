@@ -10,9 +10,24 @@
 #include <thread>
 #include <atomic>
 #include <algorithm>
+#include <set>
 #include <future>
+#include "Network/ConductorServer.hpp"
+#include "Network/CarriageClient.hpp"
+#include "DataTools.hpp"
 
 static NSString *const DATA_DIR = @"/Users/sergeinester/Documents/primes/primelocations";
+
+// ── Test Catalog Entry (loaded from TestCatalog.txt) ─────────────────
+struct TestCatalogEntry {
+    std::string test_id;
+    std::string name;
+    std::string category;
+    std::string mode;        // "search" or "tool"
+    std::string description;
+    std::string algorithms;
+    std::string default_params;
+};
 
 static NSString *formatNumber(uint64_t n) {
     NSNumberFormatter *fmt = [[NSNumberFormatter alloc] init];
@@ -22,7 +37,7 @@ static NSString *formatNumber(uint64_t n) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════
-// EQBarView — Graphic equalizer-style vertical bar visualizer
+// EQBarView -- Graphic equalizer-style vertical bar visualizer
 // ═══════════════════════════════════════════════════════════════════════
 
 static const int EQ_HISTORY = 32; // number of vertical bars (time history)
@@ -147,7 +162,7 @@ static const int EQ_HISTORY = 32; // number of vertical bars (time history)
 @end
 
 // ═══════════════════════════════════════════════════════════════════════
-// PrimePath v0.5 — Metal GPU + Multi-Core Prime Discovery
+// PrimePath v0.5 -- Metal GPU + Multi-Core Prime Discovery
 // ═══════════════════════════════════════════════════════════════════════
 
 @interface AppDelegate () {
@@ -165,6 +180,14 @@ static const int EQ_HISTORY = 32; // number of vertical bars (time history)
     uint64_t _prevDiskWriteBytes;
     // PrimeLocation predicted primes list (persists after test ends)
     std::vector<uint64_t> _predictedPrimes;
+    // Distributed computing
+    prime::ConductorServer *_conductor;
+    prime::CarriageClient  *_carriage;
+    // Test catalog
+    std::vector<TestCatalogEntry> _testCatalog;
+    std::vector<size_t> _testDisplayOrder;  // indices into _testCatalog (flat, with category headers as SIZE_MAX)
+    std::vector<std::string> _testCategories; // category names for headers
+    int _selectedTestIdx;  // index into _testCatalog, -1 if none
 }
 
 @property (strong) NSWindow *mainWindow;
@@ -214,12 +237,39 @@ static const int EQ_HISTORY = 32; // number of vertical bars (time history)
 @property (strong) NSButton *checkStopButton;
 
 // PrimeLocation extras
-@property (strong) NSButton *primeFactorButton;      // "Run PrimeFactor" — factor composites using predicted primes
+@property (strong) NSButton *primeFactorButton;      // "Run PrimeFactor" -- factor composites using predicted primes
 @property (strong) NSButton *checkAtDiscoveryButton;  // checkbox: run special tests on each predicted prime as found
 
 // Benchmark
 @property (strong) NSButton *benchmarkButton;
 @property (strong) NSButton *benchmarkStopButton;
+
+// Expression section
+@property (strong) NSTextField *expressionField;
+@property (strong) NSButton *expressionEvalButton;
+
+// Test catalog window
+@property (strong) NSWindow *testCatalogWindow;
+@property (strong) NSTableView *testTableView;
+@property (strong) NSTextView *testDetailView;
+@property (strong) NSTextView *testParamField;
+@property (strong) NSScrollView *testParamScroll;
+@property (strong) NSButton *testRunButton;
+
+// Distributed computing UI
+@property (strong) NSWindow *networkWindow;
+@property (strong) NSSegmentedControl *roleSegment;
+@property (strong) NSView *conductorPanel;
+@property (strong) NSView *carriagePanel;
+@property (strong) NSTextField *conductorPortField;
+@property (strong) NSButton *conductorStartStopBtn;
+@property (strong) NSTextField *carriageHostField;
+@property (strong) NSTextField *carriagePortField;
+@property (strong) NSButton *carriageConnectBtn;
+@property (strong) NSButton *bonjourToggle;
+@property (strong) NSTextView *connectedMachinesView;
+@property (strong) NSTextField *networkStatusLabel;
+@property (strong) NSTimer *networkRefreshTimer;
 
 @end
 
@@ -230,7 +280,7 @@ static const int EQ_HISTORY = 32; // number of vertical bars (time history)
     _prevIdleTicks = 0;
     _prevTotalTicks = 0;
 
-    // Init GPU backend (abstract — auto-selects Metal, Vulkan, or CPU)
+    // Init GPU backend (abstract -- auto-selects Metal, Vulkan, or CPU)
     _gpu = prime::create_best_backend();
 
     // Init Task Manager
@@ -261,6 +311,7 @@ static const int EQ_HISTORY = 32; // number of vertical bars (time history)
     _taskMgr->load_state();
     _taskMgr->save_state();
 
+    [self loadTestCatalog];
     [self buildUI];
 
     // Refresh stats every 500ms
@@ -301,7 +352,7 @@ static const int EQ_HISTORY = 32; // number of vertical bars (time history)
         styleMask:(NSWindowStyleMaskTitled | NSWindowStyleMaskClosable |
                    NSWindowStyleMaskMiniaturizable | NSWindowStyleMaskResizable)
         backing:NSBackingStoreBuffered defer:NO];
-    [self.mainWindow setTitle:@"PrimePath v0.5 — Metal GPU Prime Discovery"];
+    [self.mainWindow setTitle:@"PrimePath v0.5 -- Metal GPU Prime Discovery"];
     [self.mainWindow setMinSize:NSMakeSize(720, 400)];
     [self.mainWindow center]; // standard macOS centering
 
@@ -324,7 +375,7 @@ static const int EQ_HISTORY = 32; // number of vertical bars (time history)
 
     // ── HEADER ───────────────────────────────────────────────────────
     NSTextField *title = [self labelAt:NSMakeRect(M, y - 18, CW, 20)
-        text:@"PrimePath — Metal GPU Prime Discovery" bold:YES size:14];
+        text:@"PrimePath -- Metal GPU Prime Discovery" bold:YES size:14];
     title.autoresizingMask = NSViewMinYMargin | NSViewWidthSizable;
     [cv addSubview:title];
     y -= 18;
@@ -472,14 +523,20 @@ static const int EQ_HISTORY = 32; // number of vertical bars (time history)
     self.taskStartBtn.font = [NSFont systemFontOfSize:10];
     self.taskStartBtn.autoresizingMask = NSViewMinYMargin;
     [cv addSubview:self.taskStartBtn];
+
+    NSButton *catalogBtn = [self buttonAt:NSMakeRect(M + 448, y - 22, 100, 22)
+        title:@"Test Catalog..." action:@selector(showTestCatalog:)];
+    catalogBtn.font = [NSFont systemFontOfSize:10];
+    catalogBtn.autoresizingMask = NSViewMinYMargin;
+    [cv addSubview:catalogBtn];
     y -= 24;
 
-    // Start point row — directly below the test selector dropdown
+    // Start point row -- directly below the test selector dropdown
     NSTextField *startAtLbl = [self labelAt:NSMakeRect(M, y - 19, 52, 14) text:@"Start at:" bold:NO size:9.5];
     startAtLbl.autoresizingMask = NSViewMinYMargin;
     [cv addSubview:startAtLbl];
 
-    // Hidden startTaskPopup — synced to taskSelectPopup selection
+    // Hidden startTaskPopup -- synced to taskSelectPopup selection
     self.startTaskPopup = [[NSPopUpButton alloc] initWithFrame:NSZeroRect pullsDown:NO];
     for (int i = 0; i < NUM_TASKS; i++) {
         [self.startTaskPopup addItemWithTitle:
@@ -563,6 +620,7 @@ static const int EQ_HISTORY = 32; // number of vertical bars (time history)
     [self.checkModePopup addItemWithTitle:@"Check From Here"];
     [self.checkModePopup addItemWithTitle:@"Check Linear"];
     [self.checkModePopup addItemWithTitle:@"PrimeLocation"];
+    [self.checkModePopup addItemWithTitle:@"Expression"];
     self.checkModePopup.target = self;
     self.checkModePopup.action = @selector(checkModeChanged:);
     self.checkModePopup.font = [NSFont systemFontOfSize:10];
@@ -588,7 +646,19 @@ static const int EQ_HISTORY = 32; // number of vertical bars (time history)
     self.benchmarkButton.autoresizingMask = NSViewMinYMargin;
     [cv addSubview:self.benchmarkButton];
 
-    self.checkAtDiscoveryButton = [[NSButton alloc] initWithFrame:NSMakeRect(M + 340, y - 22, 150, 18)];
+    NSButton *runTestsBtn = [self buttonAt:NSMakeRect(M + 338, y - 22, 76, 22)
+        title:@"Run Tests" action:@selector(runInAppTests:)];
+    runTestsBtn.font = [NSFont systemFontOfSize:10];
+    runTestsBtn.autoresizingMask = NSViewMinYMargin;
+    [cv addSubview:runTestsBtn];
+
+    NSButton *pipelineBtn = [self buttonAt:NSMakeRect(M + 420, y - 22, 70, 22)
+        title:@"Pipeline" action:@selector(showPipelineBuilder:)];
+    pipelineBtn.font = [NSFont systemFontOfSize:10];
+    pipelineBtn.autoresizingMask = NSViewMinYMargin;
+    [cv addSubview:pipelineBtn];
+
+    self.checkAtDiscoveryButton = [[NSButton alloc] initWithFrame:NSMakeRect(M + 496, y - 22, 150, 18)];
     self.checkAtDiscoveryButton.buttonType = NSButtonTypeSwitch;
     self.checkAtDiscoveryButton.title = @"CheckAtDiscovery";
     self.checkAtDiscoveryButton.font = [NSFont systemFontOfSize:9];
@@ -597,7 +667,7 @@ static const int EQ_HISTORY = 32; // number of vertical bars (time history)
     self.checkAtDiscoveryButton.autoresizingMask = NSViewMinYMargin;
     [cv addSubview:self.checkAtDiscoveryButton];
 
-    self.primeFactorButton = [self buttonAt:NSMakeRect(M + 490, y - 22, 110, 20)
+    self.primeFactorButton = [self buttonAt:NSMakeRect(M + 560, y - 22, 110, 20)
         title:@"Run PrimeFactor" action:@selector(runPrimeFactor:)];
     self.primeFactorButton.font = [NSFont systemFontOfSize:10];
     self.primeFactorButton.hidden = YES;
@@ -642,6 +712,43 @@ static const int EQ_HISTORY = 32; // number of vertical bars (time history)
     self.checkToLabel.hidden = YES;
     self.checkToScroll.hidden = YES;
     y -= 4;
+
+    // ── EXPRESSION ──────────────────────────────────────────────────
+    NSBox *sepExpr = [[NSBox alloc] initWithFrame:NSMakeRect(M, y, CW, 1)];
+    sepExpr.boxType = NSBoxSeparator;
+    sepExpr.autoresizingMask = NSViewMinYMargin | NSViewWidthSizable;
+    [cv addSubview:sepExpr];
+    y -= 4;
+
+    NSTextField *exprLbl = [self labelAt:NSMakeRect(M, y - 15, 80, 14)
+        text:@"Expression" bold:YES size:10];
+    exprLbl.autoresizingMask = NSViewMinYMargin;
+    [cv addSubview:exprLbl];
+
+    self.expressionEvalButton = [self buttonAt:NSMakeRect(W - M - 70, y - 16, 70, 20)
+        title:@"Evaluate" action:@selector(expressionEvaluate:)];
+    self.expressionEvalButton.font = [NSFont systemFontOfSize:10];
+    self.expressionEvalButton.autoresizingMask = NSViewMinYMargin | NSViewMinXMargin;
+    [cv addSubview:self.expressionEvalButton];
+
+    NSButton *exprHelpBtn = [[NSButton alloc] initWithFrame:NSMakeRect(M + 80, y - 14, 18, 18)];
+    exprHelpBtn.bezelStyle = NSBezelStyleCircular;
+    exprHelpBtn.title = @"?";
+    exprHelpBtn.font = [NSFont boldSystemFontOfSize:10];
+    exprHelpBtn.target = self;
+    exprHelpBtn.action = @selector(showExpressionHelp:);
+    exprHelpBtn.toolTip = @"Expression syntax help";
+    exprHelpBtn.autoresizingMask = NSViewMinYMargin;
+    [cv addSubview:exprHelpBtn];
+    y -= 18;
+
+    self.expressionField = [self fieldAt:NSMakeRect(M, y - 22, CW, 22)
+        placeholder:@"is_prime(997)  factor(1729)  2^67-1  next prime 10000  twin primes 100 2000  modpow(2,100,1e9+7)"];
+    self.expressionField.autoresizingMask = NSViewMinYMargin | NSViewWidthSizable;
+    self.expressionField.target = self;
+    self.expressionField.action = @selector(expressionEvaluate:);
+    [cv addSubview:self.expressionField];
+    y -= 26;
 
     // ── OUTPUT LOG (fills remaining space) ───────────────────────────
     NSBox *sep3 = [[NSBox alloc] initWithFrame:NSMakeRect(M, y, CW, 1)];
@@ -696,10 +803,9 @@ static const int EQ_HISTORY = 32; // number of vertical bars (time history)
 
 - (void)checkModeChanged:(id)sender {
     NSInteger mode = self.checkModePopup.indexOfSelectedItem;
-    BOOL showTo = (mode >= 1); // show "to" for all modes except single
+    BOOL showTo = (mode >= 1 && mode <= 3);
     self.checkToLabel.hidden = !showTo;
     self.checkToScroll.hidden = !showTo;
-    // Update tooltip hints
     switch (mode) {
         case 0:
             self.checkFromField.toolTip = @"Number to check";
@@ -717,6 +823,14 @@ static const int EQ_HISTORY = 32; // number of vertical bars (time history)
             self.checkFromField.toolTip = @"Search near";
             self.checkToField.toolTip = @"Window size (default 10000)";
             break;
+        case 4:
+            self.checkFromField.toolTip =
+                @"Expression: is_prime(997), factor(1729), 2^67-1, "
+                @"modpow(2,100,1e9+7), primes 1000 to 2000, "
+                @"next prime 10000, wieferich 1093, twin primes 100 200, "
+                @"gcd(48,36), fibonacci(50), binomial(10,3)";
+            self.checkToField.toolTip = @"";
+            break;
     }
 }
 
@@ -725,11 +839,36 @@ static const int EQ_HISTORY = 32; // number of vertical bars (time history)
 - (void)checkGo:(id)sender {
     // If a background check is running, stop it first
     if (_checkRunning.load()) {
-        [self stopBackgroundCheck];
+        _checkRunning.store(false);
+    }
+    if (_checkThread.joinable()) {
+        _checkThread.join();
     }
 
     NSString *rawInput = self.checkFromField.string;
     NSInteger mode = self.checkModePopup.indexOfSelectedItem;
+
+    // Expression mode
+    if (mode == 4) {
+        [self evaluateExpression:rawInput];
+        return;
+    }
+
+    // Auto-detect expressions in Check Single mode: if input contains
+    // letters (except pure numbers), ^, (, or ?, route to expression evaluator
+    if (mode == 0) {
+        NSString *trimmed = [rawInput stringByTrimmingCharactersInSet:
+            [NSCharacterSet whitespaceAndNewlineCharacterSet]];
+        NSRange letterRange = [trimmed rangeOfCharacterFromSet:[NSCharacterSet letterCharacterSet]];
+        NSRange caretRange = [trimmed rangeOfString:@"^"];
+        NSRange parenRange = [trimmed rangeOfString:@"("];
+        NSRange questionRange = [trimmed rangeOfString:@"?"];
+        if (letterRange.location != NSNotFound || caretRange.location != NSNotFound ||
+            parenRange.location != NSNotFound || questionRange.location != NSNotFound) {
+            [self evaluateExpression:rawInput];
+            return;
+        }
+    }
 
     // Multi-number support: split on newlines, commas, or semicolons
     // so user can paste a block of numbers or a comma-delimited list
@@ -784,19 +923,680 @@ static const int EQ_HISTORY = 32; // number of vertical bars (time history)
     }
 }
 
+// ── Expression mode: try to parse before falling through to number check ──
+
+- (void)evaluateExpression:(NSString *)input {
+    NSString *expr = [input stringByTrimmingCharactersInSet:
+        [NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    NSString *lower = [expr lowercaseString];
+
+    // Strip trailing ? for natural queries like "is 997 prime?"
+    if ([lower hasSuffix:@"?"]) {
+        lower = [lower substringToIndex:lower.length - 1];
+        expr = [expr substringToIndex:expr.length - 1];
+    }
+
+    // ── Function call: is_prime(N) ──
+    {
+        NSRegularExpression *re = [NSRegularExpression regularExpressionWithPattern:
+            @"is_prime\\s*\\(\\s*([0-9eE^+\\-*/ .]+)\\s*\\)" options:0 error:nil];
+        NSTextCheckingResult *m = [re firstMatchInString:lower options:0 range:NSMakeRange(0, lower.length)];
+        if (m) {
+            uint64_t n = [self evalMathExpr:[expr substringWithRange:[m rangeAtIndex:1]]];
+            if (n >= 2) { [self runCheckSingle:n]; return; }
+        }
+    }
+
+    // ── "is N prime" ──
+    {
+        NSRegularExpression *re = [NSRegularExpression regularExpressionWithPattern:
+            @"is\\s+([0-9eE^+\\-*/ .]+)\\s+prime" options:NSRegularExpressionCaseInsensitive error:nil];
+        NSTextCheckingResult *m = [re firstMatchInString:lower options:0 range:NSMakeRange(0, lower.length)];
+        if (m) {
+            uint64_t n = [self evalMathExpr:[expr substringWithRange:[m rangeAtIndex:1]]];
+            if (n >= 2) { [self runCheckSingle:n]; return; }
+        }
+    }
+
+    // ── factor(N) or "factor N" or "factorize N" or "factorise N" ──
+    {
+        NSRegularExpression *re = [NSRegularExpression regularExpressionWithPattern:
+            @"(?:factor(?:ize|ise)?|factors)\\s*\\(?\\s*([0-9eE^+\\-*/ .]+)\\s*\\)?" options:NSRegularExpressionCaseInsensitive error:nil];
+        NSTextCheckingResult *m = [re firstMatchInString:lower options:0 range:NSMakeRange(0, lower.length)];
+        if (m) {
+            uint64_t n = [self evalMathExpr:[expr substringWithRange:[m rangeAtIndex:1]]];
+            if (n >= 2) {
+                auto t0 = std::chrono::steady_clock::now();
+                auto factors = prime::factor_u64(n);
+                auto dt = std::chrono::duration<double, std::micro>(
+                    std::chrono::steady_clock::now() - t0).count();
+                std::string fs = prime::factors_string(n);
+                if (factors.empty() || (factors.size() == 1 && factors[0] == n)) {
+                    [self appendText:[NSString stringWithFormat:
+                        @"factor(%@) = prime (%.1fus)\n", formatNumber(n), dt]];
+                } else {
+                    [self appendText:[NSString stringWithFormat:
+                        @"factor(%@) = %s (%.1fus)\n", formatNumber(n), fs.c_str(), dt]];
+                }
+                return;
+            }
+        }
+    }
+
+    // ── modpow(a, b, m) ──
+    {
+        NSRegularExpression *re = [NSRegularExpression regularExpressionWithPattern:
+            @"modpow\\s*\\(\\s*([0-9eE^+\\-*/ .]+)\\s*,\\s*([0-9eE^+\\-*/ .]+)\\s*,\\s*([0-9eE^+\\-*/ .]+)\\s*\\)"
+            options:NSRegularExpressionCaseInsensitive error:nil];
+        NSTextCheckingResult *m = [re firstMatchInString:lower options:0 range:NSMakeRange(0, lower.length)];
+        if (m) {
+            uint64_t a = [self evalMathExpr:[expr substringWithRange:[m rangeAtIndex:1]]];
+            uint64_t b = [self evalMathExpr:[expr substringWithRange:[m rangeAtIndex:2]]];
+            uint64_t mod = [self evalMathExpr:[expr substringWithRange:[m rangeAtIndex:3]]];
+            if (mod > 0) {
+                uint64_t result = prime::modpow(a, b, mod);
+                [self appendText:[NSString stringWithFormat:
+                    @"modpow(%@, %@, %@) = %@\n",
+                    formatNumber(a), formatNumber(b), formatNumber(mod), formatNumber(result)]];
+                return;
+            }
+        }
+    }
+
+    // ── mulmod(a, b, m) ──
+    {
+        NSRegularExpression *re = [NSRegularExpression regularExpressionWithPattern:
+            @"mulmod\\s*\\(\\s*([0-9eE^+\\-*/ .]+)\\s*,\\s*([0-9eE^+\\-*/ .]+)\\s*,\\s*([0-9eE^+\\-*/ .]+)\\s*\\)"
+            options:NSRegularExpressionCaseInsensitive error:nil];
+        NSTextCheckingResult *m = [re firstMatchInString:lower options:0 range:NSMakeRange(0, lower.length)];
+        if (m) {
+            uint64_t a = [self evalMathExpr:[expr substringWithRange:[m rangeAtIndex:1]]];
+            uint64_t b = [self evalMathExpr:[expr substringWithRange:[m rangeAtIndex:2]]];
+            uint64_t mod = [self evalMathExpr:[expr substringWithRange:[m rangeAtIndex:3]]];
+            if (mod > 0) {
+                uint64_t result = prime::mulmod(a, b, mod);
+                [self appendText:[NSString stringWithFormat:
+                    @"mulmod(%@, %@, %@) = %@\n",
+                    formatNumber(a), formatNumber(b), formatNumber(mod), formatNumber(result)]];
+                return;
+            }
+        }
+    }
+
+    // ── gcd(a, b) ──
+    {
+        NSRegularExpression *re = [NSRegularExpression regularExpressionWithPattern:
+            @"gcd\\s*\\(\\s*([0-9eE^+\\-*/ .]+)\\s*,\\s*([0-9eE^+\\-*/ .]+)\\s*\\)"
+            options:NSRegularExpressionCaseInsensitive error:nil];
+        NSTextCheckingResult *m = [re firstMatchInString:lower options:0 range:NSMakeRange(0, lower.length)];
+        if (m) {
+            uint64_t a = [self evalMathExpr:[expr substringWithRange:[m rangeAtIndex:1]]];
+            uint64_t b = [self evalMathExpr:[expr substringWithRange:[m rangeAtIndex:2]]];
+            uint64_t g = a, h = b;
+            while (h > 0) { uint64_t t = h; h = g % h; g = t; }
+            [self appendText:[NSString stringWithFormat:
+                @"gcd(%@, %@) = %@\n", formatNumber(a), formatNumber(b), formatNumber(g)]];
+            return;
+        }
+    }
+
+    // ── lcm(a, b) ──
+    {
+        NSRegularExpression *re = [NSRegularExpression regularExpressionWithPattern:
+            @"lcm\\s*\\(\\s*([0-9eE^+\\-*/ .]+)\\s*,\\s*([0-9eE^+\\-*/ .]+)\\s*\\)"
+            options:NSRegularExpressionCaseInsensitive error:nil];
+        NSTextCheckingResult *m = [re firstMatchInString:lower options:0 range:NSMakeRange(0, lower.length)];
+        if (m) {
+            uint64_t a = [self evalMathExpr:[expr substringWithRange:[m rangeAtIndex:1]]];
+            uint64_t b = [self evalMathExpr:[expr substringWithRange:[m rangeAtIndex:2]]];
+            uint64_t g = a, h = b;
+            while (h > 0) { uint64_t t = h; h = g % h; g = t; }
+            uint64_t result = (a / g) * b;
+            [self appendText:[NSString stringWithFormat:
+                @"lcm(%@, %@) = %@\n", formatNumber(a), formatNumber(b), formatNumber(result)]];
+            return;
+        }
+    }
+
+    // ── fibonacci(n) or fib(n) ──
+    {
+        NSRegularExpression *re = [NSRegularExpression regularExpressionWithPattern:
+            @"(?:fibonacci|fib)\\s*\\(?\\s*([0-9]+)\\s*\\)?"
+            options:NSRegularExpressionCaseInsensitive error:nil];
+        NSTextCheckingResult *m = [re firstMatchInString:lower options:0 range:NSMakeRange(0, lower.length)];
+        if (m) {
+            int n = (int)[[expr substringWithRange:[m rangeAtIndex:1]] integerValue];
+            if (n > 93) {
+                [self appendText:@"fibonacci: max n=93 for uint64 (overflow beyond that)\n"];
+                return;
+            }
+            uint64_t a = 0, b = 1;
+            for (int i = 0; i < n; i++) { uint64_t t = a + b; a = b; b = t; }
+            [self appendText:[NSString stringWithFormat:
+                @"fibonacci(%d) = %@\n", n, formatNumber(a)]];
+            // Check if the Fibonacci number is prime
+            if (a >= 2 && prime::is_prime(a)) {
+                [self appendText:[NSString stringWithFormat:
+                    @"  (Fibonacci prime!)\n"]];
+            }
+            return;
+        }
+    }
+
+    // ── binomial(n, k) or C(n,k) or nCk ──
+    {
+        NSRegularExpression *re = [NSRegularExpression regularExpressionWithPattern:
+            @"(?:binomial|choose|c)\\s*\\(\\s*([0-9]+)\\s*,\\s*([0-9]+)\\s*\\)"
+            options:NSRegularExpressionCaseInsensitive error:nil];
+        NSTextCheckingResult *m = [re firstMatchInString:lower options:0 range:NSMakeRange(0, lower.length)];
+        if (m) {
+            uint64_t n = [[expr substringWithRange:[m rangeAtIndex:1]] longLongValue];
+            uint64_t k = [[expr substringWithRange:[m rangeAtIndex:2]] longLongValue];
+            if (k > n) { [self appendText:@"binomial: k > n\n"]; return; }
+            if (k > n - k) k = n - k;
+            uint64_t result = 1;
+            for (uint64_t i = 0; i < k; i++) {
+                result = result * (n - i) / (i + 1);
+            }
+            [self appendText:[NSString stringWithFormat:
+                @"C(%llu, %llu) = %@\n", n - k + k, k, formatNumber(result)]];
+            if (result >= 2 && prime::is_prime(result)) {
+                [self appendText:@"  (this value is prime!)\n"];
+            }
+            return;
+        }
+    }
+
+    // ── "primes in/between/from A to/.. B" or "primes A B" or "primes A to B" ──
+    {
+        NSRegularExpression *re = [NSRegularExpression regularExpressionWithPattern:
+            @"(?:primes?|find primes?)\\s+(?:in|between|from)?\\s*([0-9eE^+\\-*/ .]+)\\s+(?:to|\\.\\.|-|and)\\s*([0-9eE^+\\-*/ .]+)"
+            options:NSRegularExpressionCaseInsensitive error:nil];
+        NSTextCheckingResult *m = [re firstMatchInString:lower options:0 range:NSMakeRange(0, lower.length)];
+        if (m) {
+            uint64_t a = [self evalMathExpr:[expr substringWithRange:[m rangeAtIndex:1]]];
+            uint64_t b = [self evalMathExpr:[expr substringWithRange:[m rangeAtIndex:2]]];
+            if (a < 2) a = 2;
+            if (b < a) { uint64_t t = a; a = b; b = t; }
+            if (b - a > 10000000) {
+                [self appendText:@"Range too large (max 10M). Use Search Tasks for big ranges.\n"];
+                return;
+            }
+            prime::Engine eng;
+            int hw = std::max(1, (int)std::thread::hardware_concurrency());
+            auto t0 = std::chrono::steady_clock::now();
+            auto results = eng.search_range(a, b, hw);
+            auto dt = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+            [self appendText:[NSString stringWithFormat:
+                @"Primes in [%@, %@]: %zu found (%.4fs)\n",
+                formatNumber(a), formatNumber(b), results.size(), dt]];
+            // Print up to first 200
+            size_t show = std::min(results.size(), (size_t)200);
+            NSMutableString *list = [NSMutableString string];
+            for (size_t i = 0; i < show; i++) {
+                if (i > 0) [list appendString:@", "];
+                [list appendFormat:@"%@", formatNumber(results[i].value)];
+            }
+            if (results.size() > 200) [list appendFormat:@" ... (%zu more)", results.size() - 200];
+            [self appendText:[NSString stringWithFormat:@"  %@\n", list]];
+            return;
+        }
+    }
+
+    // ── "next prime N" or "next_prime(N)" or "next prime after N" ──
+    {
+        NSRegularExpression *re = [NSRegularExpression regularExpressionWithPattern:
+            @"next[_ ]?prime\\s*\\(?(?:\\s*after)?\\s*([0-9eE^+\\-*/ .]+)\\s*\\)?"
+            options:NSRegularExpressionCaseInsensitive error:nil];
+        NSTextCheckingResult *m = [re firstMatchInString:lower options:0 range:NSMakeRange(0, lower.length)];
+        if (m) {
+            uint64_t n = [self evalMathExpr:[expr substringWithRange:[m rangeAtIndex:1]]];
+            uint64_t p = n + 1;
+            if (p < 2) p = 2;
+            while (!prime::is_prime(p)) p++;
+            [self appendText:[NSString stringWithFormat:
+                @"next_prime(%@) = %@\n", formatNumber(n), formatNumber(p)]];
+            return;
+        }
+    }
+
+    // ── "prev prime N" or "previous prime N" ──
+    {
+        NSRegularExpression *re = [NSRegularExpression regularExpressionWithPattern:
+            @"(?:prev(?:ious)?[_ ]?prime)\\s*\\(?\\s*([0-9eE^+\\-*/ .]+)\\s*\\)?"
+            options:NSRegularExpressionCaseInsensitive error:nil];
+        NSTextCheckingResult *m = [re firstMatchInString:lower options:0 range:NSMakeRange(0, lower.length)];
+        if (m) {
+            uint64_t n = [self evalMathExpr:[expr substringWithRange:[m rangeAtIndex:1]]];
+            if (n <= 2) { [self appendText:@"No prime before 2.\n"]; return; }
+            uint64_t p = n - 1;
+            while (p >= 2 && !prime::is_prime(p)) p--;
+            [self appendText:[NSString stringWithFormat:
+                @"prev_prime(%@) = %@\n", formatNumber(n), formatNumber(p)]];
+            return;
+        }
+    }
+
+    // ── "wieferich N" or "wieferich test N" ──
+    {
+        NSRegularExpression *re = [NSRegularExpression regularExpressionWithPattern:
+            @"wieferich\\s+(?:test\\s+)?([0-9eE^+\\-*/ .]+)"
+            options:NSRegularExpressionCaseInsensitive error:nil];
+        NSTextCheckingResult *m = [re firstMatchInString:lower options:0 range:NSMakeRange(0, lower.length)];
+        if (m) {
+            uint64_t p = [self evalMathExpr:[expr substringWithRange:[m rangeAtIndex:1]]];
+            if (p < 2 || !prime::is_prime(p)) {
+                [self appendText:[NSString stringWithFormat:
+                    @"%@ is not prime (Wieferich test requires a prime)\n", formatNumber(p)]];
+                return;
+            }
+            bool w = prime::modpow(2, p - 1, p * p) == 1;
+            [self appendText:[NSString stringWithFormat:
+                @"Wieferich test: 2^(%@-1) mod %@^2 %@ 1 -- %@\n",
+                formatNumber(p), formatNumber(p),
+                w ? @"==" : @"!=",
+                w ? @"YES, Wieferich prime!" : @"not Wieferich"]];
+            return;
+        }
+    }
+
+    // ── "wilson N" or "wilson test N" ──
+    {
+        NSRegularExpression *re = [NSRegularExpression regularExpressionWithPattern:
+            @"wilson\\s+(?:test\\s+)?([0-9eE^+\\-*/ .]+)"
+            options:NSRegularExpressionCaseInsensitive error:nil];
+        NSTextCheckingResult *m = [re firstMatchInString:lower options:0 range:NSMakeRange(0, lower.length)];
+        if (m) {
+            uint64_t p = [self evalMathExpr:[expr substringWithRange:[m rangeAtIndex:1]]];
+            if (p < 2 || !prime::is_prime(p)) {
+                [self appendText:[NSString stringWithFormat:
+                    @"%@ is not prime (Wilson test requires a prime)\n", formatNumber(p)]];
+                return;
+            }
+            if (p > 100000) {
+                [self appendText:@"Wilson test: p too large (factorial overflow risk). Max ~100000.\n"];
+                return;
+            }
+            uint64_t mod = p * p;
+            uint64_t factorial = 1;
+            for (uint64_t i = 2; i < p; i++) {
+                factorial = prime::mulmod(factorial, i, mod);
+            }
+            bool w = (factorial == mod - 1);
+            [self appendText:[NSString stringWithFormat:
+                @"Wilson test: (%@-1)! mod %@^2 %@ %@^2-1 -- %@\n",
+                formatNumber(p), formatNumber(p),
+                w ? @"==" : @"!=", formatNumber(p),
+                w ? @"YES, Wilson prime!" : @"not Wilson prime"]];
+            return;
+        }
+    }
+
+    // ── "twin primes A B" or "twin primes in A to B" ──
+    {
+        NSRegularExpression *re = [NSRegularExpression regularExpressionWithPattern:
+            @"twin\\s+primes?\\s+(?:in\\s+)?([0-9eE^+\\-*/ .]+)\\s+(?:to\\s+)?([0-9eE^+\\-*/ .]+)"
+            options:NSRegularExpressionCaseInsensitive error:nil];
+        NSTextCheckingResult *m = [re firstMatchInString:lower options:0 range:NSMakeRange(0, lower.length)];
+        if (m) {
+            uint64_t a = [self evalMathExpr:[expr substringWithRange:[m rangeAtIndex:1]]];
+            uint64_t b = [self evalMathExpr:[expr substringWithRange:[m rangeAtIndex:2]]];
+            if (a < 2) a = 2;
+            if (b - a > 10000000) {
+                [self appendText:@"Range too large (max 10M).\n"];
+                return;
+            }
+            auto sv = prime::sieve(b);
+            int count = 0;
+            NSMutableString *pairs = [NSMutableString string];
+            for (uint64_t i = a; i <= b - 2; i++) {
+                if (sv[i] && sv[i + 2]) {
+                    count++;
+                    if (count <= 50) {
+                        if (pairs.length > 0) [pairs appendString:@", "];
+                        [pairs appendFormat:@"(%@,%@)", formatNumber(i), formatNumber(i + 2)];
+                    }
+                }
+            }
+            [self appendText:[NSString stringWithFormat:
+                @"Twin primes in [%@, %@]: %d pairs\n", formatNumber(a), formatNumber(b), count]];
+            if (count > 0) {
+                if (count > 50) [pairs appendFormat:@" ... (%d more)", count - 50];
+                [self appendText:[NSString stringWithFormat:@"  %@\n", pairs]];
+            }
+            return;
+        }
+    }
+
+    // ── "sophie germain A B" ──
+    {
+        NSRegularExpression *re = [NSRegularExpression regularExpressionWithPattern:
+            @"sophie\\s+germain\\s+([0-9eE^+\\-*/ .]+)\\s+(?:to\\s+)?([0-9eE^+\\-*/ .]+)"
+            options:NSRegularExpressionCaseInsensitive error:nil];
+        NSTextCheckingResult *m = [re firstMatchInString:lower options:0 range:NSMakeRange(0, lower.length)];
+        if (m) {
+            uint64_t a = [self evalMathExpr:[expr substringWithRange:[m rangeAtIndex:1]]];
+            uint64_t b = [self evalMathExpr:[expr substringWithRange:[m rangeAtIndex:2]]];
+            if (a < 2) a = 2;
+            if (b - a > 10000000) {
+                [self appendText:@"Range too large (max 10M).\n"];
+                return;
+            }
+            auto sv = prime::sieve(b);
+            int count = 0;
+            NSMutableString *list = [NSMutableString string];
+            for (uint64_t i = a; i <= b; i++) {
+                if (sv[i] && prime::is_prime(2 * i + 1)) {
+                    count++;
+                    if (count <= 50) {
+                        if (list.length > 0) [list appendString:@", "];
+                        [list appendFormat:@"%@", formatNumber(i)];
+                    }
+                }
+            }
+            [self appendText:[NSString stringWithFormat:
+                @"Sophie Germain primes in [%@, %@]: %d found\n", formatNumber(a), formatNumber(b), count]];
+            if (count > 0) {
+                if (count > 50) [list appendFormat:@" ... (%d more)", count - 50];
+                [self appendText:[NSString stringWithFormat:@"  %@\n", list]];
+            }
+            return;
+        }
+    }
+
+    // ── "mersenne N" -- test if 2^N - 1 is prime ──
+    {
+        NSRegularExpression *re = [NSRegularExpression regularExpressionWithPattern:
+            @"mersenne\\s+([0-9]+)"
+            options:NSRegularExpressionCaseInsensitive error:nil];
+        NSTextCheckingResult *m = [re firstMatchInString:lower options:0 range:NSMakeRange(0, lower.length)];
+        if (m) {
+            int n = (int)[[expr substringWithRange:[m rangeAtIndex:1]] integerValue];
+            if (n > 63) {
+                [self appendText:[NSString stringWithFormat:
+                    @"M%d = 2^%d - 1 is too large for 64-bit testing. Use Mersenne Trial Factor search.\n", n, n]];
+                return;
+            }
+            uint64_t mn = (1ULL << n) - 1;
+            bool p = prime::is_prime(mn);
+            [self appendText:[NSString stringWithFormat:
+                @"M%d = 2^%d - 1 = %@ -- %@\n", n, n, formatNumber(mn),
+                p ? @"PRIME (Mersenne prime!)" : @"COMPOSITE"]];
+            if (!p) {
+                std::string fs = prime::factors_string(mn);
+                if (!fs.empty()) {
+                    [self appendText:[NSString stringWithFormat:
+                        @"  = %s\n", fs.c_str()]];
+                }
+            }
+            return;
+        }
+    }
+
+    // ── "fermat N" -- test Fermat number F_N = 2^(2^N) + 1 ──
+    {
+        NSRegularExpression *re = [NSRegularExpression regularExpressionWithPattern:
+            @"fermat\\s+([0-9]+)"
+            options:NSRegularExpressionCaseInsensitive error:nil];
+        NSTextCheckingResult *m = [re firstMatchInString:lower options:0 range:NSMakeRange(0, lower.length)];
+        if (m) {
+            int n = (int)[[expr substringWithRange:[m rangeAtIndex:1]] integerValue];
+            if (n > 5) {
+                [self appendText:[NSString stringWithFormat:
+                    @"F_%d = 2^(2^%d) + 1 is too large for 64-bit. Use Fermat Factor search.\n", n, n]];
+                return;
+            }
+            uint64_t fn = (1ULL << (1 << n)) + 1;
+            bool p = prime::is_prime(fn);
+            [self appendText:[NSString stringWithFormat:
+                @"F_%d = 2^(2^%d) + 1 = %@ -- %@\n", n, n, formatNumber(fn),
+                p ? @"PRIME (Fermat prime!)" : @"COMPOSITE"]];
+            if (!p) {
+                std::string fs = prime::factors_string(fn);
+                if (!fs.empty()) {
+                    [self appendText:[NSString stringWithFormat:@"  = %s\n", fs.c_str()]];
+                }
+            }
+            return;
+        }
+    }
+
+    // ── "convergence N" or "shadow N" ──
+    {
+        NSRegularExpression *re = [NSRegularExpression regularExpressionWithPattern:
+            @"(?:convergence|shadow)\\s*\\(?\\s*([0-9eE^+\\-*/ .]+)\\s*\\)?"
+            options:NSRegularExpressionCaseInsensitive error:nil];
+        NSTextCheckingResult *m = [re firstMatchInString:lower options:0 range:NSMakeRange(0, lower.length)];
+        if (m) {
+            uint64_t n = [self evalMathExpr:[expr substringWithRange:[m rangeAtIndex:1]]];
+            double c = prime::convergence(n);
+            [self appendText:[NSString stringWithFormat:
+                @"convergence(%@) = %.4f%@\n", formatNumber(n), c,
+                c == -999.0 ? @" (shadow-prime multiple)" : @""]];
+            return;
+        }
+    }
+
+    // ── "N!" -- factorial (check primality) ──
+    {
+        NSRegularExpression *re = [NSRegularExpression regularExpressionWithPattern:
+            @"^\\s*([0-9]+)\\s*!\\s*$" options:0 error:nil];
+        NSTextCheckingResult *m = [re firstMatchInString:expr options:0 range:NSMakeRange(0, expr.length)];
+        if (m) {
+            int n = (int)[[expr substringWithRange:[m rangeAtIndex:1]] integerValue];
+            if (n > 20) {
+                [self appendText:[NSString stringWithFormat:
+                    @"%d! overflows uint64 (max 20!)\n", n]];
+                return;
+            }
+            uint64_t result = 1;
+            for (int i = 2; i <= n; i++) result *= i;
+            [self appendText:[NSString stringWithFormat:
+                @"%d! = %@\n", n, formatNumber(result)]];
+            if (result >= 2) {
+                bool p = prime::is_prime(result);
+                [self appendText:[NSString stringWithFormat:
+                    @"  %@ %@\n", formatNumber(result), p ? @"is prime!" : @"is composite"]];
+            }
+            return;
+        }
+    }
+
+    // ── "N mod M" or "N % M" ──
+    {
+        NSRegularExpression *re = [NSRegularExpression regularExpressionWithPattern:
+            @"([0-9eE^+\\-*/ .]+)\\s+(?:mod|%)\\s+([0-9eE^+\\-*/ .]+)"
+            options:NSRegularExpressionCaseInsensitive error:nil];
+        NSTextCheckingResult *m = [re firstMatchInString:lower options:0 range:NSMakeRange(0, lower.length)];
+        if (m) {
+            uint64_t a = [self evalMathExpr:[expr substringWithRange:[m rangeAtIndex:1]]];
+            uint64_t b = [self evalMathExpr:[expr substringWithRange:[m rangeAtIndex:2]]];
+            if (b == 0) { [self appendText:@"Division by zero.\n"]; return; }
+            [self appendText:[NSString stringWithFormat:
+                @"%@ mod %@ = %@\n", formatNumber(a), formatNumber(b), formatNumber(a % b)]];
+            return;
+        }
+    }
+
+    // ── "pi(N)" -- prime counting function ──
+    {
+        NSRegularExpression *re = [NSRegularExpression regularExpressionWithPattern:
+            @"pi\\s*\\(\\s*([0-9eE^+\\-*/ .]+)\\s*\\)"
+            options:NSRegularExpressionCaseInsensitive error:nil];
+        NSTextCheckingResult *m = [re firstMatchInString:lower options:0 range:NSMakeRange(0, lower.length)];
+        if (m) {
+            uint64_t n = [self evalMathExpr:[expr substringWithRange:[m rangeAtIndex:1]]];
+            if (n > 100000000) {
+                [self appendText:@"pi(N): max N = 100,000,000 (sieve memory limit)\n"];
+                return;
+            }
+            auto t0 = std::chrono::steady_clock::now();
+            auto sv = prime::sieve(n);
+            uint64_t count = 0;
+            for (uint64_t i = 0; i <= n; i++) if (sv[i]) count++;
+            auto dt = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+            [self appendText:[NSString stringWithFormat:
+                @"pi(%@) = %@ (%.4fs)\n", formatNumber(n), formatNumber(count), dt]];
+            return;
+        }
+    }
+
+    // ── "euler totient N" or "totient(N)" or "phi(N)" ──
+    {
+        NSRegularExpression *re = [NSRegularExpression regularExpressionWithPattern:
+            @"(?:euler\\s+)?(?:totient|phi)\\s*\\(?\\s*([0-9eE^+\\-*/ .]+)\\s*\\)?"
+            options:NSRegularExpressionCaseInsensitive error:nil];
+        NSTextCheckingResult *m = [re firstMatchInString:lower options:0 range:NSMakeRange(0, lower.length)];
+        if (m) {
+            uint64_t n = [self evalMathExpr:[expr substringWithRange:[m rangeAtIndex:1]]];
+            // Compute Euler's totient using factorization
+            auto factors = prime::factor_u64(n);
+            uint64_t result = n;
+            uint64_t prev = 0;
+            for (auto f : factors) {
+                if (f != prev) {
+                    result = result / f * (f - 1);
+                    prev = f;
+                }
+            }
+            [self appendText:[NSString stringWithFormat:
+                @"phi(%@) = %@\n", formatNumber(n), formatNumber(result)]];
+            return;
+        }
+    }
+
+    // ── Bare math expression fallback: evaluate and check primality ──
+    {
+        uint64_t val = [self evalMathExpr:expr];
+        if (val >= 2) {
+            [self appendText:[NSString stringWithFormat:@"= %@\n", formatNumber(val)]];
+            [self runCheckSingle:val];
+            return;
+        }
+        if (val == 0 || val == 1) {
+            [self appendText:[NSString stringWithFormat:@"= %llu (not testable, need >= 2)\n", val]];
+            return;
+        }
+    }
+
+    [self appendText:[NSString stringWithFormat:
+        @"Could not parse expression: %@\n"
+        @"  Try: is_prime(997), factor(1729), 2^67-1, modpow(2,100,1e9+7),\n"
+        @"       primes 1000 to 2000, next prime 10000, wieferich 1093,\n"
+        @"       pi(1000), fibonacci(50), gcd(48,36), mersenne 31,\n"
+        @"       twin primes 100 200, sophie germain 2 1000, phi(60)\n", expr]];
+}
+
+// ── Math expression evaluator (handles 2^67-1, 1e9+7, basic +,-,*,/,^) ──
+
+- (uint64_t)evalMathExpr:(NSString *)raw {
+    NSString *expr = [[raw stringByTrimmingCharactersInSet:
+        [NSCharacterSet whitespaceCharacterSet]]
+        stringByReplacingOccurrencesOfString:@" " withString:@""];
+    // Strip commas (number formatting)
+    expr = [expr stringByReplacingOccurrencesOfString:@"," withString:@""];
+
+    if (expr.length == 0) return 0;
+
+    // Tokenize into numbers and operators
+    NSMutableArray<NSNumber *> *values = [NSMutableArray new];
+    NSMutableArray<NSString *> *ops = [NSMutableArray new];
+
+    NSUInteger i = 0;
+    while (i < expr.length) {
+        // Parse a number (possibly with 'e' notation like 1e9)
+        NSMutableString *numStr = [NSMutableString new];
+        while (i < expr.length) {
+            unichar ch = [expr characterAtIndex:i];
+            if ((ch >= '0' && ch <= '9') || ch == '.' ||
+                ch == 'e' || ch == 'E') {
+                [numStr appendFormat:@"%C", ch];
+                i++;
+            } else {
+                break;
+            }
+        }
+        if (numStr.length > 0) {
+            double d = [numStr doubleValue];
+            [values addObject:@((uint64_t)d)];
+        } else {
+            break; // unexpected char
+        }
+
+        // Parse operator
+        if (i < expr.length) {
+            unichar ch = [expr characterAtIndex:i];
+            if (ch == '+' || ch == '-' || ch == '*' || ch == '/' || ch == '^') {
+                [ops addObject:[NSString stringWithFormat:@"%C", ch]];
+                i++;
+            } else {
+                break;
+            }
+        }
+    }
+
+    if (values.count == 0) return 0;
+
+    // Evaluate ^ first (right to left)
+    for (NSInteger j = (NSInteger)ops.count - 1; j >= 0; j--) {
+        if ([ops[j] isEqualToString:@"^"]) {
+            uint64_t base = values[j].unsignedLongLongValue;
+            uint64_t exp = values[j + 1].unsignedLongLongValue;
+            uint64_t result = 1;
+            for (uint64_t e = 0; e < exp; e++) result *= base;
+            values[j] = @(result);
+            [values removeObjectAtIndex:j + 1];
+            [ops removeObjectAtIndex:j];
+        }
+    }
+
+    // Evaluate * and / left to right
+    for (NSInteger j = 0; j < (NSInteger)ops.count; ) {
+        if ([ops[j] isEqualToString:@"*"]) {
+            values[j] = @(values[j].unsignedLongLongValue * values[j + 1].unsignedLongLongValue);
+            [values removeObjectAtIndex:j + 1];
+            [ops removeObjectAtIndex:j];
+        } else if ([ops[j] isEqualToString:@"/"]) {
+            uint64_t denom = values[j + 1].unsignedLongLongValue;
+            values[j] = @(denom > 0 ? values[j].unsignedLongLongValue / denom : 0);
+            [values removeObjectAtIndex:j + 1];
+            [ops removeObjectAtIndex:j];
+        } else {
+            j++;
+        }
+    }
+
+    // Evaluate + and - left to right
+    uint64_t result = values[0].unsignedLongLongValue;
+    for (NSUInteger j = 0; j < ops.count; j++) {
+        uint64_t v = values[j + 1].unsignedLongLongValue;
+        if ([ops[j] isEqualToString:@"+"]) result += v;
+        else if ([ops[j] isEqualToString:@"-"]) result -= v;
+    }
+    return result;
+}
+
 - (void)checkStopAction:(id)sender {
     [self stopBackgroundCheck];
 }
 
 - (void)stopBackgroundCheck {
     _checkRunning.store(false);
-    if (_checkThread.joinable()) {
-        _checkThread.join();
-    }
-    dispatch_async(dispatch_get_main_queue(), ^{
-        self.checkStopButton.enabled = NO;
-        self.checkGoButton.enabled = YES;
-        [self appendText:@"Check stopped.\n"];
+    // Join on a background queue to avoid blocking main thread
+    __weak AppDelegate *weakSelf = self;
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+        AppDelegate *ss = weakSelf;
+        if (ss && ss->_checkThread.joinable()) {
+            ss->_checkThread.join();
+        }
+        dispatch_async(dispatch_get_main_queue(), ^{
+            AppDelegate *s2 = weakSelf;
+            if (s2) {
+                s2.checkStopButton.enabled = NO;
+                s2.checkGoButton.enabled = YES;
+                [s2 appendText:@"Check stopped.\n"];
+            }
+        });
     });
 }
 
@@ -809,7 +1609,7 @@ static const int EQ_HISTORY = 32; // number of vertical bars (time history)
     if (kdb.is_known(n)) {
         auto entries = kdb.get_entries(n);
         if (kdb.is_known_prime(n)) {
-            // Known prime — show all classifications
+            // Known prime -- show all classifications
             NSMutableString *classes = [NSMutableString string];
             for (auto* e : entries) {
                 if (classes.length > 0) [classes appendString:@", "];
@@ -817,25 +1617,25 @@ static const int EQ_HISTORY = 32; // number of vertical bars (time history)
             }
             NSString *desc = @"";
             if (entries.size() > 0 && entries[0]->description[0] != '\0') {
-                desc = [NSString stringWithFormat:@" — %s", entries[0]->description];
+                desc = [NSString stringWithFormat:@" -- %s", entries[0]->description];
             }
             [self appendText:[NSString stringWithFormat:
-                @"✓ KNOWN PRIME: %@ [%@]%@ (0μs — database lookup)\n",
+                @"[OK] KNOWN PRIME: %@ [%@]%@ (0us -- database lookup)\n",
                 formatNumber(n), classes, desc]];
         } else {
-            // Known pseudoprime — show factors
+            // Known pseudoprime -- show factors
             auto* e = entries[0];
             std::string factors = prime::factors_comma_string(n);
             NSString *fstr = factors.empty() ? @"" :
                 [NSString stringWithFormat:@" = %s", factors.c_str()];
             [self appendText:[NSString stringWithFormat:
-                @"✗ KNOWN %s: %@%@ — %s (0μs — database lookup)\n",
+                @"[X] KNOWN %s: %@%@ -- %s (0us -- database lookup)\n",
                 prime::known_class_name(e->kclass), formatNumber(n), fstr, e->description]];
         }
         return;
     }
 
-    // ── Not in database — compute ──
+    // ── Not in database -- compute ──
     auto t0 = std::chrono::steady_clock::now();
     bool is_p = prime::is_prime(n);
     auto dt = std::chrono::duration<double, std::micro>(
@@ -849,11 +1649,11 @@ static const int EQ_HISTORY = 32; // number of vertical bars (time history)
 
     if (is_p) {
         [self appendText:[NSString stringWithFormat:
-            @"✓ PRIME: %@ (%.1fμs)\n", formatNumber(n), dt]];
+            @"[OK] PRIME: %@ (%.1fus)\n", formatNumber(n), dt]];
         if (!pinch_hits.empty()) {
-            // Primes shouldn't have pinch hits (unless n itself appears) — flag it
+            // Primes shouldn't have pinch hits (unless n itself appears) -- flag it
             [self appendText:[NSString stringWithFormat:
-                @"  ⚠ PinchFactor found %zu hit(s) on prime? (%.1fμs)\n",
+                @"  WARNING: PinchFactor found %zu hit(s) on prime? (%.1fus)\n",
                 pinch_hits.size(), pinch_dt]];
         }
     } else {
@@ -863,19 +1663,19 @@ static const int EQ_HISTORY = 32; // number of vertical bars (time history)
         NSString *fstr = factors.empty() ? @"" :
             [NSString stringWithFormat:@" = %s", factors.c_str()];
         [self appendText:[NSString stringWithFormat:
-            @"✗ COMPOSITE: %@%@ (caught by %@, %.1fμs)\n", formatNumber(n), fstr, method, dt]];
+            @"[X] COMPOSITE: %@%@ (caught by %@, %.1fus)\n", formatNumber(n), fstr, method, dt]];
 
         // Show Pinch Factor results
         if (pinch_hits.empty()) {
             [self appendText:[NSString stringWithFormat:
-                @"  PinchFactor: no digit-structural divisors found (%.1fμs)\n", pinch_dt]];
+                @"  PinchFactor: no digit-structural divisors found (%.1fus)\n", pinch_dt]];
         } else {
             [self appendText:[NSString stringWithFormat:
-                @"  PinchFactor: %zu divisor(s) found via digit splits (%.1fμs):\n",
+                @"  PinchFactor: %zu divisor(s) found via digit splits (%.1fus):\n",
                 pinch_hits.size(), pinch_dt]];
             for (auto& h : pinch_hits) {
                 [self appendText:[NSString stringWithFormat:
-                    @"    pos %d: [%@|%@] → %@ divides N  (%s)\n",
+                    @"    pos %d: [%@|%@] -> %@ divides N  (%s)\n",
                     h.pinch_pos,
                     formatNumber(h.left), formatNumber(h.right),
                     formatNumber(h.divisor),
@@ -891,10 +1691,10 @@ static const int EQ_HISTORY = 32; // number of vertical bars (time history)
 
         if (l7_hits.empty()) {
             [self appendText:[NSString stringWithFormat:
-                @"  Lucky7s: no round-number proximity divisors found (%.1fμs)\n", l7_dt]];
+                @"  Lucky7s: no round-number proximity divisors found (%.1fus)\n", l7_dt]];
         } else {
             [self appendText:[NSString stringWithFormat:
-                @"  Lucky7s: %zu divisor(s) found near powers of 10 (%.1fμs):\n",
+                @"  Lucky7s: %zu divisor(s) found near powers of 10 (%.1fus):\n",
                 l7_hits.size(), l7_dt]];
             for (auto& h : l7_hits) {
                 NSString *sign = h.offset >= 0 ? @"+" : @"";
@@ -906,7 +1706,7 @@ static const int EQ_HISTORY = 32; // number of vertical bars (time history)
             }
         }
 
-        // DivisorWeb — digit-by-digit factor sieve
+        // DivisorWeb -- digit-by-digit factor sieve
         // Only run on numbers small enough to complete quickly (< ~10^12 for base 10)
         uint64_t web_limit = 1000000000000ULL; // 10^12
         if (n <= web_limit) {
@@ -914,7 +1714,7 @@ static const int EQ_HISTORY = 32; // number of vertical bars (time history)
             for (int base : bases) {
                 auto web = prime::divisor_web(n, base);
                 [self appendText:[NSString stringWithFormat:
-                    @"  DivisorWeb (base %d): %zu divisors, %zu prime factors (%.1fμs)\n",
+                    @"  DivisorWeb (base %d): %zu divisors, %zu prime factors (%.1fus)\n",
                     base, web.all_divisors.size(), web.prime_divisors.size(), web.elapsed_us]];
                 for (auto& lv : web.levels) {
                     NSMutableString *divStr = [NSMutableString string];
@@ -922,9 +1722,9 @@ static const int EQ_HISTORY = 32; // number of vertical bars (time history)
                         if (divStr.length > 0) [divStr appendString:@" "];
                         [divStr appendFormat:@"%@", formatNumber(d)];
                     }
-                    NSString *hitStr = lv.divisors.empty() ? @"—" : divStr;
+                    NSString *hitStr = lv.divisors.empty() ? @"--" : divStr;
                     [self appendText:[NSString stringWithFormat:
-                        @"    L%d [%@..%@] tested:%llu pruned:%llu+%llu → %@\n",
+                        @"    L%d [%@..%@] tested:%llu pruned:%llu+%llu -> %@\n",
                         lv.level, formatNumber(lv.range_lo), formatNumber(lv.range_hi),
                         lv.tested, lv.pruned_composite, lv.pruned_modular,
                         hitStr]];
@@ -932,7 +1732,7 @@ static const int EQ_HISTORY = 32; // number of vertical bars (time history)
                 if (!web.prime_divisors.empty()) {
                     NSMutableString *pStr = [NSMutableString string];
                     for (uint64_t p : web.prime_divisors) {
-                        if (pStr.length > 0) [pStr appendString:@" × "];
+                        if (pStr.length > 0) [pStr appendString:@" x "];
                         [pStr appendFormat:@"%@", formatNumber(p)];
                     }
                     [self appendText:[NSString stringWithFormat:@"    prime factors: %@\n", pStr]];
@@ -989,7 +1789,7 @@ static const int EQ_HISTORY = 32; // number of vertical bars (time history)
             if (batch.empty()) break;
             pos = p;
 
-            // Split: 30% CPU, 70% GPU — both test in parallel
+            // Split: 30% CPU, 70% GPU -- both test in parallel
             uint32_t total = (uint32_t)batch.size();
             uint32_t cpu_count = total * 3 / 10;
             uint32_t gpu_start = cpu_count;
@@ -1064,7 +1864,7 @@ static const int EQ_HISTORY = 32; // number of vertical bars (time history)
         });
         ss->_checkRunning.store(false);
     });
-    _checkThread.detach();
+    // Thread stays joinable for proper cleanup
 }
 
 // ── Check Linear (GPU+CPU wheel-210 fast scan) ─────────────────────
@@ -1186,7 +1986,7 @@ static const int EQ_HISTORY = 32; // number of vertical bars (time history)
         });
         ss->_checkRunning.store(false);
     });
-    _checkThread.detach();
+    // Thread stays joinable for proper cleanup
 }
 
 // ── PrimeLocation (convergence + GPU+CPU parallel testing) ──────────
@@ -1225,7 +2025,7 @@ static const int EQ_HISTORY = 32; // number of vertical bars (time history)
 
         uint64_t pos = (from % 2 == 0 && from > 2) ? from + 1 : from;
 
-        // Phase 0: Run MatrixSieve on the candidate range — almost zero overhead,
+        // Phase 0: Run MatrixSieve on the candidate range -- almost zero overhead,
         // eliminates ~77% of candidates divisible by primes {3,5,7,11,13,17,19,23,29,31}
         // before we even compute convergence scores.
         const uint32_t sieveCount = (uint32_t)std::min((uint64_t)windowSize, (uint64_t)2000000);
@@ -1314,7 +2114,7 @@ static const int EQ_HISTORY = 32; // number of vertical bars (time history)
 
             cpu_future.get();
 
-            // Collect results — save confirmed primes, optionally run special tests
+            // Collect results -- save confirmed primes, optionally run special tests
             auto handlePrime = [&](uint64_t val, double score) {
                 found++;
                 // Store in predicted primes list for PrimeFactor
@@ -1328,13 +2128,13 @@ static const int EQ_HISTORY = 32; // number of vertical bars (time history)
                         prime::PrimeClass::Prime, from, "", taskMgr->timestamp()});
                 }
                 NSString *msg2 = [NSString stringWithFormat:
-                    @"  ★ PREDICTED PRIME #%llu: %@ (score: %.2f, rank: %llu)\n",
+                    @"  * PREDICTED PRIME #%llu: %@ (score: %.2f, rank: %llu)\n",
                     found, formatNumber(val), score, tested];
                 dispatch_async(dispatch_get_main_queue(), ^{ [weakSelf appendText:msg2]; });
 
                 // CheckAtDiscovery: test this prime against special categories
                 if (checkAtDiscovery) {
-                    // Wieferich test: 2^(p-1) ≡ 1 (mod p²)
+                    // Wieferich test: 2^(p-1) == 1 (mod p^2)
                     unsigned __int128 p_sq = (unsigned __int128)val * val;
                     unsigned __int128 base128 = 2, result128 = 1, mod128 = p_sq;
                     uint64_t exp128 = val - 1;
@@ -1412,17 +2212,17 @@ static const int EQ_HISTORY = 32; // number of vertical bars (time history)
                     s2.primeFactorButton.title =
                         [NSString stringWithFormat:@"PrimeFactor (%llu)", foundCopy];
                     [s2 appendText:[NSString stringWithFormat:
-                        @"  %@ predicted primes stored — click 'PrimeFactor' to use them for factoring\n",
+                        @"  %@ predicted primes stored -- click 'PrimeFactor' to use them for factoring\n",
                         formatNumber(foundCopy)]];
                 }
             }
         });
         ss->_checkRunning.store(false);
     });
-    _checkThread.detach();
+    // Thread stays joinable for proper cleanup
 }
 
-// ── Run PrimeFactor — use predicted primes to factor numbers ─────────
+// ── Run PrimeFactor -- use predicted primes to factor numbers ─────────
 
 - (void)runPrimeFactor:(id)sender {
     if (_predictedPrimes.empty()) {
@@ -1437,7 +2237,7 @@ static const int EQ_HISTORY = 32; // number of vertical bars (time history)
     uint64_t target = strtoull(fromStr.UTF8String, nullptr, 10);
 
     if (target < 2) {
-        // No target specified — factor composites near the predicted primes
+        // No target specified -- factor composites near the predicted primes
         [self appendText:[NSString stringWithFormat:
             @"── PrimeFactor: testing %@ predicted primes as trial divisors ──\n",
             formatNumber((uint64_t)_predictedPrimes.size())]];
@@ -1522,7 +2322,7 @@ static const int EQ_HISTORY = 32; // number of vertical bars (time history)
                     }
                 }
             } else if (remaining == target) {
-                // Predicted primes didn't help — use standard factoring
+                // Predicted primes didn't help -- use standard factoring
                 auto factors = prime::factor_u64(target);
                 for (size_t i = 0; i < factors.size(); i++) {
                     if (i > 0) factorization += " x ";
@@ -1554,15 +2354,15 @@ static const int EQ_HISTORY = 32; // number of vertical bars (time history)
             self.startNumberField.stringValue = @"2";
             self.startPowerField.stringValue = @"64";
             self.startHintLabel.stringValue =
-                @"Wall-Sun-Sun: PrimeGrid verified to 2^64 (Dec 2022). ZERO known — any find is historic!";
+                @"Wall-Sun-Sun: PrimeGrid verified to 2^64 (Dec 2022). ZERO known -- any find is historic!";
             break;
         case prime::TaskType::Wilson:
-            // 2×10^13 verified. Start just past that.
-            // 2^44 = 17.6T ≈ 1.76×10^13, so 2^44+1 is just below. Use 2^45+1 ≈ 3.5×10^13.
+            // 2x10^13 verified. Start just past that.
+            // 2^44 = 17.6T ~ 1.76x10^13, so 2^44+1 is just below. Use 2^45+1 ~ 3.5x10^13.
             self.startNumberField.stringValue = @"2";
             self.startPowerField.stringValue = @"45";
             self.startHintLabel.stringValue =
-                @"Wilson: Verified to 2x10^13 (2012). 2^45+1 ≈ 3.5x10^13. Only 3 known: 5, 13, 563.";
+                @"Wilson: Verified to 2x10^13 (2012). 2^45+1 ~ 3.5x10^13. Only 3 known: 5, 13, 563.";
             break;
         case prime::TaskType::TwinPrime:
             self.startNumberField.stringValue = @"10";
@@ -1639,14 +2439,14 @@ static const int EQ_HISTORY = 32; // number of vertical bars (time history)
     if (power == 0) {
         // Direct number entry
         if (base_val < 3) {
-            [self appendText:@"Invalid start point — need a number >= 3\n"];
+            [self appendText:@"Invalid start point -- need a number >= 3\n"];
             return;
         }
         start_pos = base_val;
         desc = [NSString stringWithFormat:@"%@", formatNumber(start_pos)];
     } else {
         if (base_val < 2) {
-            [self appendText:@"Invalid start point — need base >= 2\n"];
+            [self appendText:@"Invalid start point -- need base >= 2\n"];
             return;
         }
         // Compute base^power + 1 using 128-bit to detect overflow
@@ -1686,7 +2486,7 @@ static const int EQ_HISTORY = 32; // number of vertical bars (time history)
     _taskMgr->save_state();
 
     [self appendText:[NSString stringWithFormat:
-        @"Set %s start → %@\n", prime::task_name(t), desc]];
+        @"Set %s start -> %@\n", prime::task_name(t), desc]];
 }
 
 // ── Task toggle ─────────────────────────────────────────────────────
@@ -1750,31 +2550,31 @@ static const int EQ_HISTORY = 32; // number of vertical bars (time history)
     NSAlert *alert = [[NSAlert alloc] init];
     alert.messageText = @"Log Output Glossary";
     alert.informativeText =
-        @"GPU flush: 281318 WSS → GPU | shadow: avg=128 [100-214] 26546 suspicious\n\n"
+        @"GPU flush: 281318 WSS -> GPU | shadow: avg=128 [100-214] 26546 suspicious\n\n"
 
-        @"GPU flush — CPU sieve buffer is full, candidates sent to GPU for testing.\n\n"
-        @"281,318 — Number of candidate primes in this batch.\n\n"
-        @"WSS — Wall-Sun-Sun prime search. Looking for primes p where p² divides "
+        @"GPU flush -- CPU sieve buffer is full, candidates sent to GPU for testing.\n\n"
+        @"281,318 -- Number of candidate primes in this batch.\n\n"
+        @"WSS -- Wall-Sun-Sun prime search. Looking for primes p where p^2 divides "
         @"F(p-(p/5)). None have ever been found.\n\n"
-        @"→ GPU — Candidates dispatched to Metal GPU for modular arithmetic.\n\n"
-        @"shadow — Even-shadow pre-filter. Each candidate gets a score based on how "
-        @"well the divisors of p±1 constrain the computation. Higher = better.\n\n"
-        @"avg=128 — Average shadow score across all candidates in the batch.\n\n"
-        @"[100-214] — Score range: lowest 100, highest 214.\n\n"
-        @"suspicious — Candidates with low shadow scores (poor p±1 divisor structure). "
+        @"-> GPU -- Candidates dispatched to Metal GPU for modular arithmetic.\n\n"
+        @"shadow -- Even-shadow pre-filter. Each candidate gets a score based on how "
+        @"well the divisors of p+/-1 constrain the computation. Higher = better.\n\n"
+        @"avg=128 -- Average shadow score across all candidates in the batch.\n\n"
+        @"[100-214] -- Score range: lowest 100, highest 214.\n\n"
+        @"suspicious -- Candidates with low shadow scores (poor p+/-1 divisor structure). "
         @"Less likely to be interesting but still tested. Reordered to back of batch.\n\n"
 
         @"── Other terms ──\n\n"
-        @"pos: — Current search position (the number being tested).\n\n"
-        @"found: — Count of discoveries (primes/factors found so far).\n\n"
-        @"/s — Candidates tested per second.\n\n"
-        @"GPU util — Percentage of time the GPU is actively computing.\n\n"
-        @"threads — Total GPU threads dispatched since launch.\n\n"
-        @"batches — Number of GPU command buffers submitted.\n\n"
-        @"ms/batch — Average GPU execution time per batch.\n\n"
-        @"ALU/NEON — CPU SIMD sieve stats. 'tested' = candidates sieved, "
+        @"pos: -- Current search position (the number being tested).\n\n"
+        @"found: -- Count of discoveries (primes/factors found so far).\n\n"
+        @"/s -- Candidates tested per second.\n\n"
+        @"GPU util -- Percentage of time the GPU is actively computing.\n\n"
+        @"threads -- Total GPU threads dispatched since launch.\n\n"
+        @"batches -- Number of GPU command buffers submitted.\n\n"
+        @"ms/batch -- Average GPU execution time per batch.\n\n"
+        @"ALU/NEON -- CPU SIMD sieve stats. 'tested' = candidates sieved, "
         @"'rejected' = composites filtered out before GPU.\n\n"
-        @"Predictor — Pseudoprime predictor stats. Carm = Carmichael numbers, "
+        @"Predictor -- Pseudoprime predictor stats. Carm = Carmichael numbers, "
         @"SPRP2 = strong probable primes base 2, frontier = highest value tested.";
     alert.alertStyle = NSAlertStyleInformational;
     [alert addButtonWithTitle:@"OK"];
@@ -1824,6 +2624,79 @@ static const int EQ_HISTORY = 32; // number of vertical bars (time history)
         @"  Mersenne TF    Trial factor Mersenne numbers 2^p-1 on GPU.\n"
         @"  Fermat Factor  Find factors of Fermat numbers F_m = 2^(2^m)+1 on GPU.\n\n"
 
+        @"EXPRESSION MODE\n"
+        @"---------------\n"
+        @"Select 'Expression' from Check & Tools, or just type an expression in\n"
+        @"Check Single mode -- it auto-detects when input contains letters, ^, or ().\n\n"
+
+        @"  Math expressions\n"
+        @"    2^67-1              Evaluate and check primality\n"
+        @"    1e9+7               Scientific notation\n"
+        @"    20!                 Factorial (max 20)\n"
+        @"    1729 mod 13         Modular remainder\n\n"
+
+        @"  Primality & factoring\n"
+        @"    is_prime(997)       Primality test (or: is 997 prime?)\n"
+        @"    factor(1729)        Full prime factorization (or: factor 1729)\n"
+        @"    next prime 10000    Next prime after N\n"
+        @"    prev prime 100     Previous prime before N\n\n"
+
+        @"  Modular arithmetic\n"
+        @"    modpow(2,100,1e9+7) Modular exponentiation: a^b mod m\n"
+        @"    mulmod(a,b,m)       Overflow-safe (a*b) mod m\n\n"
+
+        @"  Number theory\n"
+        @"    pi(1000)            Prime counting function\n"
+        @"    phi(60)             Euler's totient (or: totient(60))\n"
+        @"    gcd(48,36)          Greatest common divisor\n"
+        @"    lcm(48,36)          Least common multiple\n"
+        @"    fibonacci(50)       Fibonacci number (max 93, checks primality)\n"
+        @"    C(10,3)             Binomial coefficient (or: binomial(10,3))\n\n"
+
+        @"  Range searches\n"
+        @"    primes 1000 to 2000    Find all primes in range\n"
+        @"    twin primes 100 200    Find twin prime pairs\n"
+        @"    sophie germain 2 1000  Sophie Germain primes in range\n\n"
+
+        @"  Special tests\n"
+        @"    wieferich 1093      Wieferich test: 2^(p-1) mod p^2 == 1?\n"
+        @"    wilson 563          Wilson test: (p-1)! mod p^2 == p^2-1?\n"
+        @"    mersenne 31         Test Mersenne number M31 = 2^31-1\n"
+        @"    fermat 4            Test Fermat number F4 = 2^16+1\n"
+        @"    convergence(97)     Shadow convergence score\n\n"
+
+        @"PIPELINE BUILDER\n"
+        @"----------------\n"
+        @"Click 'Pipeline' in Check & Tools to open the Search Pipeline Builder.\n"
+        @"Build custom search pipelines by combining stages:\n\n"
+
+        @"  Sieve stages (fast, reduce candidates)\n"
+        @"    Wheel-210           Skip multiples of 2,3,5,7. ~77%% rejection.\n"
+        @"    MatrixSieve         NEON vectorized sieve (primes 3-31). ~77%% rejection.\n"
+        @"    CRT Filter          Chinese Remainder Theorem (primes 11-31). Fast reject.\n"
+        @"    PseudoprimeFilter   Remove known Carmichael/SPRP-2 numbers.\n\n"
+
+        @"  Scoring stages (rank candidates by quality)\n"
+        @"    Shadow/Convergence  Score using shadow prime field (primes 7-67).\n"
+        @"    EvenShadow          Analyze p+/-1 divisor structure (0-255 score).\n\n"
+
+        @"  Test stages (confirm results -- most expensive)\n"
+        @"    Miller-Rabin (CPU)  Deterministic 12-witness primality test.\n"
+        @"    GPU Primality       Metal batch primality test.\n"
+        @"    Wieferich Test      2^(p-1) mod p^2 == 1? (CPU or GPU)\n"
+        @"    Wilson Test         (p-1)! mod p^2 == p^2-1? (CPU only)\n"
+        @"    Pair Test           Twin/Cousin/Sexy prime test (CPU or GPU).\n\n"
+
+        @"  Post-processing stages\n"
+        @"    Factor (Pollard)    Full factorization via trial + Pollard rho.\n"
+        @"    PinchFactor         Digit-structural factoring heuristic.\n"
+        @"    Lucky7s             Round-number proximity factoring.\n"
+        @"    DivisorWeb          Hierarchical divisor search.\n\n"
+
+        @"  Each stage displays its cost estimate (candidates/sec) and rejection\n"
+        @"  rate so you can build efficient pipelines. Stages execute in order --\n"
+        @"  put cheap filters first to reduce work for expensive tests.\n\n"
+
         @"LOG OUTPUT GLOSSARY\n"
         @"-------------------\n"
         @"  GPU flush      CPU sieve buffer full, batch sent to GPU.\n"
@@ -1861,7 +2734,10 @@ static const int EQ_HISTORY = 32; // number of vertical bars (time history)
         @"  Check From     Find primes starting from a number.\n"
         @"  Check Linear   Enumerate all primes in a range.\n"
         @"  PrimeLocation  Predict prime locations using the PrimeLocation algorithm.\n"
+        @"  Expression     Evaluate math expressions, number theory functions.\n"
+        @"  Pipeline       Build custom search pipelines (see Pipeline Builder above).\n"
         @"  Benchmark      Run GPU and CPU performance benchmarks.\n"
+        @"  Run Tests      Run the full 108-test engine validation suite.\n"
         @"  CheckAtDiscovery  Run special tests on each predicted prime as found.\n\n"
 
         @"KEYBOARD SHORTCUTS\n"
@@ -1894,6 +2770,8 @@ static const int EQ_HISTORY = 32; // number of vertical bars (time history)
 
 - (void)runBenchmark:(id)sender {
     if (_benchRunning.load()) return;
+    // Join previous benchmark thread if still joinable
+    if (_benchThread.joinable()) _benchThread.join();
     _benchRunning.store(true);
     self.benchmarkButton.enabled = NO;
     self.benchmarkStopButton.enabled = YES;
@@ -1921,13 +2799,21 @@ static const int EQ_HISTORY = 32; // number of vertical bars (time history)
             }
         });
     });
-    _benchThread.detach();
+    // Thread stays joinable for proper cleanup
 }
 
 - (void)stopBenchmark:(id)sender {
     _benchRunning.store(false);
     self.benchmarkButton.enabled = YES;
     self.benchmarkStopButton.enabled = NO;
+    // Join on background to avoid blocking main thread
+    __weak AppDelegate *weakSelf = self;
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+        AppDelegate *ss = weakSelf;
+        if (ss && ss->_benchThread.joinable()) {
+            ss->_benchThread.join();
+        }
+    });
 }
 
 // ── Stats refresh + resource monitoring ─────────────────────────────
@@ -1946,7 +2832,7 @@ static const int EQ_HISTORY = 32; // number of vertical bars (time history)
     };
 
     // known_limit = highest verified value; jump_to = where to start searching
-    // PrimeGrid verified Wieferich/WSS to 2^64 ≈ 1.84×10^19.
+    // PrimeGrid verified Wieferich/WSS to 2^64 ~ 1.84x10^19.
     // We can't represent 2^64 in u64, so use 2^64-1 as the limit
     // and jump to a round value just below it to leave room for batched sieving.
     static const uint64_t PAST_2_64 = 18400000000000000001ULL;
@@ -1983,7 +2869,7 @@ static const int EQ_HISTORY = 32; // number of vertical bars (time history)
                         fetched_limit = 18446744073709551615ULL; // 2^64 - 1
                     }
                     // Check for "10^13" pattern (Wilson)
-                    if ([html containsString:@"2*10^13"] || [html containsString:@"2×10^13"]) {
+                    if ([html containsString:@"2*10^13"] || [html containsString:@"2x10^13"]) {
                         fetched_limit = 20000000000000ULL;
                     }
                     // Check for larger limits in case of updates
@@ -2007,7 +2893,7 @@ static const int EQ_HISTORY = 32; // number of vertical bars (time history)
                 // Auto-advance past the verified frontier
                 uint64_t new_pos;
                 if (fetched_limit >= UINT64_MAX - 2) {
-                    // Frontier is ~2^64 — use safe start below overflow ceiling
+                    // Frontier is ~2^64 -- use safe start below overflow ceiling
                     new_pos = PAST_2_64;
                 } else {
                     new_pos = fetched_limit + 1;
@@ -2044,7 +2930,7 @@ static const int EQ_HISTORY = 32; // number of vertical bars (time history)
                 });
             } else {
                 NSString *msg = [NSString stringWithFormat:
-                    @"✓ %@ search at %@ — past known frontier.\n",
+                    @"[OK] %@ search at %@ -- past known frontier.\n",
                     f.name, formatNumber(our_pos)];
                 dispatch_async(dispatch_get_main_queue(), ^{
                     [weakSelf appendText:msg];
@@ -2055,6 +2941,8 @@ static const int EQ_HISTORY = 32; // number of vertical bars (time history)
 }
 
 - (void)refreshStats {
+    if (!_taskMgr) return;
+
     // Update resource visualizer
     [self updateResourceMonitor];
 
@@ -2250,6 +3138,733 @@ static const int EQ_HISTORY = 32; // number of vertical bars (time history)
     return b;
 }
 
+// ═══════════════════════════════════════════════════════════════════════
+// Pipeline Builder -- configurable search & calculation pipeline
+// ═══════════════════════════════════════════════════════════════════════
+
+// Pipeline stage definition
+struct PipelineStage {
+    const char *name;
+    const char *category;    // "Sieve", "Score", "Test", "Post"
+    const char *description;
+    double cost_per_million; // estimated ms per 1M candidates
+    double rejection_pct;    // typical % of candidates rejected (0 for tests)
+};
+
+static const PipelineStage kPipelineStages[] = {
+    // Sieve stages
+    {"Wheel-210",         "Sieve", "Skip multiples of 2,3,5,7",                  0.1,  77.0},
+    {"MatrixSieve",       "Sieve", "NEON sieve (primes 3-31)",                   0.5,  77.0},
+    {"CRT Filter",        "Sieve", "CRT rejection (primes 11-31)",               0.3,  15.0},
+    {"Pseudoprime Filter","Sieve", "Remove known Carmichael/SPRP-2",             0.2,   0.1},
+    // Score stages
+    {"Convergence Score", "Score", "Shadow prime field scoring (primes 7-67)",    5.0,  30.0},
+    {"EvenShadow Score",  "Score", "p+/-1 divisor structure analysis (0-255)",    3.0,  20.0},
+    // Test stages
+    {"Miller-Rabin CPU",  "Test",  "Deterministic 12-witness primality",        50.0,   0.0},
+    {"GPU Primality",     "Test",  "Metal batch primality (4096/batch)",         15.0,   0.0},
+    {"Wieferich Test",    "Test",  "2^(p-1) mod p^2 == 1?",                    200.0,   0.0},
+    {"Wilson Test",       "Test",  "factorial(p-1) mod p^2",                   5000.0,   0.0},
+    {"Twin Pair Test",    "Test",  "is_prime(p) && is_prime(p+2)",              80.0,   0.0},
+    {"Sophie Germain",    "Test",  "is_prime(p) && is_prime(2p+1)",             80.0,   0.0},
+    {"Cousin Pair Test",  "Test",  "is_prime(p) && is_prime(p+4)",              80.0,   0.0},
+    {"Sexy Pair Test",    "Test",  "is_prime(p) && is_prime(p+6)",              80.0,   0.0},
+    {"Emirp Test",        "Test",  "is_prime(reverse_digits(p))",               60.0,   0.0},
+    // Post stages
+    {"Factor (full)",     "Post",  "Trial division + Pollard rho",             500.0,   0.0},
+    {"PinchFactor",       "Post",  "Digit-structural factoring heuristic",     100.0,   0.0},
+    {"Lucky7s",           "Post",  "Round-number proximity factoring",         100.0,   0.0},
+    {"DivisorWeb",        "Post",  "Hierarchical divisor search",              200.0,   0.0},
+    // Analysis stages (Factor Seed Prediction)
+    {"Ring Beacon",       "Analysis", "Mod-210 wheel beacon density scoring",    80.0,   0.0},
+    {"Topography",        "Analysis", "Factor count elevation & depth-gap corr.",120.0,   0.0},
+    {"Factor Web",        "Analysis", "Factor seed web connectivity & gaps",     100.0,   0.0},
+    {"Audio Harmonic",    "Analysis", "Harmonic resonance scoring of factors",   90.0,   0.0},
+    {"Twisting Tree",     "Analysis", "Factor tree shape transition analysis",  150.0,   0.0},
+    {"Quad Residue",      "Analysis", "Quadratic residue distribution analysis",200.0,   0.0},
+    {"Goldbach Split",    "Analysis", "Goldbach partition pair analysis",        300.0,   0.0},
+    {"Euler Totient",     "Analysis", "Totient function chain analysis",        250.0,   0.0},
+};
+static const int kNumPipelineStages = sizeof(kPipelineStages) / sizeof(kPipelineStages[0]);
+
+- (void)showPipelineBuilder:(id)sender {
+    NSWindow *win = [[NSWindow alloc]
+        initWithContentRect:NSMakeRect(150, 150, 720, 640)
+        styleMask:(NSWindowStyleMaskTitled | NSWindowStyleMaskClosable | NSWindowStyleMaskResizable)
+        backing:NSBackingStoreBuffered defer:NO];
+    win.title = @"Search Pipeline Builder";
+    win.releasedWhenClosed = NO;
+    win.minSize = NSMakeSize(600, 500);
+
+    NSView *cv = win.contentView;
+    CGFloat W = cv.frame.size.width;
+    CGFloat y = cv.frame.size.height - 10;
+
+    // Title
+    NSTextField *title = [[NSTextField alloc] initWithFrame:NSMakeRect(14, y - 20, 400, 18)];
+    title.stringValue = @"Build a custom search pipeline";
+    title.font = [NSFont boldSystemFontOfSize:13];
+    title.bezeled = NO; title.editable = NO; title.drawsBackground = NO;
+    title.autoresizingMask = NSViewMinYMargin;
+    [cv addSubview:title];
+    y -= 30;
+
+    // Range inputs
+    NSTextField *rangeLbl = [[NSTextField alloc] initWithFrame:NSMakeRect(14, y - 16, 40, 14)];
+    rangeLbl.stringValue = @"From:"; rangeLbl.font = [NSFont systemFontOfSize:10];
+    rangeLbl.bezeled = NO; rangeLbl.editable = NO; rangeLbl.drawsBackground = NO;
+    rangeLbl.autoresizingMask = NSViewMinYMargin;
+    [cv addSubview:rangeLbl];
+
+    NSTextField *fromField = [[NSTextField alloc] initWithFrame:NSMakeRect(54, y - 18, 140, 20)];
+    fromField.font = [NSFont monospacedSystemFontOfSize:10 weight:NSFontWeightRegular];
+    fromField.stringValue = @"1000000";
+    fromField.tag = 9001;
+    fromField.autoresizingMask = NSViewMinYMargin;
+    [cv addSubview:fromField];
+
+    NSTextField *toLbl = [[NSTextField alloc] initWithFrame:NSMakeRect(200, y - 16, 24, 14)];
+    toLbl.stringValue = @"To:"; toLbl.font = [NSFont systemFontOfSize:10];
+    toLbl.bezeled = NO; toLbl.editable = NO; toLbl.drawsBackground = NO;
+    toLbl.autoresizingMask = NSViewMinYMargin;
+    [cv addSubview:toLbl];
+
+    NSTextField *toField = [[NSTextField alloc] initWithFrame:NSMakeRect(224, y - 18, 140, 20)];
+    toField.font = [NSFont monospacedSystemFontOfSize:10 weight:NSFontWeightRegular];
+    toField.stringValue = @"1100000";
+    toField.tag = 9002;
+    toField.autoresizingMask = NSViewMinYMargin;
+    [cv addSubview:toField];
+
+    // Sort by score checkbox
+    NSButton *sortCheck = [[NSButton alloc] initWithFrame:NSMakeRect(380, y - 18, 140, 18)];
+    sortCheck.buttonType = NSButtonTypeSwitch;
+    sortCheck.title = @"Sort by score";
+    sortCheck.font = [NSFont systemFontOfSize:10];
+    sortCheck.state = NSControlStateValueOn;
+    sortCheck.tag = 9010;
+    sortCheck.autoresizingMask = NSViewMinYMargin;
+    [cv addSubview:sortCheck];
+
+    // Run button
+    NSButton *runBtn = [self buttonAt:NSMakeRect(540, y - 20, 80, 22) title:@"Run" action:@selector(runPipeline:)];
+    runBtn.font = [NSFont boldSystemFontOfSize:11];
+    runBtn.autoresizingMask = NSViewMinYMargin | NSViewMinXMargin;
+    [cv addSubview:runBtn];
+
+    // Stop button
+    NSButton *stopBtn = [self buttonAt:NSMakeRect(626, y - 20, 70, 22) title:@"Stop" action:@selector(checkStopAction:)];
+    stopBtn.font = [NSFont systemFontOfSize:10];
+    stopBtn.autoresizingMask = NSViewMinYMargin | NSViewMinXMargin;
+    [cv addSubview:stopBtn];
+
+    y -= 28;
+
+    // Separator
+    NSBox *sep = [[NSBox alloc] initWithFrame:NSMakeRect(14, y, W - 28, 1)];
+    sep.boxType = NSBoxSeparator;
+    sep.autoresizingMask = NSViewMinYMargin | NSViewWidthSizable;
+    [cv addSubview:sep];
+    y -= 6;
+
+    // Column headers
+    NSDictionary *headerAttrs = @{
+        NSFontAttributeName: [NSFont boldSystemFontOfSize:9],
+        NSForegroundColorAttributeName: [NSColor secondaryLabelColor]
+    };
+
+    NSTextField *hdrStage = [[NSTextField alloc] initWithFrame:NSMakeRect(40, y - 12, 140, 12)];
+    hdrStage.attributedStringValue = [[NSAttributedString alloc] initWithString:@"STAGE" attributes:headerAttrs];
+    hdrStage.bezeled = NO; hdrStage.editable = NO; hdrStage.drawsBackground = NO;
+    hdrStage.autoresizingMask = NSViewMinYMargin;
+    [cv addSubview:hdrStage];
+
+    NSTextField *hdrDesc = [[NSTextField alloc] initWithFrame:NSMakeRect(190, y - 12, 240, 12)];
+    hdrDesc.attributedStringValue = [[NSAttributedString alloc] initWithString:@"DESCRIPTION" attributes:headerAttrs];
+    hdrDesc.bezeled = NO; hdrDesc.editable = NO; hdrDesc.drawsBackground = NO;
+    hdrDesc.autoresizingMask = NSViewMinYMargin;
+    [cv addSubview:hdrDesc];
+
+    NSTextField *hdrCost = [[NSTextField alloc] initWithFrame:NSMakeRect(450, y - 12, 80, 12)];
+    hdrCost.attributedStringValue = [[NSAttributedString alloc] initWithString:@"COST (ms/1M)" attributes:headerAttrs];
+    hdrCost.bezeled = NO; hdrCost.editable = NO; hdrCost.drawsBackground = NO;
+    hdrCost.autoresizingMask = NSViewMinYMargin;
+    [cv addSubview:hdrCost];
+
+    NSTextField *hdrReject = [[NSTextField alloc] initWithFrame:NSMakeRect(550, y - 12, 80, 12)];
+    hdrReject.attributedStringValue = [[NSAttributedString alloc] initWithString:@"REJECT %%" attributes:headerAttrs];
+    hdrReject.bezeled = NO; hdrReject.editable = NO; hdrReject.drawsBackground = NO;
+    hdrReject.autoresizingMask = NSViewMinYMargin;
+    [cv addSubview:hdrReject];
+
+    NSTextField *hdrOrder = [[NSTextField alloc] initWithFrame:NSMakeRect(640, y - 12, 50, 12)];
+    hdrOrder.attributedStringValue = [[NSAttributedString alloc] initWithString:@"ORDER" attributes:headerAttrs];
+    hdrOrder.bezeled = NO; hdrOrder.editable = NO; hdrOrder.drawsBackground = NO;
+    hdrOrder.autoresizingMask = NSViewMinYMargin;
+    [cv addSubview:hdrOrder];
+
+    y -= 16;
+
+    // Stage checkboxes in a scrollable container
+    CGFloat stageListTop = y;
+    CGFloat stageListHeight = y - 180; // leave room for log below
+    NSScrollView *stageScroll = [[NSScrollView alloc] initWithFrame:NSMakeRect(14, y - stageListHeight, W - 28, stageListHeight)];
+    stageScroll.hasVerticalScroller = YES;
+    stageScroll.borderType = NSBezelBorder;
+    stageScroll.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
+
+    // Calculate total content height for all stages
+    CGFloat contentH = 0;
+    {
+        const char *prevCat = "";
+        for (int i = 0; i < kNumPipelineStages; i++) {
+            if (strcmp(kPipelineStages[i].category, prevCat) != 0) {
+                prevCat = kPipelineStages[i].category;
+                contentH += 16; // category header
+            }
+            contentH += 18; // stage row
+        }
+        contentH += 10; // padding
+    }
+    if (contentH < stageListHeight) contentH = stageListHeight;
+
+    NSView *stageContainer = [[NSView alloc] initWithFrame:NSMakeRect(0, 0, W - 32, contentH)];
+
+    CGFloat sy = contentH - 4; // start near top of content
+
+    NSColor *sieveColor = [NSColor colorWithSRGBRed:0.2 green:0.6 blue:0.3 alpha:1.0];
+    NSColor *scoreColor = [NSColor colorWithSRGBRed:0.3 green:0.5 blue:0.8 alpha:1.0];
+    NSColor *testColor  = [NSColor colorWithSRGBRed:0.8 green:0.4 blue:0.2 alpha:1.0];
+    NSColor *postColor  = [NSColor colorWithSRGBRed:0.6 green:0.3 blue:0.7 alpha:1.0];
+    NSColor *analysisColor = [NSColor colorWithSRGBRed:0.7 green:0.5 blue:0.1 alpha:1.0];
+
+    const char *lastCategory = "";
+
+    for (int i = 0; i < kNumPipelineStages; i++) {
+        const auto& stage = kPipelineStages[i];
+
+        // Category header
+        if (strcmp(stage.category, lastCategory) != 0) {
+            lastCategory = stage.category;
+
+            NSColor *catColor = sieveColor;
+            if (strcmp(stage.category, "Score") == 0) catColor = scoreColor;
+            else if (strcmp(stage.category, "Test") == 0) catColor = testColor;
+            else if (strcmp(stage.category, "Post") == 0) catColor = postColor;
+            else if (strcmp(stage.category, "Analysis") == 0) catColor = analysisColor;
+
+            NSTextField *catLbl = [[NSTextField alloc] initWithFrame:NSMakeRect(4, sy - 14, 100, 13)];
+            catLbl.stringValue = [NSString stringWithUTF8String:stage.category];
+            catLbl.font = [NSFont boldSystemFontOfSize:9];
+            catLbl.textColor = catColor;
+            catLbl.bezeled = NO; catLbl.editable = NO; catLbl.drawsBackground = NO;
+            [stageContainer addSubview:catLbl];
+            sy -= 16;
+        }
+
+        // Checkbox
+        NSButton *cb = [[NSButton alloc] initWithFrame:NSMakeRect(14, sy - 16, 160, 16)];
+        cb.buttonType = NSButtonTypeSwitch;
+        cb.title = [NSString stringWithUTF8String:stage.name];
+        cb.font = [NSFont systemFontOfSize:10];
+        cb.tag = 10000 + i;
+        // Default: enable Wheel, MatrixSieve, CRT, and Miller-Rabin
+        if (i <= 2 || i == 6) cb.state = NSControlStateValueOn;
+        [stageContainer addSubview:cb];
+
+        // Description
+        NSTextField *desc = [[NSTextField alloc] initWithFrame:NSMakeRect(180, sy - 15, 250, 13)];
+        desc.stringValue = [NSString stringWithUTF8String:stage.description];
+        desc.font = [NSFont systemFontOfSize:9];
+        desc.textColor = [NSColor secondaryLabelColor];
+        desc.bezeled = NO; desc.editable = NO; desc.drawsBackground = NO;
+        [stageContainer addSubview:desc];
+
+        // Cost
+        NSTextField *cost = [[NSTextField alloc] initWithFrame:NSMakeRect(440, sy - 15, 70, 13)];
+        cost.stringValue = [NSString stringWithFormat:@"%.1f", stage.cost_per_million];
+        cost.font = [NSFont monospacedSystemFontOfSize:9 weight:NSFontWeightRegular];
+        cost.alignment = NSTextAlignmentRight;
+        cost.bezeled = NO; cost.editable = NO; cost.drawsBackground = NO;
+        [stageContainer addSubview:cost];
+
+        // Rejection %
+        NSTextField *rej = [[NSTextField alloc] initWithFrame:NSMakeRect(520, sy - 15, 60, 13)];
+        if (stage.rejection_pct > 0) {
+            rej.stringValue = [NSString stringWithFormat:@"~%.0f%%", stage.rejection_pct];
+        } else {
+            rej.stringValue = @"--";
+        }
+        rej.font = [NSFont monospacedSystemFontOfSize:9 weight:NSFontWeightRegular];
+        rej.alignment = NSTextAlignmentRight;
+        rej.bezeled = NO; rej.editable = NO; rej.drawsBackground = NO;
+        [stageContainer addSubview:rej];
+
+        // Order stepper
+        NSTextField *orderField = [[NSTextField alloc] initWithFrame:NSMakeRect(600, sy - 16, 30, 16)];
+        orderField.integerValue = i + 1;
+        orderField.font = [NSFont monospacedSystemFontOfSize:9 weight:NSFontWeightRegular];
+        orderField.alignment = NSTextAlignmentCenter;
+        orderField.tag = 20000 + i;
+        [stageContainer addSubview:orderField];
+
+        sy -= 18;
+    }
+
+    stageScroll.documentView = stageContainer;
+    [cv addSubview:stageScroll];
+
+    y = y - stageListHeight - 8;
+
+    // Cost estimate label
+    NSTextField *estLabel = [[NSTextField alloc] initWithFrame:NSMakeRect(14, y - 14, W - 28, 13)];
+    estLabel.stringValue = @"Estimated pipeline throughput shown after each run.";
+    estLabel.font = [NSFont systemFontOfSize:9];
+    estLabel.textColor = [NSColor tertiaryLabelColor];
+    estLabel.bezeled = NO; estLabel.editable = NO; estLabel.drawsBackground = NO;
+    estLabel.autoresizingMask = NSViewMinYMargin | NSViewWidthSizable;
+    [cv addSubview:estLabel];
+
+    y -= 20;
+
+    // Pipeline output log
+    NSScrollView *logScroll = [[NSScrollView alloc] initWithFrame:NSMakeRect(14, 10, W - 28, y - 10)];
+    logScroll.hasVerticalScroller = YES;
+    logScroll.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
+    NSTextView *logView = [[NSTextView alloc] initWithFrame:NSMakeRect(0, 0, W - 32, y - 10)];
+    logView.editable = NO;
+    logView.font = [NSFont monospacedSystemFontOfSize:10 weight:NSFontWeightRegular];
+    logView.autoresizingMask = NSViewWidthSizable;
+    logScroll.documentView = logView;
+    logScroll.identifier = @"pipelineLog";
+    [cv addSubview:logScroll];
+
+    [win makeKeyAndOrderFront:nil];
+}
+
+// ── Run Pipeline -- executes the configured pipeline ──
+
+- (void)runPipeline:(id)sender {
+    // Find the pipeline window
+    NSWindow *win = [sender window];
+    if (!win) return;
+    NSView *cv = win.contentView;
+
+    // Read range
+    NSTextField *fromField = [cv viewWithTag:9001];
+    NSTextField *toField = [cv viewWithTag:9002];
+    NSButton *sortCheck = [cv viewWithTag:9010];
+    NSTextView *logView = nil;
+
+    // Find the log text view by scroll view identifier
+    for (NSView *v in cv.subviews) {
+        if ([v.identifier isEqualToString:@"pipelineLog"] && [v isKindOfClass:[NSScrollView class]]) {
+            NSScrollView *sv = (NSScrollView *)v;
+            if ([sv.documentView isKindOfClass:[NSTextView class]]) {
+                logView = (NSTextView *)sv.documentView;
+            }
+            break;
+        }
+    }
+    if (!logView || !fromField || !toField) return;
+
+    NSString *fromStr = [fromField.stringValue stringByReplacingOccurrencesOfString:@"," withString:@""];
+    NSString *toStr = [toField.stringValue stringByReplacingOccurrencesOfString:@"," withString:@""];
+    uint64_t rangeStart = [self evalMathExpr:fromStr];
+    uint64_t rangeEnd = [self evalMathExpr:toStr];
+    if (rangeStart < 2) rangeStart = 2;
+    if (rangeEnd <= rangeStart) {
+        logView.string = @"Invalid range. End must be > Start.\n";
+        return;
+    }
+    if (rangeEnd - rangeStart > 10000000) {
+        logView.string = @"Range too large for pipeline (max 10M). Use Search Tasks for larger ranges.\n";
+        return;
+    }
+    bool sortByScore = (sortCheck && sortCheck.state == NSControlStateValueOn);
+
+    // Collect enabled stages with their order
+    struct ActiveStage {
+        int index;
+        int order;
+    };
+    std::vector<ActiveStage> activeStages;
+
+    for (int i = 0; i < kNumPipelineStages; i++) {
+        NSButton *cb = [cv viewWithTag:10000 + i];
+        if (cb && cb.state == NSControlStateValueOn) {
+            NSTextField *orderField = [cv viewWithTag:20000 + i];
+            int order = orderField ? (int)orderField.integerValue : (i + 1);
+            activeStages.push_back({i, order});
+        }
+    }
+
+    if (activeStages.empty()) {
+        logView.string = @"No pipeline stages selected.\n";
+        return;
+    }
+
+    // Sort by user-specified order
+    std::sort(activeStages.begin(), activeStages.end(),
+              [](const ActiveStage& a, const ActiveStage& b) { return a.order < b.order; });
+
+    // Build stage name list for header
+    NSMutableString *stageNames = [NSMutableString string];
+    for (auto& s : activeStages) {
+        if (stageNames.length > 0) [stageNames appendString:@" -> "];
+        [stageNames appendFormat:@"%s", kPipelineStages[s.index].name];
+    }
+
+    logView.string = [NSString stringWithFormat:
+        @"Pipeline: %@\n"
+        @"Range: [%@, %@] (%@ candidates)\n"
+        @"Running...\n\n",
+        stageNames,
+        formatNumber(rangeStart), formatNumber(rangeEnd),
+        formatNumber(rangeEnd - rangeStart)];
+
+    // Run in background
+    __weak AppDelegate *weakSelf = self;
+    __weak NSTextView *weakLog = logView;
+    std::vector<ActiveStage> stages = activeStages;
+
+    _checkRunning.store(false);
+    if (_checkThread.joinable()) _checkThread.join();
+    _checkRunning.store(true);
+
+    _checkThread = std::thread([weakSelf, weakLog, rangeStart, rangeEnd, stages, sortByScore]() {
+        AppDelegate *ss = weakSelf;
+        if (!ss) return;
+
+        auto plog = [weakLog](NSString *msg) {
+            dispatch_async(dispatch_get_main_queue(), ^{
+                NSTextView *lv = weakLog;
+                if (!lv) return;
+                NSAttributedString *attr = [[NSAttributedString alloc]
+                    initWithString:msg
+                    attributes:@{
+                        NSFontAttributeName: [NSFont monospacedSystemFontOfSize:10 weight:NSFontWeightRegular],
+                        NSForegroundColorAttributeName: [NSColor labelColor]
+                    }];
+                [lv.textStorage appendAttributedString:attr];
+                [lv scrollRangeToVisible:NSMakeRange(lv.string.length, 0)];
+            });
+        };
+
+        auto t_total = std::chrono::steady_clock::now();
+
+        // Start with all candidates in range
+        struct Candidate {
+            uint64_t value;
+            double score;
+        };
+        std::vector<Candidate> candidates;
+        candidates.reserve(rangeEnd - rangeStart);
+
+        // Populate initial candidates (odd numbers, skip even except 2)
+        if (rangeStart == 2) candidates.push_back({2, 0.0});
+        uint64_t start = (rangeStart % 2 == 0) ? rangeStart + 1 : rangeStart;
+        if (start < 3) start = 3;
+        for (uint64_t n = start; n <= rangeEnd; n += 2) {
+            candidates.push_back({n, 0.0});
+        }
+
+        plog([NSString stringWithFormat:@"Initial candidates: %@\n", formatNumber((uint64_t)candidates.size())]);
+
+        // Results collection
+        std::vector<uint64_t> results;
+        std::vector<std::pair<uint64_t, std::string>> postResults; // for post-processing
+
+        // Execute each stage
+        for (auto& stage : stages) {
+            if (!ss->_checkRunning.load()) {
+                plog(@"\nPipeline stopped by user.\n");
+                return;
+            }
+
+            const auto& def = kPipelineStages[stage.index];
+            auto t0 = std::chrono::steady_clock::now();
+            size_t before = candidates.size();
+
+            plog([NSString stringWithFormat:@"[%s] Processing %@ candidates...\n",
+                def.name, formatNumber((uint64_t)before)]);
+
+            if (strcmp(def.name, "Wheel-210") == 0) {
+                // Wheel-210 filter
+                std::vector<Candidate> filtered;
+                filtered.reserve(candidates.size());
+                for (auto& c : candidates) {
+                    if (c.value <= 7 || prime::WHEEL.valid(c.value))
+                        filtered.push_back(c);
+                }
+                candidates = std::move(filtered);
+
+            } else if (strcmp(def.name, "MatrixSieve") == 0) {
+                // MatrixSieve: check against small primes 3-31
+                static const uint64_t mprimes[] = {3,5,7,11,13,17,19,23,29,31};
+                std::vector<Candidate> filtered;
+                filtered.reserve(candidates.size());
+                for (auto& c : candidates) {
+                    bool ok = true;
+                    for (auto p : mprimes) {
+                        if (c.value > p && c.value % p == 0) { ok = false; break; }
+                    }
+                    if (ok) filtered.push_back(c);
+                }
+                candidates = std::move(filtered);
+
+            } else if (strcmp(def.name, "CRT Filter") == 0) {
+                std::vector<Candidate> filtered;
+                filtered.reserve(candidates.size());
+                for (auto& c : candidates) {
+                    if (!prime::crt_reject(c.value))
+                        filtered.push_back(c);
+                }
+                candidates = std::move(filtered);
+
+            } else if (strcmp(def.name, "Pseudoprime Filter") == 0) {
+                // Simple: remove even numbers and known small composites
+                std::vector<Candidate> filtered;
+                filtered.reserve(candidates.size());
+                for (auto& c : candidates) {
+                    // Quick Fermat test base 2 -- catches many pseudoprimes
+                    if (c.value > 2 && prime::modpow(2, c.value - 1, c.value) != 1) continue;
+                    filtered.push_back(c);
+                }
+                candidates = std::move(filtered);
+
+            } else if (strcmp(def.name, "Convergence Score") == 0) {
+                for (auto& c : candidates) {
+                    c.score = prime::convergence(c.value, 12);
+                }
+                // Remove shadow-field rejects
+                std::vector<Candidate> filtered;
+                filtered.reserve(candidates.size());
+                for (auto& c : candidates) {
+                    if (c.score > -900.0) filtered.push_back(c);
+                }
+                candidates = std::move(filtered);
+
+            } else if (strcmp(def.name, "EvenShadow Score") == 0) {
+                // Score based on p-1/p+1 divisor structure
+                for (auto& c : candidates) {
+                    uint64_t pm1 = c.value - 1;
+                    int factors = 0;
+                    for (uint64_t p : {2ULL,3ULL,5ULL,7ULL,11ULL,13ULL,17ULL,19ULL,23ULL}) {
+                        while (pm1 % p == 0) { pm1 /= p; factors++; }
+                    }
+                    c.score += factors * 10.0; // more small factors = higher score
+                }
+
+            } else if (strcmp(def.name, "Miller-Rabin CPU") == 0) {
+                std::vector<Candidate> filtered;
+                for (auto& c : candidates) {
+                    if (prime::is_prime(c.value)) filtered.push_back(c);
+                }
+                candidates = std::move(filtered);
+
+            } else if (strcmp(def.name, "GPU Primality") == 0) {
+                if (ss->_gpu) {
+                    // Batch GPU test
+                    std::vector<uint64_t> vals;
+                    vals.reserve(candidates.size());
+                    for (auto& c : candidates) vals.push_back(c.value);
+                    std::vector<uint8_t> gpu_results(vals.size(), 0);
+                    ss->_gpu->primality_batch(vals.data(), gpu_results.data(), (uint32_t)vals.size());
+                    std::vector<Candidate> filtered;
+                    for (size_t i = 0; i < candidates.size(); i++) {
+                        if (gpu_results[i]) filtered.push_back(candidates[i]);
+                    }
+                    candidates = std::move(filtered);
+                } else {
+                    plog(@"  (no GPU available, falling back to CPU Miller-Rabin)\n");
+                    std::vector<Candidate> filtered;
+                    for (auto& c : candidates) {
+                        if (prime::is_prime(c.value)) filtered.push_back(c);
+                    }
+                    candidates = std::move(filtered);
+                }
+
+            } else if (strcmp(def.name, "Wieferich Test") == 0) {
+                std::vector<Candidate> filtered;
+                for (auto& c : candidates) {
+                    if (prime::modpow(2, c.value - 1, c.value * c.value) == 1)
+                        filtered.push_back(c);
+                }
+                candidates = std::move(filtered);
+
+            } else if (strcmp(def.name, "Wilson Test") == 0) {
+                std::vector<Candidate> filtered;
+                for (auto& c : candidates) {
+                    if (c.value > 100000) continue; // too slow for large p
+                    uint64_t mod = c.value * c.value;
+                    uint64_t factorial = 1;
+                    for (uint64_t i = 2; i < c.value; i++) {
+                        factorial = prime::mulmod(factorial, i, mod);
+                    }
+                    if (factorial == mod - 1) filtered.push_back(c);
+                }
+                candidates = std::move(filtered);
+
+            } else if (strcmp(def.name, "Twin Pair Test") == 0) {
+                std::vector<Candidate> filtered;
+                for (auto& c : candidates) {
+                    if (prime::is_prime(c.value) && prime::is_prime(c.value + 2))
+                        filtered.push_back(c);
+                }
+                candidates = std::move(filtered);
+
+            } else if (strcmp(def.name, "Sophie Germain") == 0) {
+                std::vector<Candidate> filtered;
+                for (auto& c : candidates) {
+                    if (prime::is_prime(c.value) && prime::is_prime(2 * c.value + 1))
+                        filtered.push_back(c);
+                }
+                candidates = std::move(filtered);
+
+            } else if (strcmp(def.name, "Cousin Pair Test") == 0) {
+                std::vector<Candidate> filtered;
+                for (auto& c : candidates) {
+                    if (prime::is_prime(c.value) && prime::is_prime(c.value + 4))
+                        filtered.push_back(c);
+                }
+                candidates = std::move(filtered);
+
+            } else if (strcmp(def.name, "Sexy Pair Test") == 0) {
+                std::vector<Candidate> filtered;
+                for (auto& c : candidates) {
+                    if (prime::is_prime(c.value) && prime::is_prime(c.value + 6))
+                        filtered.push_back(c);
+                }
+                candidates = std::move(filtered);
+
+            } else if (strcmp(def.name, "Emirp Test") == 0) {
+                std::vector<Candidate> filtered;
+                for (auto& c : candidates) {
+                    uint64_t rev = 0, tmp = c.value;
+                    while (tmp > 0) { rev = rev * 10 + tmp % 10; tmp /= 10; }
+                    if (rev != c.value && prime::is_prime(c.value) && prime::is_prime(rev))
+                        filtered.push_back(c);
+                }
+                candidates = std::move(filtered);
+
+            } else if (strcmp(def.name, "Factor (full)") == 0) {
+                for (auto& c : candidates) {
+                    std::string fs = prime::factors_string(c.value);
+                    if (!fs.empty()) {
+                        postResults.push_back({c.value, fs});
+                    }
+                }
+
+            } else if (strcmp(def.name, "PinchFactor") == 0) {
+                for (auto& c : candidates) {
+                    auto hits = prime::pinch_factor(c.value);
+                    for (auto& h : hits) {
+                        if (c.value % h.divisor == 0 && h.divisor > 1 && h.divisor < c.value) {
+                            postResults.push_back({c.value,
+                                std::string("PinchFactor: ") + std::to_string(h.divisor)
+                                + " (" + h.method + ")"});
+                            break;
+                        }
+                    }
+                }
+
+            } else if (strcmp(def.name, "Lucky7s") == 0) {
+                for (auto& c : candidates) {
+                    auto hits = prime::lucky7_factor(c.value);
+                    for (auto& h : hits) {
+                        if (c.value % h.divisor == 0 && h.divisor > 1) {
+                            postResults.push_back({c.value,
+                                std::string("Lucky7: ") + std::to_string(h.divisor)
+                                + " (" + h.method + ")"});
+                            break;
+                        }
+                    }
+                }
+
+            } else if (strcmp(def.name, "DivisorWeb") == 0) {
+                for (auto& c : candidates) {
+                    auto web = prime::divisor_web(c.value, 10);
+                    if (!web.all_divisors.empty()) {
+                        std::string divs;
+                        for (auto d : web.all_divisors) {
+                            if (!divs.empty()) divs += ", ";
+                            divs += std::to_string(d);
+                        }
+                        postResults.push_back({c.value, "DivisorWeb: {" + divs + "}"});
+                    }
+                }
+            }
+
+            auto dt = std::chrono::duration<double>(
+                std::chrono::steady_clock::now() - t0).count();
+            size_t after = candidates.size();
+            size_t rejected = before - after;
+            double pct = before > 0 ? 100.0 * rejected / before : 0.0;
+
+            NSString *stageResult;
+            if (strcmp(def.category, "Post") == 0) {
+                stageResult = [NSString stringWithFormat:
+                    @"  -> %@ results, %.4fs\n",
+                    formatNumber((uint64_t)postResults.size()), dt];
+            } else if (rejected > 0) {
+                stageResult = [NSString stringWithFormat:
+                    @"  -> %@ survived, %@ rejected (%.1f%%), %.4fs\n",
+                    formatNumber((uint64_t)after), formatNumber((uint64_t)rejected), pct, dt];
+            } else {
+                stageResult = [NSString stringWithFormat:
+                    @"  -> %@ survived, %.4fs\n",
+                    formatNumber((uint64_t)after), dt];
+            }
+            plog(stageResult);
+        }
+
+        // Sort by score if requested
+        if (sortByScore && !candidates.empty()) {
+            std::sort(candidates.begin(), candidates.end(),
+                      [](const Candidate& a, const Candidate& b) { return a.score > b.score; });
+        }
+
+        auto totalTime = std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - t_total).count();
+
+        // Output results
+        plog([NSString stringWithFormat:@"\n== Pipeline Results ==\n"]);
+        plog([NSString stringWithFormat:@"Survivors: %@\n", formatNumber((uint64_t)candidates.size())]);
+        plog([NSString stringWithFormat:@"Total time: %.4fs\n\n", totalTime]);
+
+        // Show up to 500 results
+        size_t show = std::min(candidates.size(), (size_t)500);
+        for (size_t i = 0; i < show; i++) {
+            auto& c = candidates[i];
+            NSString *scoreStr = (c.score != 0.0)
+                ? [NSString stringWithFormat:@" (score: %.2f)", c.score]
+                : @"";
+            plog([NSString stringWithFormat:@"  %@%@\n", formatNumber(c.value), scoreStr]);
+        }
+        if (candidates.size() > 500) {
+            plog([NSString stringWithFormat:@"  ... and %@ more\n",
+                formatNumber((uint64_t)(candidates.size() - 500))]);
+        }
+
+        // Show post-processing results
+        if (!postResults.empty()) {
+            plog([NSString stringWithFormat:@"\n== Post-Processing Results ==\n"]);
+            size_t showPost = std::min(postResults.size(), (size_t)200);
+            for (size_t i = 0; i < showPost; i++) {
+                plog([NSString stringWithFormat:@"  %@: %s\n",
+                    formatNumber(postResults[i].first), postResults[i].second.c_str()]);
+            }
+        }
+
+        plog([NSString stringWithFormat:@"\nDone. Throughput: %@/s\n",
+            formatNumber((uint64_t)((rangeEnd - rangeStart) / totalTime))]);
+
+        ss->_checkRunning.store(false);
+    });
+    // Thread stays joinable for proper cleanup
+}
+
 - (void)appendText:(NSString *)text {
     NSAttributedString *attr = [[NSAttributedString alloc]
         initWithString:text
@@ -2263,22 +3878,518 @@ static const int EQ_HISTORY = 32; // number of vertical bars (time history)
     [self.mainWindow setDocumentEdited:NO];
 }
 
+// ═══════════════════════════════════════════════════════════════════════
+// In-App Engine Test Suite (108 tests)
+// ═══════════════════════════════════════════════════════════════════════
+
+- (void)runInAppTests:(id)sender {
+    // Stop any running check first
+    _checkRunning.store(false);
+    if (_checkThread.joinable()) _checkThread.join();
+    _checkRunning.store(true);
+
+    __weak AppDelegate *weakSelf = self;
+
+    _checkThread = std::thread([weakSelf]() {
+        AppDelegate *ss = weakSelf;
+        if (!ss) return;
+
+        int pass = 0, fail = 0;
+
+        auto log = [weakSelf](NSString *msg) {
+            dispatch_async(dispatch_get_main_queue(), ^{
+                [weakSelf appendText:msg];
+            });
+        };
+
+        auto cancelled = [weakSelf]() -> bool {
+            AppDelegate *s = weakSelf;
+            return !s || !s->_checkRunning.load();
+        };
+
+        auto check = [&](bool expr, const char *name) {
+            if (expr) {
+                log([NSString stringWithFormat:@"  PASS: %s\n", name]);
+                pass++;
+            } else {
+                log([NSString stringWithFormat:@"  FAIL: %s\n", name]);
+                fail++;
+            }
+        };
+
+        log(@"\nPrimePath Engine Test Suite\n");
+        log(@"================================================\n");
+
+        // ── 1. Primality Testing ──
+        log(@"\n=== 1. Primality Testing ===\n");
+
+        check(!prime::is_prime(0), "0 is not prime");
+        check(!prime::is_prime(1), "1 is not prime");
+        check(prime::is_prime(2),  "2 is prime");
+
+        uint64_t known_primes[] = {2,3,5,7,11,13,997,7919,104729};
+        bool all_primes_ok = true;
+        for (auto p : known_primes) {
+            if (!prime::is_prime(p)) { all_primes_ok = false; break; }
+        }
+        check(all_primes_ok, "known primes: 2,3,5,7,11,13,997,7919,104729");
+
+        uint64_t known_composites[] = {4,6,9,15};
+        bool all_comp_ok = true;
+        for (auto c : known_composites) {
+            if (prime::is_prime(c)) { all_comp_ok = false; break; }
+        }
+        check(all_comp_ok, "known composites: 4,6,9,15");
+
+        check(!prime::is_prime(561), "561 (Carmichael) is composite");
+
+        uint64_t carmichaels[] = {1105, 1729, 2465, 2821, 6601, 8911, 10585, 15841, 29341, 41041, 46657, 52633, 62745, 63973, 75361};
+        bool carm_ok = true;
+        for (auto c : carmichaels) {
+            if (prime::is_prime(c)) { carm_ok = false; break; }
+        }
+        check(carm_ok, "all Carmichael numbers correctly rejected");
+
+        check(prime::is_prime(2147483647ULL), "M31 = 2^31-1 is prime");
+        check(prime::is_prime(2305843009213693951ULL), "M61 = 2^61-1 is prime");
+        check(!prime::is_prime(8388607ULL),   "2^23-1 = 8388607 is composite (47*178481)");
+        check(!prime::is_prime(536870911ULL), "2^29-1 = 536870911 is composite");
+        check(prime::is_prime(1000000007ULL),    "10^9+7 is prime");
+        check(prime::is_prime(999999999989ULL),  "999999999989 is prime");
+        check(!prime::is_prime(1000000007ULL * 1000000009ULL), "product of two large primes is composite");
+
+        uint64_t small_primes[] = {2,3,5,7,11,13,17,19,23,29,31,37,41,43,47,53,59,61,67,71,73,79,83,89,97};
+        bool all_small = true;
+        for (auto p : small_primes) {
+            if (!prime::is_prime(p)) { all_small = false; break; }
+        }
+        check(all_small, "all primes up to 97 detected");
+
+        uint64_t small_comp[] = {4,6,8,9,10,12,14,15,16,18,20,21,22,24,25,26,27,28};
+        bool all_sc = true;
+        for (auto c : small_comp) {
+            if (prime::is_prime(c)) { all_sc = false; break; }
+        }
+        check(all_sc, "small composites [4..28] correctly rejected");
+
+        prime::Engine engine;
+        auto r2 = engine.verify(2);
+        check(r2.confirmed && r2.value == 2, "Engine::verify(2) confirms prime");
+        auto r4 = engine.verify(4);
+        check(!r4.confirmed && r4.value == 4, "Engine::verify(4) confirms composite");
+        auto rBig = engine.verify(1000000007ULL);
+        check(rBig.confirmed, "Engine::verify(10^9+7) confirms prime");
+
+        if (cancelled()) goto test_done;
+        { // ── 2. Modular Arithmetic ──
+        log(@"\n=== 2. Modular Arithmetic ===\n");
+
+        check(prime::mulmod(3, 5, 7) == 1, "mulmod(3,5,7) = 15 mod 7 = 1");
+        check(prime::mulmod(0, 12345, 100) == 0, "mulmod(0,x,m) = 0");
+        check(prime::mulmod(12345, 0, 100) == 0, "mulmod(x,0,m) = 0");
+        check(prime::mulmod(1, 1, 1) == 0, "mulmod(1,1,1) = 0");
+
+        uint64_t big = (1ULL << 63);
+        uint64_t bigmod = big + 1;
+        check(prime::mulmod(big, big, bigmod) == 1, "mulmod overflow: (2^63)^2 mod (2^63+1) = 1");
+
+        uint64_t umax = UINT64_MAX;
+        check(prime::mulmod(umax - 1, umax - 1, umax) == 1, "mulmod(UINT64_MAX-1, UINT64_MAX-1, UINT64_MAX) = 1");
+
+        check(prime::mulmod(1ULL << 62, 4, (1ULL << 63) + 7) != 0, "mulmod near 2^64 does not crash");
+
+        check(prime::modpow(2, 10, 1000) == 24, "modpow(2,10,1000) = 1024 mod 1000 = 24");
+        check(prime::modpow(2, 10, 1024) == 0,  "modpow(2,10,1024) = 0");
+        check(prime::modpow(3, 0, 100) == 1,    "modpow(x,0,m) = 1");
+        check(prime::modpow(5, 1, 100) == 5,    "modpow(5,1,100) = 5");
+        check(prime::modpow(7, 7, 1) == 0,      "modpow(x,y,1) = 0");
+
+        uint64_t m = 1000000007ULL;
+        uint64_t r100v = prime::modpow(3, 100, m);
+        uint64_t r101v = prime::modpow(3, 101, m);
+        check(prime::mulmod(r100v, 3, m) == r101v, "modpow consistency: 3^100 * 3 = 3^101 (mod 10^9+7)");
+
+        uint64_t fermat_primes[] = {5, 7, 13, 97, 101, 997, 7919, 10007, 104729, 1000000007ULL};
+        bool fermat_ok = true;
+        for (auto p : fermat_primes) {
+            if (prime::modpow(2, p - 1, p) != 1) { fermat_ok = false; break; }
+        }
+        check(fermat_ok, "Fermat's little theorem: 2^(p-1) mod p == 1 for known primes");
+
+        bool fermat_multi = true;
+        for (auto p : fermat_primes) {
+            for (uint64_t a : {3ULL, 5ULL, 11ULL}) {
+                if (a % p == 0) continue;
+                if (prime::modpow(a, p - 1, p) != 1) { fermat_multi = false; break; }
+            }
+            if (!fermat_multi) break;
+        }
+        check(fermat_multi, "Fermat's little theorem holds for bases 3,5,11 across sample primes");
+
+        uint64_t r64 = prime::modpow(2, 64, m);
+        uint64_t r65 = prime::modpow(2, 65, m);
+        check(prime::mulmod(r64, 2, m) == r65, "modpow consistency: 2^64 * 2 = 2^65 (mod 10^9+7)");
+        }
+
+        if (cancelled()) goto test_done;
+        { // ── 3. Sieve ──
+        log(@"\n=== 3. Sieve ===\n");
+
+        auto s100v = prime::sieve(100);
+        int count100 = 0;
+        for (uint64_t i = 0; i <= 100; i++) if (s100v[i]) count100++;
+        check(count100 == 25, "pi(100) = 25");
+
+        auto s1000 = prime::sieve(1000);
+        int count1000 = 0;
+        for (uint64_t i = 0; i <= 1000; i++) if (s1000[i]) count1000++;
+        check(count1000 == 168, "pi(1000) = 168");
+
+        auto s10k = prime::sieve(10000);
+        int count10k = 0;
+        for (uint64_t i = 0; i <= 10000; i++) if (s10k[i]) count10k++;
+        check(count10k == 1229, "pi(10000) = 1229");
+
+        bool sieve_agree = true;
+        for (uint64_t i = 0; i <= 1000; i++) {
+            if ((bool)s1000[i] != prime::is_prime(i)) { sieve_agree = false; break; }
+        }
+        check(sieve_agree, "sieve agrees with is_prime for n <= 1000");
+
+        auto s2v = prime::sieve(2);
+        check(s2v[0] == false && s2v[1] == false && s2v[2] == true, "sieve(2) correct");
+
+        bool wheel_ok = true;
+        for (uint64_t i = 8; i <= 10000; i++) {
+            if (s10k[i] && !prime::WHEEL.valid(i)) { wheel_ok = false; break; }
+        }
+        check(wheel_ok, "wheel-210 accepts all primes > 7 up to 10000");
+        check(!prime::WHEEL.valid(4) && !prime::WHEEL.valid(6) && !prime::WHEEL.valid(9) && !prime::WHEEL.valid(10),
+              "wheel-210 rejects 4, 6, 9, 10");
+        }
+
+        if (cancelled()) goto test_done;
+        { // ── 4. Factoring ──
+        log(@"\n=== 4. Factoring ===\n");
+
+        auto f1 = prime::factor_u64(1);
+        check(f1.empty(), "factor(1) = empty");
+
+        auto f2v = prime::factor_u64(2);
+        check(f2v.size() == 1 && f2v[0] == 2, "factor(2) = {2}");
+
+        auto f12 = prime::factor_u64(12);
+        check(f12.size() == 3 && f12[0] == 2 && f12[1] == 2 && f12[2] == 3, "factor(12) = {2,2,3}");
+
+        auto f143 = prime::factor_u64(143);
+        check(f143.size() == 2 && f143[0] == 11 && f143[1] == 13, "factor(143) = {11,13}");
+
+        auto f256 = prime::factor_u64(256);
+        check(f256.size() == 8, "factor(256) = eight 2s");
+        bool all2 = true;
+        for (auto x : f256) if (x != 2) all2 = false;
+        check(all2, "factor(256) all factors are 2");
+
+        auto fSemi = prime::factor_u64(100160063ULL);
+        check(fSemi.size() == 2 && fSemi[0] == 10007 && fSemi[1] == 10009, "factor(10007*10009)");
+
+        auto f3v = prime::factor_u64(1113121ULL);
+        check(f3v.size() == 3 && f3v[0] == 101 && f3v[1] == 103 && f3v[2] == 107,
+              "factor(101*103*107) = {101,103,107}");
+
+        auto fPollard = prime::factor_u64(1000036000099ULL);
+        check(fPollard.size() == 2 && fPollard[0] == 1000003ULL && fPollard[1] == 1000033ULL,
+              "factor(1000003*1000033) via Pollard rho");
+
+        uint64_t test_vals[] = {2, 12, 143, 256, 1113121ULL, 100160063ULL, 1000036000099ULL};
+        bool product_ok = true;
+        for (auto n : test_vals) {
+            auto factors = prime::factor_u64(n);
+            uint64_t product = 1;
+            for (auto f : factors) product *= f;
+            if (product != n) { product_ok = false; break; }
+        }
+        check(product_ok, "factor product reconstruction correct for all test values");
+
+        bool all_prime = true;
+        for (auto n : test_vals) {
+            auto factors = prime::factor_u64(n);
+            for (auto f : factors) {
+                if (!prime::is_prime(f)) { all_prime = false; break; }
+            }
+            if (!all_prime) break;
+        }
+        check(all_prime, "all returned factors are prime");
+
+        check(prime::factors_string(12) == "2 x 2 x 3", "factors_string(12) = \"2 x 2 x 3\"");
+        check(prime::factors_string(1).empty(), "factors_string(1) = empty");
+
+        uint64_t d = prime::brent_rho_one(143, 1);
+        check(d == 11 || d == 13, "brent_rho_one(143,1) finds a factor of 143");
+        }
+
+        if (cancelled()) goto test_done;
+        { // ── 5. Special Primes (Wieferich / Wilson) ──
+        log(@"\n=== 5. Special Primes (Wieferich / Wilson) ===\n");
+
+        auto wieferich_test = [](uint64_t p) -> bool {
+            return prime::modpow(2, p - 1, p * p) == 1;
+        };
+
+        check(prime::is_prime(1093), "1093 is prime");
+        check(wieferich_test(1093),  "1093 is Wieferich: 2^1092 mod 1093^2 == 1");
+        check(prime::is_prime(3511), "3511 is prime");
+        check(wieferich_test(3511),  "3511 is Wieferich: 2^3510 mod 3511^2 == 1");
+        check(!wieferich_test(3),  "3 is not Wieferich");
+        check(!wieferich_test(5),  "5 is not Wieferich");
+        check(!wieferich_test(7),  "7 is not Wieferich");
+        check(!wieferich_test(11), "11 is not Wieferich");
+        check(!wieferich_test(13), "13 is not Wieferich");
+
+        auto wilson_test = [](uint64_t p) -> bool {
+            uint64_t mod = p * p;
+            uint64_t factorial = 1;
+            for (uint64_t i = 2; i < p; i++) {
+                factorial = prime::mulmod(factorial, i, mod);
+            }
+            return factorial == mod - 1;
+        };
+
+        check(prime::is_prime(5),   "5 is prime");
+        check(wilson_test(5),       "5 is Wilson prime: 4! mod 25 == 24");
+        check(prime::is_prime(13),  "13 is prime");
+        check(wilson_test(13),      "13 is Wilson prime: 12! mod 169 == 168");
+        check(prime::is_prime(563), "563 is prime");
+        check(wilson_test(563),     "563 is Wilson prime: 562! mod 563^2 == 563^2-1");
+        check(!wilson_test(7),  "7 is not Wilson prime");
+        check(!wilson_test(11), "11 is not Wilson prime");
+        check(!wilson_test(23), "23 is not Wilson prime");
+        }
+
+        if (cancelled()) goto test_done;
+        { // ── 6. Search Engine ──
+        log(@"\n=== 6. Search Engine ===\n");
+
+        int hw = std::max(1, (int)std::thread::hardware_concurrency());
+
+        auto r1 = engine.search_range(2, 30, 1);
+        check(r1.size() == 6, "search_range(2,30) finds 6 primes (wheel skips 2,3,5,7)");
+
+        bool sorted = true;
+        for (size_t i = 1; i < r1.size(); i++) {
+            if (r1[i].value <= r1[i-1].value) { sorted = false; break; }
+        }
+        check(sorted, "search_range results are sorted");
+
+        bool all_confirmed = true;
+        for (auto& pr : r1) if (!pr.confirmed) all_confirmed = false;
+        check(all_confirmed, "all search results have confirmed=true");
+
+        auto sieveData = prime::sieve(1100);
+        int sieve_count = 0;
+        for (uint64_t i = 1000; i <= 1100; i++) if (sieveData[i]) sieve_count++;
+        auto rMid = engine.search_range(1000, 1100, hw);
+        check((int)rMid.size() == sieve_count, "search_range(1000,1100) count matches sieve");
+
+        std::set<uint64_t> sieveSet, engineSet;
+        for (uint64_t i = 1000; i <= 1100; i++) if (sieveData[i]) sieveSet.insert(i);
+        for (auto& pr : rMid) engineSet.insert(pr.value);
+        check(sieveSet == engineSet, "search_range(1000,1100) exact values match sieve");
+
+        auto s100b = prime::sieve(100);
+        int sieve100 = 0;
+        for (uint64_t i = 2; i <= 100; i++) if (s100b[i]) sieve100++;
+        auto r100b = engine.search_range(2, 100, 1);
+        check((int)r100b.size() == sieve100 - 4, "search_range(2,100) matches pi(100)-4 (wheel skips 2,3,5,7)");
+
+        auto s5200 = prime::sieve(5200);
+        std::set<uint64_t> sSet5k, eSet5k;
+        for (uint64_t i = 5000; i <= 5200; i++) if (s5200[i]) sSet5k.insert(i);
+        auto r5k = engine.search_range(5000, 5200, hw);
+        for (auto& pr : r5k) eSet5k.insert(pr.value);
+        check(sSet5k == eSet5k, "search_range(5000,5200) exact values match sieve");
+
+        auto r_single = engine.search_range(100000, 101000, 1);
+        auto r_multi  = engine.search_range(100000, 101000, hw);
+        std::set<uint64_t> set1, set2;
+        for (auto& pr : r_single) set1.insert(pr.value);
+        for (auto& pr : r_multi)  set2.insert(pr.value);
+        check(set1 == set2, "single-thread and multi-thread find identical primes [100000,101000]");
+
+        int twin_count = 0;
+        for (size_t i = 1; i < r100b.size(); i++) {
+            if (r100b[i].value - r100b[i-1].value == 2) twin_count++;
+        }
+        check(twin_count == 6, "6 twin prime pairs in engine results [2,100]");
+
+        uint64_t lo = 999900, hi = 1000100;
+        auto rBase = engine.search_range(lo, hi, hw);
+        std::set<uint64_t> baseline;
+        for (auto& pr : rBase) baseline.insert(pr.value);
+        bool deterministic = true;
+        for (int trial = 0; trial < 3; trial++) {
+            auto rt = engine.search_range(lo, hi, hw);
+            std::set<uint64_t> sv;
+            for (auto& pr : rt) sv.insert(pr.value);
+            if (sv != baseline) { deterministic = false; break; }
+        }
+        check(deterministic, "3 repeated runs produce identical results");
+        }
+
+        if (cancelled()) goto test_done;
+        { // ── 7. Performance Benchmark ──
+        log(@"\n=== 7. Performance Benchmark ===\n");
+
+        int hw = std::max(1, (int)std::thread::hardware_concurrency());
+        uint64_t bstart = 1000000000ULL;
+        uint64_t bend   = 1000000000ULL + 100000ULL;
+        auto t0 = std::chrono::steady_clock::now();
+        auto results = engine.search_range(bstart, bend, hw);
+        auto dt = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+
+        log([NSString stringWithFormat:@"  Range: [%llu, %llu]\n", bstart, bend]);
+        log([NSString stringWithFormat:@"  Primes found: %zu\n", results.size()]);
+        log([NSString stringWithFormat:@"  Time: %.4f s\n", dt]);
+        if (dt > 0) {
+            log([NSString stringWithFormat:@"  Rate: %.0f candidates/sec\n", (double)(bend - bstart) / dt]);
+        }
+
+        check(results.size() > 4500 && results.size() < 5200,
+              "prime count in [10^9, 10^9+10^5] is reasonable (~4832)");
+        check(dt < 30.0, "benchmark completes in under 30 seconds");
+        }
+
+        if (cancelled()) goto test_done;
+        { // ── A. CRT Rejection Filter ──
+        log(@"\n=== A. CRT Rejection Filter ===\n");
+
+        check(prime::crt_reject(0),  "crt_reject(0)");
+        check(prime::crt_reject(1),  "crt_reject(1)");
+        check(!prime::crt_reject(2), "crt_reject(2) = false (prime)");
+        check(!prime::crt_reject(37), "crt_reject(37) = false (prime)");
+        check(prime::crt_reject(11 * 43), "crt_reject(11*43)");
+        check(prime::crt_reject(13 * 47), "crt_reject(13*47)");
+        check(prime::crt_reject(17 * 41), "crt_reject(17*41)");
+        check(prime::crt_reject(19 * 43), "crt_reject(19*43)");
+        check(prime::crt_reject(23 * 41), "crt_reject(23*41)");
+        check(prime::crt_reject(29 * 43), "crt_reject(29*43)");
+        check(prime::crt_reject(31 * 43), "crt_reject(31*43)");
+
+        auto crtSv = prime::sieve(10000);
+        bool crt_ok = true;
+        for (uint64_t i = 38; i <= 10000; i++) {
+            if (crtSv[i] && prime::crt_reject(i)) { crt_ok = false; break; }
+        }
+        check(crt_ok, "crt_reject does not reject any prime in [38, 10000]");
+        }
+
+        if (cancelled()) goto test_done;
+        { // ── B. Convergence / Shadow Field ──
+        log(@"\n=== B. Convergence / Shadow Field ===\n");
+
+        check(prime::convergence(7 * 11) == -999.0, "convergence(77) = -999 (multiple of shadow prime)");
+        check(prime::convergence(13 * 17) == -999.0, "convergence(221) = -999");
+
+        double c97 = prime::convergence(97);
+        check(c97 != -999.0, "convergence(97) is finite (prime)");
+        double c101 = prime::convergence(101);
+        check(c101 != -999.0, "convergence(101) is finite");
+
+        auto prv = engine.verify(997);
+        check(prv.convergence_score != 0.0 && prv.convergence_score != -999.0,
+              "verify(997) returns non-trivial convergence score");
+
+        // ── C. Heuristic Factoring ──
+        log(@"\n=== C. Heuristic Factoring ===\n");
+
+        auto ph = prime::pinch_factor(1729);
+        bool pinch_found = false;
+        for (auto& h : ph) {
+            if (1729 % h.divisor == 0 && h.divisor > 1 && h.divisor < 1729) pinch_found = true;
+        }
+        check(pinch_found, "pinch_factor(1729) finds at least one divisor");
+
+        auto l7 = prime::lucky7_factor(100160063ULL);
+        bool lucky7_found = false;
+        for (auto& h : l7) {
+            if (100160063ULL % h.divisor == 0 && h.divisor > 1) lucky7_found = true;
+        }
+        check(lucky7_found, "lucky7_factor(10007*10009) finds factor near 10^4");
+
+        auto web = prime::divisor_web(60, 10);
+        check(web.n == 60, "divisor_web(60).n = 60");
+        std::set<uint64_t> expected_pd = {2, 3, 5};
+        std::set<uint64_t> actual_pd(web.prime_divisors.begin(), web.prime_divisors.end());
+        check(actual_pd == expected_pd, "divisor_web(60) prime_divisors = {2,3,5}");
+
+        auto hd = prime::heuristic_divisors(1729);
+        bool hd_valid = true;
+        for (auto dv : hd) {
+            if (1729 % dv != 0) { hd_valid = false; break; }
+        }
+        check(hd_valid, "heuristic_divisors(1729) all results divide 1729");
+        }
+
+    test_done:
+        // ── Results ──
+        if (cancelled()) {
+            log(@"\nTest suite cancelled.\n\n");
+        } else {
+            log(@"\n================================================\n");
+            NSString *summary = [NSString stringWithFormat:
+                @"RESULTS: %d passed, %d failed, %d total\n", pass, fail, pass + fail];
+            log(summary);
+            log(@"================================================\n");
+            if (fail == 0) {
+                log(@"ALL TESTS PASSED\n\n");
+            } else {
+                log([NSString stringWithFormat:@"%d TESTS FAILED\n\n", fail]);
+            }
+        }
+        ss->_checkRunning.store(false);
+    });
+    // Thread stays joinable for proper cleanup
+}
+
 - (BOOL)applicationShouldTerminateAfterLastWindowClosed:(NSApplication *)sender {
     return YES;
 }
 
 - (NSApplicationTerminateReply)applicationShouldTerminate:(NSApplication *)sender {
-    // Stop background check
+    // Invalidate all timers first
+    [self.refreshTimer invalidate];
+    self.refreshTimer = nil;
+    [self.frontierCheckTimer invalidate];
+    self.frontierCheckTimer = nil;
+
+    // Signal all background threads to stop
     _checkRunning.store(false);
+    _benchRunning.store(false);
+
+    // Stop TaskManager tasks (this signals worker threads inside TaskManager)
+    if (_taskMgr) {
+        _taskMgr->stop_all();
+    }
+
+    // Join background threads (now they're joinable, not detached)
     if (_checkThread.joinable()) {
         _checkThread.join();
     }
+    if (_benchThread.joinable()) {
+        _benchThread.join();
+    }
+
     if (self.eventMonitor) {
         [NSEvent removeMonitor:self.eventMonitor];
         self.eventMonitor = nil;
     }
+    // Stop distributed computing
+    [self.networkRefreshTimer invalidate];
+    self.networkRefreshTimer = nil;
+    if (_conductor) { _conductor->stop(); delete _conductor; _conductor = nullptr; }
+    if (_carriage) { _carriage->stop(); delete _carriage; _carriage = nullptr; }
+
     if (_taskMgr) {
-        _taskMgr->stop_all();
         delete _taskMgr;
         _taskMgr = nullptr;
     }
@@ -2287,6 +4398,1312 @@ static const int EQ_HISTORY = 32; // number of vertical bars (time history)
         _gpu = nullptr;
     }
     return NSTerminateNow;
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// Test Catalog -- loads from TestCatalog.txt
+// ═══════════════════════════════════════════════════════════════════════
+
+- (void)loadTestCatalog {
+    _testCatalog.clear();
+    _selectedTestIdx = -1;
+    NSString *path = [DATA_DIR stringByAppendingPathComponent:@"TestCatalog.txt"];
+    NSString *content = [NSString stringWithContentsOfFile:path encoding:NSUTF8StringEncoding error:nil];
+    if (!content) return;
+
+    TestCatalogEntry current;
+    bool in_entry = false;
+
+    for (NSString *rawLine in [content componentsSeparatedByString:@"\n"]) {
+        NSString *line = [rawLine stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceCharacterSet]];
+        if (line.length == 0 || [line hasPrefix:@"#"]) continue;
+
+        if ([line hasPrefix:@"["] && [line hasSuffix:@"]"]) {
+            if (in_entry && !current.test_id.empty()) _testCatalog.push_back(current);
+            current = TestCatalogEntry();
+            current.test_id = [[line substringWithRange:NSMakeRange(1, line.length - 2)] UTF8String];
+            in_entry = true;
+            continue;
+        }
+        if (!in_entry) continue;
+
+        NSRange eq = [line rangeOfString:@" = "];
+        if (eq.location == NSNotFound) continue;
+        NSString *key = [line substringToIndex:eq.location];
+        NSString *val = [line substringFromIndex:eq.location + 3];
+        std::string k = key.UTF8String, v = val.UTF8String;
+
+        if (k == "name") current.name = v;
+        else if (k == "category") current.category = v;
+        else if (k == "mode") current.mode = v;
+        else if (k == "description") current.description = v;
+        else if (k == "algorithms") current.algorithms = v;
+        else if (k == "default_params") current.default_params = v;
+    }
+    if (in_entry && !current.test_id.empty()) _testCatalog.push_back(current);
+
+    // Build display order grouped by category
+    _testDisplayOrder.clear();
+    _testCategories.clear();
+    std::map<std::string, std::vector<size_t>> byCategory;
+    std::vector<std::string> catOrder;
+    for (size_t i = 0; i < _testCatalog.size(); i++) {
+        auto& cat = _testCatalog[i].category;
+        if (byCategory.find(cat) == byCategory.end()) catOrder.push_back(cat);
+        byCategory[cat].push_back(i);
+    }
+    for (auto& cat : catOrder) {
+        _testCategories.push_back(cat);
+        _testDisplayOrder.push_back(SIZE_MAX); // category header marker
+        for (auto idx : byCategory[cat]) {
+            _testDisplayOrder.push_back(idx);
+        }
+    }
+}
+
+- (void)showTestCatalog:(id)sender {
+    if (self.testCatalogWindow) {
+        [self loadTestCatalog];
+        [self.testTableView reloadData];
+        [self.testCatalogWindow makeKeyAndOrderFront:nil];
+        return;
+    }
+
+    [self loadTestCatalog];
+
+    CGFloat W = 820, H = 600;
+    self.testCatalogWindow = [[NSWindow alloc]
+        initWithContentRect:NSMakeRect(100, 100, W, H)
+        styleMask:(NSWindowStyleMaskTitled | NSWindowStyleMaskClosable |
+                   NSWindowStyleMaskMiniaturizable | NSWindowStyleMaskResizable)
+        backing:NSBackingStoreBuffered defer:NO];
+    [self.testCatalogWindow setTitle:@"Test Catalog"];
+    [self.testCatalogWindow setMinSize:NSMakeSize(600, 400)];
+    self.testCatalogWindow.delegate = self;
+
+    NSView *cv = self.testCatalogWindow.contentView;
+    CGFloat M = 10;
+
+    // Split: left list (280px) | right detail (rest)
+    CGFloat listW = 280;
+
+    // Left: table view in scroll view
+    NSScrollView *tableScroll = [[NSScrollView alloc] initWithFrame:NSMakeRect(M, 44, listW, H - 54)];
+    tableScroll.hasVerticalScroller = YES;
+    tableScroll.borderType = NSBezelBorder;
+    tableScroll.autoresizingMask = NSViewHeightSizable | NSViewMaxXMargin;
+
+    self.testTableView = [[NSTableView alloc] initWithFrame:NSMakeRect(0, 0, listW - 4, H - 54)];
+    NSTableColumn *col = [[NSTableColumn alloc] initWithIdentifier:@"test"];
+    col.title = @"Tests";
+    col.width = listW - 8;
+    col.resizingMask = NSTableColumnAutoresizingMask;
+    [self.testTableView addTableColumn:col];
+    self.testTableView.headerView = nil;
+    self.testTableView.delegate = self;
+    self.testTableView.dataSource = self;
+    self.testTableView.rowHeight = 22;
+    self.testTableView.target = self;
+    self.testTableView.action = @selector(testTableClicked:);
+    tableScroll.documentView = self.testTableView;
+    [cv addSubview:tableScroll];
+
+    // Right: detail view
+    CGFloat detailX = M + listW + 8;
+    CGFloat detailW = W - detailX - M;
+
+    // Detail description area (upper right)
+    CGFloat paramH = 80;
+    NSScrollView *detailScroll = [[NSScrollView alloc] initWithFrame:NSMakeRect(detailX, 44 + paramH + 4, detailW, H - 54 - paramH - 4)];
+    detailScroll.hasVerticalScroller = YES;
+    detailScroll.borderType = NSBezelBorder;
+    detailScroll.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
+    self.testDetailView = [[NSTextView alloc] initWithFrame:NSMakeRect(0, 0, detailW - 4, H - 54 - paramH - 4)];
+    self.testDetailView.editable = NO;
+    self.testDetailView.font = [NSFont systemFontOfSize:11];
+    self.testDetailView.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
+    self.testDetailView.string = @"Select a test from the list to see its description, algorithms, and parameters.";
+    detailScroll.documentView = self.testDetailView;
+    [cv addSubview:detailScroll];
+
+    // Parameter input area (multi-line text view, lower right)
+    NSTextField *paramLbl = [self labelAt:NSMakeRect(detailX, 44 + paramH - 14, 80, 14) text:@"Parameters:" bold:NO size:10];
+    paramLbl.autoresizingMask = NSViewMaxYMargin | NSViewWidthSizable;
+    [cv addSubview:paramLbl];
+
+    self.testParamScroll = [[NSScrollView alloc] initWithFrame:NSMakeRect(detailX, 44, detailW - 80, paramH - 16)];
+    self.testParamScroll.hasVerticalScroller = YES;
+    self.testParamScroll.borderType = NSBezelBorder;
+    self.testParamScroll.autoresizingMask = NSViewMaxYMargin | NSViewWidthSizable;
+    self.testParamField = [[NSTextView alloc] initWithFrame:NSMakeRect(0, 0, detailW - 84, paramH - 16)];
+    self.testParamField.editable = YES;
+    self.testParamField.selectable = YES;
+    self.testParamField.richText = NO;
+    self.testParamField.font = [NSFont monospacedSystemFontOfSize:11 weight:NSFontWeightRegular];
+    self.testParamField.autoresizingMask = NSViewWidthSizable;
+    self.testParamField.string = @"";
+    self.testParamScroll.documentView = self.testParamField;
+    [cv addSubview:self.testParamScroll];
+
+    self.testRunButton = [self buttonAt:NSMakeRect(W - M - 70, 44 + paramH/2 - 14, 70, 28)
+        title:@"Run" action:@selector(runCatalogTest:)];
+    self.testRunButton.font = [NSFont boldSystemFontOfSize:11];
+    self.testRunButton.autoresizingMask = NSViewMaxYMargin | NSViewMinXMargin;
+    [cv addSubview:self.testRunButton];
+
+    // Reload button
+    NSButton *reloadBtn = [self buttonAt:NSMakeRect(M, 14, 90, 22)
+        title:@"Reload File" action:@selector(reloadTestCatalog:)];
+    reloadBtn.font = [NSFont systemFontOfSize:9];
+    reloadBtn.autoresizingMask = NSViewMaxYMargin;
+    [cv addSubview:reloadBtn];
+
+    NSTextField *fileLbl = [self labelAt:NSMakeRect(M + 96, 16, 400, 13)
+        text:[NSString stringWithFormat:@"Catalog: %@/TestCatalog.txt", DATA_DIR] bold:NO size:8.5];
+    fileLbl.textColor = [NSColor secondaryLabelColor];
+    fileLbl.autoresizingMask = NSViewMaxYMargin | NSViewWidthSizable;
+    [cv addSubview:fileLbl];
+
+    [self.testCatalogWindow makeKeyAndOrderFront:nil];
+}
+
+- (void)reloadTestCatalog:(id)sender {
+    [self loadTestCatalog];
+    [self.testTableView reloadData];
+    self.testDetailView.string = @"Catalog reloaded. Select a test.";
+    [self appendText:@"Test catalog reloaded from file.\n"];
+}
+
+// ── NSTableView DataSource / Delegate ────────────────────────────────
+
+- (NSInteger)numberOfRowsInTableView:(NSTableView *)tableView {
+    return (NSInteger)_testDisplayOrder.size();
+}
+
+- (NSView *)tableView:(NSTableView *)tableView viewForTableColumn:(NSTableColumn *)tableColumn row:(NSInteger)row {
+    if (row < 0 || row >= (NSInteger)_testDisplayOrder.size()) return nil;
+    size_t idx = _testDisplayOrder[row];
+
+    NSTextField *cell = [tableView makeViewWithIdentifier:@"TestCell" owner:self];
+    if (!cell) {
+        cell = [[NSTextField alloc] initWithFrame:NSMakeRect(0, 0, 270, 20)];
+        cell.identifier = @"TestCell";
+        cell.editable = NO;
+        cell.bordered = NO;
+        cell.drawsBackground = NO;
+    }
+
+    if (idx == SIZE_MAX) {
+        // Category header -- find which one
+        size_t catIdx = 0;
+        for (size_t i = 0; i <= (size_t)row; i++) {
+            if (_testDisplayOrder[i] == SIZE_MAX) catIdx++;
+        }
+        catIdx--;
+        NSString *catName = (catIdx < _testCategories.size())
+            ? [NSString stringWithUTF8String:_testCategories[catIdx].c_str()]
+            : @"Unknown";
+        cell.stringValue = [catName uppercaseString];
+        cell.font = [NSFont boldSystemFontOfSize:9.5];
+        cell.textColor = [NSColor secondaryLabelColor];
+    } else {
+        auto& entry = _testCatalog[idx];
+        NSString *mode = (entry.mode == "search") ? @"  [search]" : @"";
+        cell.stringValue = [NSString stringWithFormat:@"  %s%@",
+            entry.name.c_str(), mode];
+        cell.font = [NSFont systemFontOfSize:11];
+        cell.textColor = [NSColor labelColor];
+    }
+    return cell;
+}
+
+- (BOOL)tableView:(NSTableView *)tableView shouldSelectRow:(NSInteger)row {
+    if (row < 0 || row >= (NSInteger)_testDisplayOrder.size()) return NO;
+    return _testDisplayOrder[row] != SIZE_MAX; // can't select category headers
+}
+
+- (void)testTableClicked:(id)sender {
+    NSInteger row = self.testTableView.selectedRow;
+    if (row < 0 || row >= (NSInteger)_testDisplayOrder.size()) return;
+    size_t idx = _testDisplayOrder[row];
+    if (idx == SIZE_MAX) return;
+
+    _selectedTestIdx = (int)idx;
+    auto& entry = _testCatalog[idx];
+
+    NSMutableString *detail = [NSMutableString string];
+    [detail appendFormat:@"%s\n", entry.name.c_str()];
+    [detail appendString:@"────────────────────────────────────────\n\n"];
+    [detail appendFormat:@"Category: %s\n", entry.category.c_str()];
+    [detail appendFormat:@"Mode: %s\n\n", entry.mode == "search" ? "Long-running search (Start/Pause/Stop)" : "One-shot analysis tool"];
+    [detail appendFormat:@"DESCRIPTION\n%s\n\n", entry.description.c_str()];
+    [detail appendFormat:@"ALGORITHMS USED\n"];
+    // Split by | and show as bullet list
+    NSString *algos = [NSString stringWithUTF8String:entry.algorithms.c_str()];
+    for (NSString *algo in [algos componentsSeparatedByString:@"|"]) {
+        NSString *trimmed = [algo stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceCharacterSet]];
+        if (trimmed.length > 0)
+            [detail appendFormat:@"  • %@\n", trimmed];
+    }
+    [detail appendString:@"\n"];
+
+    // Mode-specific parameter hints
+    if (entry.mode == "search") {
+        [detail appendString:@"USAGE\nSelect this task in the main window dropdown and click Start.\n"
+            @"The search runs continuously until stopped. Use Set Start to\n"
+            @"choose the starting position.\n"];
+    } else {
+        [detail appendString:@"PARAMETERS\nEnter values in the parameter field below and click Run.\n"];
+        // Specific hints per test
+        if (entry.test_id == "rsa_key_audit" || entry.test_id == "factorization_workbench")
+            [detail appendString:@"Enter one or more numbers separated by spaces.\n"];
+        else if (entry.test_id == "batch_gcd_audit")
+            [detail appendString:@"Enter moduli separated by spaces.\n"];
+        else if (entry.test_id == "discrete_log")
+            [detail appendString:@"Enter: g h p  (finds x where g^x == h mod p)\n"];
+        else if (entry.test_id == "primitive_root_finder")
+            [detail appendString:@"Enter a prime p.\n"];
+        else if (entry.test_id == "dh_parameter_test")
+            [detail appendString:@"Enter: g p  (generator and prime)\n"];
+        else if (entry.test_id == "euler_totient_calc")
+            [detail appendString:@"Enter one or more numbers.\n"];
+        else if (entry.test_id == "multiplicative_order_calc")
+            [detail appendString:@"Enter: a m  (finds ord_m(a))\n"];
+        else if (entry.test_id == "crt_solver")
+            [detail appendString:@"Enter pairs: r1 m1 r2 m2 ...  (x == r_i mod m_i)\n"];
+        else if (entry.test_id == "quadratic_residue_test")
+            [detail appendString:@"Enter: a p  (test if a is QR mod p)\n"];
+        else if (entry.test_id == "sum_two_squares")
+            [detail appendString:@"Enter a number n to decompose as a^2 + b^2.\n"];
+        else if (entry.test_id == "perfect_power_test")
+            [detail appendString:@"Enter a number n to test if n = a^k.\n"];
+        else if (entry.test_id == "jacobi_symbol_calc")
+            [detail appendString:@"Enter: a n  (computes Jacobi symbol (a/n))\n"];
+        else if (entry.test_id == "smooth_number_finder")
+            [detail appendString:@"Enter: lo hi B  (find B-smooth numbers in [lo,hi])\n"];
+        else if (entry.test_id == "lcg_period_analysis")
+            [detail appendString:@"Enter: a c m [seed]  (LCG: x' = a*x+c mod m)\n"];
+        else if (entry.test_id == "pollard_p1_factor")
+            [detail appendString:@"Enter: n [B]  (factor n, smoothness bound B default 100000)\n"];
+        else if (entry.test_id == "convergence_analyzer")
+            [detail appendString:@"Enter one or more numbers.\n"];
+        else if (entry.test_id == "modular_arithmetic")
+            [detail appendString:@"Enter: op a b m  (op = modpow|mulmod|modinv|gcd|lcm)\n"];
+    }
+
+    self.testDetailView.string = detail;
+
+    // Pre-fill parameter field with default example values
+    if (!entry.default_params.empty()) {
+        self.testParamField.string = [NSString stringWithUTF8String:entry.default_params.c_str()];
+    } else {
+        self.testParamField.string = @"";
+    }
+}
+
+// ── Run selected test ────────────────────────────────────────────────
+
+- (void)runCatalogTest:(id)sender {
+    if (_selectedTestIdx < 0 || _selectedTestIdx >= (int)_testCatalog.size()) return;
+    auto& entry = _testCatalog[_selectedTestIdx];
+
+    // Always stop and join any previous test thread first
+    _checkRunning.store(false);
+    if (_checkThread.joinable()) _checkThread.join();
+
+    // For search-mode tests, start the corresponding TaskManager task
+    if (entry.mode == "search") {
+        std::map<std::string, prime::TaskType> searchMap = {
+            {"wieferich_search", prime::TaskType::Wieferich},
+            {"wallsunsun_search", prime::TaskType::WallSunSun},
+            {"wilson_search", prime::TaskType::Wilson},
+            {"twin_prime_search", prime::TaskType::TwinPrime},
+            {"sophie_germain_search", prime::TaskType::SophieGermain},
+            {"cousin_prime_search", prime::TaskType::CousinPrime},
+            {"sexy_prime_search", prime::TaskType::SexyPrime},
+            {"general_prime_search", prime::TaskType::GeneralPrime},
+            {"emirp_search", prime::TaskType::Emirp},
+            {"mersenne_trial", prime::TaskType::MersenneTrial},
+            {"fermat_factor", prime::TaskType::FermatFactor},
+        };
+        auto it = searchMap.find(entry.test_id);
+        if (it != searchMap.end()) {
+            _taskMgr->start_task(it->second);
+            [self appendText:[NSString stringWithFormat:@"Started search: %s\n", entry.name.c_str()]];
+        }
+        return;
+    }
+
+    // For tool-mode tests, parse params and run
+    NSString *params = [self.testParamField.string
+        stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+
+    // Parse values separated by spaces, newlines, commas, semicolons, or pipes
+    NSMutableCharacterSet *delimiters = [NSMutableCharacterSet whitespaceAndNewlineCharacterSet];
+    [delimiters addCharactersInString:@",;|"];
+    NSArray *parts = [params componentsSeparatedByCharactersInSet:delimiters];
+    std::vector<uint64_t> vals;
+    std::vector<std::string> tokens;
+    for (NSString *p in parts) {
+        NSString *cleaned = [p stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceCharacterSet]];
+        if (cleaned.length > 0) {
+            tokens.push_back(cleaned.UTF8String);
+            uint64_t v = strtoull(cleaned.UTF8String, nullptr, 10);
+            vals.push_back(v);
+        }
+    }
+
+    std::string tid = entry.test_id;
+    __weak AppDelegate *weakSelf = self;
+
+    // Special cases that use existing methods
+    if (tid == "benchmark_suite") {
+        [self runBenchmark:sender];
+        return;
+    }
+    if (tid == "engine_test_suite") {
+        [self runInAppTests:sender];
+        return;
+    }
+
+    _checkRunning.store(true);
+
+    _checkThread = std::thread([weakSelf, tid, vals, tokens]() {
+        @autoreleasepool {
+        AppDelegate *ss = weakSelf;
+        if (!ss) return;
+
+        auto log = [weakSelf](NSString *msg) {
+            dispatch_async(dispatch_get_main_queue(), ^{
+                @autoreleasepool {
+                [weakSelf appendText:msg];
+                }
+            });
+        };
+
+        if (tid == "rsa_key_audit" || tid == "factorization_workbench") {
+            if (vals.empty()) { log(@"Enter numbers to factor.\n"); ss->_checkRunning.store(false); return; }
+            for (auto n : vals) {
+                auto factors = prime::factor_u64(n);
+                NSMutableString *s = [NSMutableString stringWithFormat:@"%llu = ", n];
+                if (factors.empty()) [s appendString:@"(no factors)"];
+                for (size_t i = 0; i < factors.size(); i++) {
+                    if (i > 0) [s appendString:@" x "];
+                    [s appendFormat:@"%llu", factors[i]];
+                    if (prime::is_prime(factors[i])) [s appendString:@"(prime)"];
+                }
+                [s appendString:@"\n"];
+                log(s);
+                // Additional info for RSA audit
+                if (tid == "rsa_key_audit") {
+                    if (factors.size() == 1 && factors[0] == n) {
+                        log([NSString stringWithFormat:@"  -> %llu is prime. Strong key.\n", n]);
+                    } else if (factors.size() == 2) {
+                        uint64_t bits_p = 0, bits_q = 0, p = factors[0], q = factors[1];
+                        while ((1ULL << bits_p) <= p) bits_p++;
+                        while ((1ULL << bits_q) <= q) bits_q++;
+                        log([NSString stringWithFormat:@"  -> Semiprime: %llu-bit x %llu-bit. %s\n",
+                            bits_p, bits_q, (bits_p < 20 || bits_q < 20) ? "WEAK -- small factor!" : "Factor sizes OK."]);
+                    } else {
+                        log([NSString stringWithFormat:@"  -> %zu factors. Not a standard RSA modulus.\n", factors.size()]);
+                    }
+                }
+            }
+        }
+        else if (tid == "batch_gcd_audit") {
+            if (vals.size() < 2) { log(@"Enter at least 2 moduli.\n"); ss->_checkRunning.store(false); return; }
+            log([NSString stringWithFormat:@"Batch GCD audit on %zu moduli...\n", vals.size()]);
+            auto weak = prime::batch_gcd_audit(vals);
+            if (weak.empty()) {
+                log(@"No shared factors found. All moduli appear independent.\n");
+            } else {
+                log([NSString stringWithFormat:@"WEAK KEYS FOUND: %zu shared factors!\n", weak.size() / 2]);
+                for (auto& w : weak) {
+                    log([NSString stringWithFormat:@"  %llu shares factor %llu with %llu\n",
+                        w.modulus, w.shared_factor, w.other_modulus]);
+                }
+            }
+        }
+        else if (tid == "discrete_log") {
+            if (vals.size() < 3) { log(@"Enter: g h p\n"); ss->_checkRunning.store(false); return; }
+            log([NSString stringWithFormat:@"Solving %llu^x == %llu (mod %llu)...\n", vals[0], vals[1], vals[2]]);
+            auto t0 = std::chrono::steady_clock::now();
+            int64_t x = prime::baby_step_giant_step(vals[0], vals[1], vals[2]);
+            double dt = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+            if (x >= 0) {
+                log([NSString stringWithFormat:@"Solution: x = %lld  (%.4f s)\n", x, dt]);
+                uint64_t verify = prime::modpow(vals[0], (uint64_t)x, vals[2]);
+                log([NSString stringWithFormat:@"Verify: %llu^%lld mod %llu = %llu %s\n",
+                    vals[0], x, vals[2], verify, verify == vals[1] ? "OK" : "FAIL"]);
+            } else {
+                log([NSString stringWithFormat:@"No solution found (%.4f s). p may not be prime.\n", dt]);
+            }
+        }
+        else if (tid == "primitive_root_finder") {
+            if (vals.empty()) { log(@"Enter a prime p.\n"); ss->_checkRunning.store(false); return; }
+            for (auto p : vals) {
+                if (!prime::is_prime(p)) {
+                    log([NSString stringWithFormat:@"%llu is not prime.\n", p]);
+                    continue;
+                }
+                uint64_t g = prime::primitive_root(p);
+                uint64_t ord = prime::multiplicative_order(g, p);
+                log([NSString stringWithFormat:@"Primitive root of %llu: g = %llu  (order = %llu = p-1 [OK])\n", p, g, ord]);
+            }
+        }
+        else if (tid == "dh_parameter_test") {
+            if (vals.size() < 2) { log(@"Enter: g p\n"); ss->_checkRunning.store(false); return; }
+            uint64_t g = vals[0], p = vals[1];
+            log([NSString stringWithFormat:@"Diffie-Hellman parameter analysis: g=%llu, p=%llu\n", g, p]);
+            log([NSString stringWithFormat:@"  p is prime: %s\n", prime::is_prime(p) ? "YES" : "NO -- INSECURE"]);
+            if (prime::is_prime(p)) {
+                bool safe = prime::is_prime((p - 1) / 2);
+                log([NSString stringWithFormat:@"  Safe prime ((p-1)/2 prime): %s\n", safe ? "YES" : "NO"]);
+                uint64_t ord = prime::multiplicative_order(g, p);
+                log([NSString stringWithFormat:@"  ord_p(g) = %llu", ord]);
+                if (ord == p - 1) log(@"  (generator -- GOOD)\n");
+                else log([NSString stringWithFormat:@"  (subgroup of size %llu -- may be weak)\n", ord]);
+                auto pf = prime::factor_u64(p - 1);
+                NSMutableString *fs = [NSMutableString stringWithString:@"  p-1 factors: "];
+                for (size_t i = 0; i < pf.size(); i++) {
+                    if (i > 0) [fs appendString:@" x "];
+                    [fs appendFormat:@"%llu", pf[i]];
+                }
+                [fs appendString:@"\n"];
+                log(fs);
+                uint64_t largest = pf.empty() ? 0 : pf.back();
+                log([NSString stringWithFormat:@"  Largest factor of p-1: %llu (%s)\n",
+                    largest, largest > 1000000 ? "large -- resists Pohlig-Hellman" : "SMALL -- vulnerable to Pohlig-Hellman"]);
+            }
+        }
+        else if (tid == "euler_totient_calc") {
+            if (vals.empty()) { log(@"Enter numbers.\n"); ss->_checkRunning.store(false); return; }
+            for (auto n : vals) {
+                uint64_t phi = prime::euler_totient(n);
+                log([NSString stringWithFormat:@"phi(%llu) = %llu", n, phi]);
+                auto factors = prime::factor_u64(n);
+                NSMutableString *fs = [NSMutableString stringWithString:@"  ["];
+                for (size_t i = 0; i < factors.size(); i++) {
+                    if (i > 0) [fs appendString:@"x"];
+                    [fs appendFormat:@"%llu", factors[i]];
+                }
+                [fs appendString:@"]\n"];
+                log(fs);
+            }
+        }
+        else if (tid == "multiplicative_order_calc") {
+            if (vals.size() < 2) { log(@"Enter: a m\n"); ss->_checkRunning.store(false); return; }
+            uint64_t a = vals[0], m = vals[1];
+            uint64_t g = prime::gcd(a, m);
+            if (g != 1) {
+                log([NSString stringWithFormat:@"gcd(%llu, %llu) = %llu ≠ 1. Order undefined.\n", a, m, g]);
+            } else {
+                uint64_t ord = prime::multiplicative_order(a, m);
+                log([NSString stringWithFormat:@"ord_%llu(%llu) = %llu\n", m, a, ord]);
+                log([NSString stringWithFormat:@"Verify: %llu^%llu mod %llu = %llu\n",
+                    a, ord, m, prime::modpow(a, ord, m)]);
+            }
+        }
+        else if (tid == "crt_solver") {
+            if (vals.size() < 4 || vals.size() % 2 != 0) {
+                log(@"Enter pairs: r1 m1 r2 m2 ...\n"); ss->_checkRunning.store(false); return;
+            }
+            std::vector<uint64_t> rems, mods;
+            for (size_t i = 0; i < vals.size(); i += 2) {
+                rems.push_back(vals[i]);
+                mods.push_back(vals[i + 1]);
+                log([NSString stringWithFormat:@"  x == %llu (mod %llu)\n", vals[i], vals[i + 1]]);
+            }
+            auto [sol, mod] = prime::chinese_remainder(rems, mods);
+            if (mod == 0) {
+                log(@"No solution (moduli not coprime or inconsistent).\n");
+            } else {
+                log([NSString stringWithFormat:@"Solution: x == %llu (mod %llu)\n", sol, mod]);
+                // Verify
+                bool ok = true;
+                for (size_t i = 0; i < rems.size(); i++) {
+                    if (sol % mods[i] != rems[i]) ok = false;
+                }
+                log([NSString stringWithFormat:@"Verify: %s\n", ok ? "All congruences satisfied [OK]" : "ERROR [X]"]);
+            }
+        }
+        else if (tid == "quadratic_residue_test") {
+            if (vals.size() < 2) { log(@"Enter: a p\n"); ss->_checkRunning.store(false); return; }
+            uint64_t a = vals[0], p = vals[1];
+            if (p < 2) { log(@"p must be >= 2.\n"); ss->_checkRunning.store(false); return; }
+            if (!prime::is_prime(p)) {
+                log([NSString stringWithFormat:@"Warning: %llu is not prime. Results use Jacobi symbol.\n", p]);
+            }
+            bool qr = prime::is_quadratic_residue(a, p);
+            int leg = prime::legendre_symbol(a, p);
+            log([NSString stringWithFormat:@"(%llu/%llu) = %d  --  %llu is %sa quadratic residue mod %llu\n",
+                a, p, leg, a, qr ? "" : "NOT ", p]);
+            if (qr) {
+                uint64_t root = prime::sqrt_mod(a, p);
+                log([NSString stringWithFormat:@"sqrt%llu mod %llu = %llu\n", a, p, root]);
+                log([NSString stringWithFormat:@"Verify: %llu^2 mod %llu = %llu %s\n",
+                    root, p, prime::mulmod(root, root, p),
+                    prime::mulmod(root, root, p) == a % p ? "OK" : "FAIL"]);
+            }
+        }
+        else if (tid == "sum_two_squares") {
+            if (vals.empty()) { log(@"Enter a number.\n"); ss->_checkRunning.store(false); return; }
+            for (auto n : vals) {
+                auto [a, b] = prime::sum_two_squares(n);
+                if (a == 0 && b == 0 && n != 0) {
+                    log([NSString stringWithFormat:@"%llu cannot be written as a^2 + b^2\n", n]);
+                } else {
+                    log([NSString stringWithFormat:@"%llu = %llu^2 + %llu^2 = %llu + %llu\n", n, a, b, a*a, b*b]);
+                }
+            }
+        }
+        else if (tid == "perfect_power_test") {
+            if (vals.empty()) { log(@"Enter numbers.\n"); ss->_checkRunning.store(false); return; }
+            for (auto n : vals) {
+                auto [base, exp] = prime::perfect_power(n);
+                if (exp > 1) {
+                    log([NSString stringWithFormat:@"%llu = %llu^%llu  (perfect power)\n", n, base, exp]);
+                } else {
+                    log([NSString stringWithFormat:@"%llu is not a perfect power\n", n]);
+                }
+            }
+        }
+        else if (tid == "jacobi_symbol_calc") {
+            if (vals.size() < 2) { log(@"Enter: a n\n"); ss->_checkRunning.store(false); return; }
+            int j = prime::jacobi_symbol((int64_t)vals[0], (int64_t)vals[1]);
+            log([NSString stringWithFormat:@"Jacobi symbol (%llu/%llu) = %d\n", vals[0], vals[1], j]);
+            if (prime::is_prime(vals[1])) {
+                log([NSString stringWithFormat:@"(n=%llu is prime, so this equals the Legendre symbol)\n", vals[1]]);
+            }
+        }
+        else if (tid == "smooth_number_finder") {
+            if (vals.size() < 3) { log(@"Enter: lo hi B\n"); ss->_checkRunning.store(false); return; }
+            uint64_t lo = vals[0], hi = vals[1], B = vals[2];
+            if (hi - lo > 1000000) { log(@"Range too large (max 1M). Reduce range.\n"); ss->_checkRunning.store(false); return; }
+            log([NSString stringWithFormat:@"Finding %llu-smooth numbers in [%llu, %llu]...\n", B, lo, hi]);
+            auto smooth = prime::enumerate_smooth(lo, hi, B);
+            log([NSString stringWithFormat:@"Found %zu smooth numbers (%.1f%% of range)\n",
+                smooth.size(), 100.0 * smooth.size() / (hi - lo + 1)]);
+            size_t show = std::min(smooth.size(), (size_t)50);
+            for (size_t i = 0; i < show; i++) {
+                auto factors = prime::factor_u64(smooth[i]);
+                NSMutableString *s = [NSMutableString stringWithFormat:@"  %llu = ", smooth[i]];
+                for (size_t j = 0; j < factors.size(); j++) {
+                    if (j > 0) [s appendString:@"x"];
+                    [s appendFormat:@"%llu", factors[j]];
+                }
+                [s appendString:@"\n"];
+                log(s);
+            }
+            if (smooth.size() > show) log([NSString stringWithFormat:@"  ... and %zu more\n", smooth.size() - show]);
+        }
+        else if (tid == "lcg_period_analysis") {
+            if (vals.size() < 3) { log(@"Enter: a c m [seed]\n"); ss->_checkRunning.store(false); return; }
+            uint64_t a = vals[0], c = vals[1], m = vals[2];
+            uint64_t seed = vals.size() > 3 ? vals[3] : 0;
+            log([NSString stringWithFormat:@"LCG analysis: x' = %llu*x + %llu mod %llu (seed=%llu)\n", a, c, m, seed]);
+            auto result = prime::analyze_lcg(a, c, m, seed);
+            log([NSString stringWithFormat:@"  Period: %llu\n", result.period]);
+            log([NSString stringWithFormat:@"  Tail length: %llu\n", result.tail_length]);
+            log([NSString stringWithFormat:@"  Full period (period=m): %s\n", result.full_period ? "YES -- ideal" : "NO"]);
+            NSMutableString *fs = [NSMutableString stringWithString:@"  m factors: "];
+            for (size_t i = 0; i < result.factors_of_m.size(); i++) {
+                if (i > 0) [fs appendString:@"x"];
+                [fs appendFormat:@"%llu", result.factors_of_m[i]];
+            }
+            [fs appendString:@"\n"];
+            log(fs);
+            // Check Hull-Dobell conditions
+            if (c != 0) {
+                bool cond1 = prime::gcd(c, m) == 1;
+                log([NSString stringWithFormat:@"  Hull-Dobell: gcd(c,m)=1: %s\n", cond1 ? "YES" : "NO"]);
+            }
+        }
+        else if (tid == "pollard_p1_factor") {
+            if (vals.empty()) { log(@"Enter: n [B]\n"); ss->_checkRunning.store(false); return; }
+            uint64_t n = vals[0];
+            uint64_t B = vals.size() > 1 ? vals[1] : 100000;
+            log([NSString stringWithFormat:@"Pollard p-1 factoring: n=%llu, B=%llu\n", n, B]);
+            auto t0 = std::chrono::steady_clock::now();
+            uint64_t f = prime::pollard_p_minus_1(n, B);
+            double dt = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+            if (f > 0) {
+                log([NSString stringWithFormat:@"  Factor found: %llu x %llu  (%.4f s)\n", f, n / f, dt]);
+                log([NSString stringWithFormat:@"  p-1 = %llu, factors: %s\n", f - 1,
+                    [NSString stringWithUTF8String:prime::factors_string(f - 1).c_str()]]);
+            } else {
+                log([NSString stringWithFormat:@"  No factor found with B=%llu (%.4f s). Try larger B.\n", B, dt]);
+            }
+        }
+        else if (tid == "convergence_analyzer") {
+            if (vals.empty()) { log(@"Enter numbers.\n"); ss->_checkRunning.store(false); return; }
+            for (auto n : vals) {
+                double c = prime::convergence(n);
+                bool ip = prime::is_prime(n);
+                log([NSString stringWithFormat:@"%llu: convergence=%.4f  prime=%s\n",
+                    n, c, ip ? "YES" : "NO"]);
+            }
+        }
+        else if (tid == "modular_arithmetic") {
+            // Check if first token is an operation name
+            std::string op = "";
+            std::vector<uint64_t> nums;
+            if (!tokens.empty()) {
+                char c0 = tokens[0][0];
+                if (c0 < '0' || c0 > '9') {
+                    op = tokens[0];
+                    for (size_t i = 1; i < tokens.size(); i++)
+                        nums.push_back(strtoull(tokens[i].c_str(), nullptr, 10));
+                } else {
+                    nums = vals;
+                }
+            }
+            if (nums.size() < 2) {
+                log(@"Enter: op a b [m]  -- op = modpow|mulmod|modinv|gcd|lcm\n"
+                    @"Or just 2 numbers for gcd/lcm, or 3 for modpow.\n");
+                ss->_checkRunning.store(false); return;
+            }
+            if (op == "gcd" || (op.empty() && nums.size() == 2)) {
+                log([NSString stringWithFormat:@"gcd(%llu, %llu) = %llu\n", nums[0], nums[1], prime::gcd(nums[0], nums[1])]);
+                log([NSString stringWithFormat:@"lcm(%llu, %llu) = %llu\n", nums[0], nums[1], prime::lcm(nums[0], nums[1])]);
+            } else if (op == "lcm") {
+                log([NSString stringWithFormat:@"lcm(%llu, %llu) = %llu\n", nums[0], nums[1], prime::lcm(nums[0], nums[1])]);
+            } else if (op == "modinv" && nums.size() >= 2) {
+                uint64_t inv = prime::mod_inverse(nums[0], nums[1]);
+                if (inv > 0)
+                    log([NSString stringWithFormat:@"modinv(%llu, %llu) = %llu\n", nums[0], nums[1], inv]);
+                else
+                    log([NSString stringWithFormat:@"modinv(%llu, %llu) = none (not coprime)\n", nums[0], nums[1]]);
+            } else if (op == "mulmod" && nums.size() >= 3) {
+                log([NSString stringWithFormat:@"mulmod(%llu, %llu, %llu) = %llu\n",
+                    nums[0], nums[1], nums[2], prime::mulmod(nums[0], nums[1], nums[2])]);
+            } else if (nums.size() >= 3) {
+                // Default: modpow
+                log([NSString stringWithFormat:@"modpow(%llu, %llu, %llu) = %llu\n",
+                    nums[0], nums[1], nums[2], prime::modpow(nums[0], nums[1], nums[2])]);
+                log([NSString stringWithFormat:@"mulmod(%llu, %llu, %llu) = %llu\n",
+                    nums[0], nums[1], nums[2], prime::mulmod(nums[0], nums[1], nums[2])]);
+                uint64_t inv = prime::mod_inverse(nums[0], nums[2]);
+                if (inv > 0)
+                    log([NSString stringWithFormat:@"modinv(%llu, %llu) = %llu\n", nums[0], nums[2], inv]);
+                else
+                    log([NSString stringWithFormat:@"modinv(%llu, %llu) = none (not coprime)\n", nums[0], nums[2]]);
+            }
+        }
+        else if (tid == "rsa_key_gen") {
+            uint64_t bits = vals.empty() ? 32 : vals[0];
+            if (bits < 8) bits = 8;
+            if (bits > 62) bits = 62;
+            uint64_t half = bits / 2;
+            if (half < 4) half = 4;
+            uint64_t lo = 1ULL << (half - 1);
+            uint64_t hi = (1ULL << half) - 1;
+            log([NSString stringWithFormat:@"Generating RSA keypair (~%llu-bit modulus)...\n", bits]);
+
+            // Find random prime p
+            srand48(time(nullptr));
+            uint64_t p = 0, q = 0;
+            for (int attempt = 0; attempt < 100000; attempt++) {
+                uint64_t candidate = lo + (uint64_t)(drand48() * (hi - lo));
+                candidate |= 1; // odd
+                if (prime::is_prime(candidate)) { p = candidate; break; }
+            }
+            // Find random prime q != p
+            for (int attempt = 0; attempt < 100000; attempt++) {
+                uint64_t candidate = lo + (uint64_t)(drand48() * (hi - lo));
+                candidate |= 1;
+                if (candidate != p && prime::is_prime(candidate)) { q = candidate; break; }
+            }
+            if (p == 0 || q == 0) {
+                log(@"Failed to find primes. Try different bit size.\n");
+                ss->_checkRunning.store(false); return;
+            }
+            if (p < q) std::swap(p, q);
+            uint64_t n = p * q;
+            uint64_t phi = (p - 1) * (q - 1);
+            uint64_t e = 65537;
+            if (prime::gcd(e, phi) != 1) {
+                // Find alternative e
+                for (e = 3; e < phi; e += 2) {
+                    if (prime::gcd(e, phi) == 1) break;
+                }
+            }
+            uint64_t d = prime::mod_inverse(e, phi);
+
+            log([NSString stringWithFormat:@"\n  RSA Key Parameters (%llu-bit modulus)\n", bits]);
+            log(@"  ─────────────────────────────────────\n");
+            log([NSString stringWithFormat:@"  p  = %llu  (prime)\n", p]);
+            log([NSString stringWithFormat:@"  q  = %llu  (prime)\n", q]);
+            log([NSString stringWithFormat:@"  n  = pxq = %llu\n", n]);
+            log([NSString stringWithFormat:@"  phi(n) = (p-1)(q-1) = %llu\n", phi]);
+            log([NSString stringWithFormat:@"  e  = %llu  (public exponent)\n", e]);
+            log([NSString stringWithFormat:@"  d  = %llu  (private exponent)\n", d]);
+
+            // Verify: m^e^d mod n = m
+            uint64_t test_msg = 42;
+            if (test_msg >= n) test_msg = n / 2;
+            uint64_t cipher = prime::modpow(test_msg, e, n);
+            uint64_t plain = prime::modpow(cipher, d, n);
+            log([NSString stringWithFormat:@"\n  Verification: encrypt(%llu) = %llu, decrypt = %llu %s\n",
+                test_msg, cipher, plain, plain == test_msg ? "OK" : "FAIL"]);
+
+            // Bit counts
+            uint64_t nbits = 0;
+            for (uint64_t tmp = n; tmp; tmp >>= 1) nbits++;
+            log([NSString stringWithFormat:@"  Actual modulus size: %llu bits\n", nbits]);
+        }
+        else if (tid == "ring_beacon_test") {
+            uint64_t lo = vals.size() >= 2 ? vals[0] : 10000;
+            uint64_t hi = vals.size() >= 2 ? vals[1] : lo + 10000;
+            if (hi - lo > 100000) { log(@"Range too large (max 100K).\n"); ss->_checkRunning.store(false); return; }
+            log([NSString stringWithFormat:@"Ring Beacon Test [%llu, %llu] (mod-210 wheel)...\n", lo, hi]);
+            auto r = prime::ring_beacon_test(lo, hi);
+            log([NSString stringWithFormat:@"  Primes in range: %d\n", r.total_primes]);
+            log([NSString stringWithFormat:@"  Predicted prime positions: %d\n", r.predicted_primes]);
+            log([NSString stringWithFormat:@"  Correct predictions: %d\n", r.correct_predictions]);
+            log([NSString stringWithFormat:@"  Precision: %.1f%%\n", r.precision * 100]);
+            log([NSString stringWithFormat:@"  Recall: %.1f%%\n", r.recall * 100]);
+            log(@"  Spoke beacon counts (lowest = most prime-like):\n");
+            int show = std::min((int)r.spoke_beacon_counts.size(), 15);
+            for (int i = 0; i < show; i++) {
+                log([NSString stringWithFormat:@"    spoke %3d: %d beacons\n",
+                    r.spoke_beacon_counts[i].first, r.spoke_beacon_counts[i].second]);
+            }
+        }
+        else if (tid == "topography_test") {
+            uint64_t lo = vals.size() >= 2 ? vals[0] : 1000;
+            uint64_t hi = vals.size() >= 2 ? vals[1] : lo + 4000;
+            if (hi - lo > 100000) { log(@"Range too large (max 100K).\n"); ss->_checkRunning.store(false); return; }
+            log([NSString stringWithFormat:@"Topography Test [%llu, %llu]...\n", lo, hi]);
+            auto r = prime::topography_test(lo, hi);
+            log([NSString stringWithFormat:@"  Primes: %d\n", r.num_primes]);
+            log([NSString stringWithFormat:@"  Avg prime gap: %.2f\n", r.avg_gap]);
+            log([NSString stringWithFormat:@"  Avg valley depth (factor count): %.2f\n", r.avg_valley_depth]);
+            log([NSString stringWithFormat:@"  Depth-gap correlation: %.4f\n", r.depth_gap_correlation]);
+            log(@"    (positive = deeper valleys predict bigger gaps)\n");
+            if (!r.deepest_valleys.empty()) {
+                log(@"  Deepest valleys (highly composite numbers):\n");
+                int show = std::min((int)r.deepest_valleys.size(), 10);
+                for (int i = 0; i < show; i++) {
+                    log([NSString stringWithFormat:@"    %llu: %d factors\n",
+                        r.deepest_valleys[i].first, r.deepest_valleys[i].second]);
+                }
+            }
+        }
+        else if (tid == "web_test") {
+            uint64_t lo = vals.size() >= 2 ? vals[0] : 1000;
+            uint64_t hi = vals.size() >= 2 ? vals[1] : lo + 4000;
+            if (hi - lo > 50000) { log(@"Range too large (max 50K).\n"); ss->_checkRunning.store(false); return; }
+            log([NSString stringWithFormat:@"Factor Web Test [%llu, %llu]...\n", lo, hi]);
+            auto r = prime::web_test(lo, hi);
+            log([NSString stringWithFormat:@"  Primes: %d, Composites: %d\n", r.num_primes, r.num_composites]);
+            log(@"  Seed type distribution:\n");
+            for (auto& [type, count] : r.seed_counts) {
+                log([NSString stringWithFormat:@"    %-16s: %d\n", prime::seed_type_name(type), count]);
+            }
+            log([NSString stringWithFormat:@"  Shared TinyPrime seeds: %d\n", r.shared_tiny]);
+            log([NSString stringWithFormat:@"  Shared TwinFactor seeds: %d\n", r.shared_twin]);
+            log([NSString stringWithFormat:@"  Shared SophieFactor seeds: %d\n", r.shared_sophie]);
+            log([NSString stringWithFormat:@"  Predicted primes (web gaps): %d\n", r.predicted_primes]);
+            log([NSString stringWithFormat:@"  Correct: %d\n", r.correct_predictions]);
+            log([NSString stringWithFormat:@"  Precision: %.1f%%, Recall: %.1f%%\n", r.precision * 100, r.recall * 100]);
+        }
+        else if (tid == "audio_test") {
+            uint64_t lo = vals.size() >= 2 ? vals[0] : 1000;
+            uint64_t hi = vals.size() >= 2 ? vals[1] : lo + 4000;
+            if (hi - lo > 100000) { log(@"Range too large (max 100K).\n"); ss->_checkRunning.store(false); return; }
+            log([NSString stringWithFormat:@"Audio Test (Harmonic Resonance) [%llu, %llu]...\n", lo, hi]);
+            auto r = prime::audio_test(lo, hi);
+            log([NSString stringWithFormat:@"  Primes: %d\n", r.num_primes]);
+            log([NSString stringWithFormat:@"  Avg resonance: %.4f\n", r.avg_resonance]);
+            log([NSString stringWithFormat:@"  Low-resonance gaps: %d\n", r.resonance_gaps]);
+            log([NSString stringWithFormat:@"  Primes in gaps: %d\n", r.primes_in_gaps]);
+            log([NSString stringWithFormat:@"  Gap prime rate vs baseline: %.2fx\n", r.gap_prime_rate]);
+            log(@"    (>1.0 = resonance gaps predict primes better than random)\n");
+            if (!r.common_harmonics.empty()) {
+                log(@"  Most common harmonic ratios:\n");
+                // Sort by count
+                std::vector<std::pair<std::string, int>> sorted_h(r.common_harmonics.begin(), r.common_harmonics.end());
+                std::sort(sorted_h.begin(), sorted_h.end(), [](auto& a, auto& b) { return a.second > b.second; });
+                int show = std::min((int)sorted_h.size(), 10);
+                for (int i = 0; i < show; i++) {
+                    log([NSString stringWithFormat:@"    %s: %d occurrences\n",
+                        sorted_h[i].first.c_str(), sorted_h[i].second]);
+                }
+            }
+        }
+        else if (tid == "twisting_tree_test") {
+            uint64_t lo = vals.size() >= 2 ? vals[0] : 1000;
+            uint64_t hi = vals.size() >= 2 ? vals[1] : lo + 4000;
+            if (hi - lo > 100000) { log(@"Range too large (max 100K).\n"); ss->_checkRunning.store(false); return; }
+            log([NSString stringWithFormat:@"Twisting Tree Test [%llu, %llu]...\n", lo, hi]);
+            auto r = prime::twisting_tree_test(lo, hi);
+            log([NSString stringWithFormat:@"  Primes: %d\n", r.num_primes]);
+            log([NSString stringWithFormat:@"  Balanced trees: %d, Unbalanced: %d\n", r.balanced_trees, r.unbalanced_trees]);
+            log([NSString stringWithFormat:@"  Tree shape transitions: %d\n", r.shape_changes]);
+            log([NSString stringWithFormat:@"  Primes after shape change: %d\n", r.primes_after_change]);
+            log([NSString stringWithFormat:@"  Change->prime rate vs baseline: %.2fx\n", r.change_prime_rate]);
+            log(@"    (>1.0 = shape changes predict primes)\n");
+            log([NSString stringWithFormat:@"  Avg gap after balanced tree: %.2f\n", r.balanced_gap_avg]);
+            log([NSString stringWithFormat:@"  Avg gap after unbalanced tree: %.2f\n", r.unbalanced_gap_avg]);
+            log(@"  Tree shape distribution:\n");
+            std::vector<std::pair<std::string, int>> sorted_s(r.shape_counts.begin(), r.shape_counts.end());
+            std::sort(sorted_s.begin(), sorted_s.end(), [](auto& a, auto& b) { return a.second > b.second; });
+            int show = std::min((int)sorted_s.size(), 15);
+            for (int i = 0; i < show; i++) {
+                log([NSString stringWithFormat:@"    %s: %d composites\n",
+                    sorted_s[i].first.c_str(), sorted_s[i].second]);
+            }
+        }
+        else {
+            log([NSString stringWithFormat:@"Test '%s' not yet implemented.\n", tid.c_str()]);
+        }
+
+        ss->_checkRunning.store(false);
+        } // @autoreleasepool
+    });
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// Expression Evaluate
+// ═══════════════════════════════════════════════════════════════════════
+
+- (void)expressionEvaluate:(id)sender {
+    NSString *input = [self.expressionField.stringValue
+        stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    if (input.length == 0) return;
+    [self evaluateExpression:input];
+}
+
+- (void)showExpressionHelp:(id)sender {
+    NSAlert *alert = [[NSAlert alloc] init];
+    alert.messageText = @"Expression Syntax";
+    alert.informativeText =
+        @"Supported expressions:\n\n"
+        @"  is_prime(N)         -- primality test\n"
+        @"  factor(N)           -- full factorization\n"
+        @"  modpow(a,b,m)       -- a^b mod m\n"
+        @"  mulmod(a,b,m)       -- a*b mod m\n"
+        @"  gcd(a,b)  lcm(a,b)  -- greatest common div / least common mult\n"
+        @"  fibonacci(n)        -- nth Fibonacci number\n"
+        @"  binomial(n,k)       -- C(n,k)\n"
+        @"  primes A to B       -- list primes in range\n"
+        @"  next prime N        -- next prime after N\n"
+        @"  prev prime N        -- previous prime before N\n"
+        @"  twin primes A B     -- twin primes in range\n"
+        @"  sophie germain A B  -- Sophie Germain primes in range\n"
+        @"  wieferich N         -- test Wieferich property\n"
+        @"  wilson N            -- test Wilson property\n"
+        @"  mersenne N          -- test 2^N - 1\n"
+        @"  convergence(N)      -- convergence score\n"
+        @"  pi(N)  phi(N)       -- prime counting / Euler totient\n"
+        @"  N!  N mod M         -- factorial / modulo\n"
+        @"  2^67-1  3*5+7       -- math expressions";
+    [alert addButtonWithTitle:@"OK"];
+    [alert runModal];
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// Distributed Computing Setup
+// ═══════════════════════════════════════════════════════════════════════
+
+- (void)showDistributedSetup:(id)sender {
+    // If window already exists, just bring it forward
+    if (self.networkWindow) {
+        [self.networkWindow makeKeyAndOrderFront:nil];
+        return;
+    }
+
+    CGFloat W = 620, H = 560;
+    self.networkWindow = [[NSWindow alloc]
+        initWithContentRect:NSMakeRect(200, 200, W, H)
+        styleMask:(NSWindowStyleMaskTitled | NSWindowStyleMaskClosable |
+                   NSWindowStyleMaskMiniaturizable | NSWindowStyleMaskResizable)
+        backing:NSBackingStoreBuffered defer:NO];
+    [self.networkWindow setTitle:@"Distributed Computing Setup"];
+    [self.networkWindow setMinSize:NSMakeSize(500, 400)];
+    self.networkWindow.delegate = self;
+
+    NSView *cv = self.networkWindow.contentView;
+    CGFloat M = 14, CW = W - 2 * M;
+    CGFloat y = H - 10;
+
+    // Title
+    NSTextField *titleLbl = [self labelAt:NSMakeRect(M, y - 20, CW, 20)
+        text:@"Distributed Computing" bold:YES size:14];
+    titleLbl.autoresizingMask = NSViewMinYMargin | NSViewWidthSizable;
+    [cv addSubview:titleLbl];
+    y -= 24;
+
+    NSTextField *descLbl = [self labelAt:NSMakeRect(M, y - 14, CW, 14)
+        text:@"Run as Conductor (coordinates work) or Carriage (receives work from a Conductor)" bold:NO size:9.5];
+    descLbl.textColor = [NSColor secondaryLabelColor];
+    descLbl.autoresizingMask = NSViewMinYMargin | NSViewWidthSizable;
+    [cv addSubview:descLbl];
+    y -= 20;
+
+    NSBox *sep1 = [[NSBox alloc] initWithFrame:NSMakeRect(M, y, CW, 1)];
+    sep1.boxType = NSBoxSeparator;
+    sep1.autoresizingMask = NSViewMinYMargin | NSViewWidthSizable;
+    [cv addSubview:sep1];
+    y -= 10;
+
+    // Role selector
+    NSTextField *roleLbl = [self labelAt:NSMakeRect(M, y - 16, 40, 14) text:@"Role:" bold:YES size:11];
+    roleLbl.autoresizingMask = NSViewMinYMargin;
+    [cv addSubview:roleLbl];
+
+    self.roleSegment = [[NSSegmentedControl alloc] initWithFrame:NSMakeRect(M + 44, y - 18, 240, 22)];
+    self.roleSegment.segmentCount = 2;
+    [self.roleSegment setLabel:@"Conductor (Server)" forSegment:0];
+    [self.roleSegment setLabel:@"Carriage (Worker)" forSegment:1];
+    [self.roleSegment setWidth:120 forSegment:0];
+    [self.roleSegment setWidth:120 forSegment:1];
+    self.roleSegment.selectedSegment = 0;
+    self.roleSegment.target = self;
+    self.roleSegment.action = @selector(networkRoleChanged:);
+    self.roleSegment.autoresizingMask = NSViewMinYMargin;
+    [cv addSubview:self.roleSegment];
+    y -= 30;
+
+    // ── Conductor panel ──────────────────────────────────────────────
+    CGFloat panelTop = y;
+    self.conductorPanel = [[NSView alloc] initWithFrame:NSMakeRect(0, panelTop - 70, W, 70)];
+    self.conductorPanel.autoresizingMask = NSViewMinYMargin | NSViewWidthSizable;
+    {
+        CGFloat py = 50;
+        NSTextField *portLbl = [self labelAt:NSMakeRect(M, py - 14, 34, 14) text:@"Port:" bold:NO size:10];
+        [self.conductorPanel addSubview:portLbl];
+
+        self.conductorPortField = [[NSTextField alloc] initWithFrame:NSMakeRect(M + 38, py - 16, 70, 20)];
+        self.conductorPortField.font = [NSFont monospacedSystemFontOfSize:10 weight:NSFontWeightRegular];
+        self.conductorPortField.stringValue = @"9807";
+        [self.conductorPanel addSubview:self.conductorPortField];
+
+        self.conductorStartStopBtn = [self buttonAt:NSMakeRect(M + 120, py - 16, 110, 22)
+            title:@"Start Server" action:@selector(conductorStartStop:)];
+        self.conductorStartStopBtn.font = [NSFont systemFontOfSize:10];
+        [self.conductorPanel addSubview:self.conductorStartStopBtn];
+
+        py -= 28;
+        self.bonjourToggle = [NSButton checkboxWithTitle:@"Publish via Bonjour (auto-discovery on local network)"
+            target:nil action:nil];
+        self.bonjourToggle.frame = NSMakeRect(M, py - 14, 400, 18);
+        self.bonjourToggle.font = [NSFont systemFontOfSize:9.5];
+        self.bonjourToggle.state = NSControlStateValueOn;
+        [self.conductorPanel addSubview:self.bonjourToggle];
+    }
+    [cv addSubview:self.conductorPanel];
+
+    // ── Carriage panel ───────────────────────────────────────────────
+    self.carriagePanel = [[NSView alloc] initWithFrame:NSMakeRect(0, panelTop - 70, W, 70)];
+    self.carriagePanel.autoresizingMask = NSViewMinYMargin | NSViewWidthSizable;
+    self.carriagePanel.hidden = YES;
+    {
+        CGFloat py = 50;
+        NSTextField *hostLbl = [self labelAt:NSMakeRect(M, py - 14, 80, 14) text:@"Conductor IP:" bold:NO size:10];
+        [self.carriagePanel addSubview:hostLbl];
+
+        self.carriageHostField = [[NSTextField alloc] initWithFrame:NSMakeRect(M + 84, py - 16, 160, 20)];
+        self.carriageHostField.font = [NSFont monospacedSystemFontOfSize:10 weight:NSFontWeightRegular];
+        self.carriageHostField.placeholderString = @"192.168.1.100";
+        [self.carriagePanel addSubview:self.carriageHostField];
+
+        NSTextField *cportLbl = [self labelAt:NSMakeRect(M + 252, py - 14, 30, 14) text:@"Port:" bold:NO size:10];
+        [self.carriagePanel addSubview:cportLbl];
+
+        self.carriagePortField = [[NSTextField alloc] initWithFrame:NSMakeRect(M + 286, py - 16, 60, 20)];
+        self.carriagePortField.font = [NSFont monospacedSystemFontOfSize:10 weight:NSFontWeightRegular];
+        self.carriagePortField.stringValue = @"9807";
+        [self.carriagePanel addSubview:self.carriagePortField];
+
+        self.carriageConnectBtn = [self buttonAt:NSMakeRect(M + 360, py - 16, 100, 22)
+            title:@"Connect" action:@selector(carriageConnect:)];
+        self.carriageConnectBtn.font = [NSFont systemFontOfSize:10];
+        [self.carriagePanel addSubview:self.carriageConnectBtn];
+
+        py -= 28;
+        NSButton *autoDiscover = [NSButton checkboxWithTitle:@"Auto-discover via Bonjour"
+            target:self action:@selector(carriageBonjourToggle:)];
+        autoDiscover.frame = NSMakeRect(M, py - 14, 250, 18);
+        autoDiscover.font = [NSFont systemFontOfSize:9.5];
+        autoDiscover.state = NSControlStateValueOff;
+        [self.carriagePanel addSubview:autoDiscover];
+    }
+    [cv addSubview:self.carriagePanel];
+
+    y = panelTop - 76;
+
+    // ── Connected Machines ───────────────────────────────────────────
+    NSBox *sep2 = [[NSBox alloc] initWithFrame:NSMakeRect(M, y, CW, 1)];
+    sep2.boxType = NSBoxSeparator;
+    sep2.autoresizingMask = NSViewMinYMargin | NSViewWidthSizable;
+    [cv addSubview:sep2];
+    y -= 6;
+
+    NSTextField *machLbl = [self labelAt:NSMakeRect(M, y - 16, 150, 14)
+        text:@"Connected Machines" bold:YES size:11];
+    machLbl.autoresizingMask = NSViewMinYMargin;
+    [cv addSubview:machLbl];
+
+    NSButton *testBtn = [self buttonAt:NSMakeRect(W - M - 120, y - 16, 120, 20)
+        title:@"Test Connection" action:@selector(testNetworkConnection:)];
+    testBtn.font = [NSFont systemFontOfSize:10];
+    testBtn.autoresizingMask = NSViewMinYMargin | NSViewMinXMargin;
+    [cv addSubview:testBtn];
+    y -= 22;
+
+    // Machine list (scrollable text view)
+    CGFloat listH = y - 40;
+    NSScrollView *machScroll = [[NSScrollView alloc] initWithFrame:NSMakeRect(M, 36, CW, listH)];
+    machScroll.hasVerticalScroller = YES;
+    machScroll.borderType = NSBezelBorder;
+    machScroll.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
+    self.connectedMachinesView = [[NSTextView alloc] initWithFrame:NSMakeRect(0, 0, CW - 4, listH)];
+    self.connectedMachinesView.editable = NO;
+    self.connectedMachinesView.font = [NSFont monospacedSystemFontOfSize:10 weight:NSFontWeightRegular];
+    self.connectedMachinesView.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
+    self.connectedMachinesView.string = @"No machines connected.\n\n"
+        @"Conductor mode: Start the server, then launch PrimePath on other\n"
+        @"machines in Carriage mode to connect.\n\n"
+        @"Carriage mode: Enter the Conductor's IP address and click Connect,\n"
+        @"or enable Bonjour to discover automatically.";
+    machScroll.documentView = self.connectedMachinesView;
+    [cv addSubview:machScroll];
+
+    // Status line at bottom
+    self.networkStatusLabel = [self labelAt:NSMakeRect(M, 10, CW, 16)
+        text:@"Status: Idle" bold:NO size:10];
+    self.networkStatusLabel.textColor = [NSColor secondaryLabelColor];
+    self.networkStatusLabel.autoresizingMask = NSViewWidthSizable | NSViewMaxYMargin;
+    [cv addSubview:self.networkStatusLabel];
+
+    // Start refresh timer
+    __weak AppDelegate *weakSelf = self;
+    self.networkRefreshTimer = [NSTimer scheduledTimerWithTimeInterval:1.0 repeats:YES
+        block:^(NSTimer *t) { [weakSelf refreshNetworkStatus]; }];
+
+    [self.networkWindow makeKeyAndOrderFront:nil];
+}
+
+// ── Network role toggle ──────────────────────────────────────────────
+
+- (void)networkRoleChanged:(id)sender {
+    BOOL isConductor = (self.roleSegment.selectedSegment == 0);
+    self.conductorPanel.hidden = !isConductor;
+    self.carriagePanel.hidden = isConductor;
+}
+
+// ── Conductor start/stop ─────────────────────────────────────────────
+
+- (void)conductorStartStop:(id)sender {
+    if (_conductor && _conductor->is_running()) {
+        _conductor->stop();
+        delete _conductor;
+        _conductor = nullptr;
+        self.conductorStartStopBtn.title = @"Start Server";
+        self.networkStatusLabel.stringValue = @"Status: Server stopped";
+        [self appendText:@"[Network] Conductor server stopped.\n"];
+    } else {
+        uint16_t port = (uint16_t)self.conductorPortField.integerValue;
+        if (port == 0) port = 9807;
+        _conductor = new prime::ConductorServer(port, _taskMgr);
+
+        __weak AppDelegate *weakSelf = self;
+        _conductor->set_on_carriage_connected([weakSelf](uint32_t cid, const std::string& name) {
+            NSString *msg = [NSString stringWithFormat:@"[Network] Carriage connected: %s (id=%u)\n",
+                name.c_str(), cid];
+            dispatch_async(dispatch_get_main_queue(), ^{
+                [weakSelf appendText:msg];
+                [weakSelf refreshNetworkStatus];
+            });
+        });
+        _conductor->set_on_carriage_disconnected([weakSelf](uint32_t cid, const std::string& name) {
+            NSString *msg = [NSString stringWithFormat:@"[Network] Carriage disconnected: %s (id=%u)\n",
+                name.c_str(), cid];
+            dispatch_async(dispatch_get_main_queue(), ^{
+                [weakSelf appendText:msg];
+                [weakSelf refreshNetworkStatus];
+            });
+        });
+        _conductor->set_on_carriage_progress([weakSelf](uint32_t cid, const prime::net::ProgressMsg& pm) {
+            // Progress is tracked internally, refreshed by timer
+        });
+        _conductor->set_on_remote_discovery([weakSelf](uint32_t cid, const prime::net::DiscoveryMsg& dm) {
+            NSString *msg = [NSString stringWithFormat:@"[Network] Remote discovery from carriage %u: value=%llu\n",
+                cid, dm.value];
+            dispatch_async(dispatch_get_main_queue(), ^{
+                [weakSelf appendText:msg];
+            });
+        });
+
+        _conductor->start();
+        self.conductorStartStopBtn.title = @"Stop Server";
+        self.networkStatusLabel.stringValue = [NSString stringWithFormat:
+            @"Status: Conductor running on port %u", port];
+        [self appendText:[NSString stringWithFormat:@"[Network] Conductor server started on port %u\n", port]];
+    }
+}
+
+// ── Carriage connect/disconnect ──────────────────────────────────────
+
+- (void)carriageConnect:(id)sender {
+    if (_carriage && _carriage->is_connected()) {
+        _carriage->stop();
+        delete _carriage;
+        _carriage = nullptr;
+        self.carriageConnectBtn.title = @"Connect";
+        self.networkStatusLabel.stringValue = @"Status: Disconnected";
+        [self appendText:@"[Network] Carriage disconnected.\n"];
+    } else {
+        NSString *host = self.carriageHostField.stringValue;
+        uint16_t port = (uint16_t)self.carriagePortField.integerValue;
+        if (port == 0) port = 9807;
+        if (host.length == 0) {
+            self.networkStatusLabel.stringValue = @"Status: Enter a Conductor IP address";
+            return;
+        }
+
+        _carriage = new prime::CarriageClient(DATA_DIR.UTF8String);
+        __weak AppDelegate *weakSelf = self;
+        _carriage->set_status_callback([weakSelf](const std::string& status) {
+            NSString *msg = [NSString stringWithFormat:@"[Network] %s\n",
+                status.c_str()];
+            dispatch_async(dispatch_get_main_queue(), ^{
+                [weakSelf appendText:msg];
+                [weakSelf refreshNetworkStatus];
+            });
+        });
+        _carriage->set_work_callback([weakSelf](const prime::net::WorkChunk& chunk) {
+            NSString *msg = [NSString stringWithFormat:
+                @"[Network] Received work: [%llu, %llu)\n",
+                chunk.range_start, chunk.range_end];
+            dispatch_async(dispatch_get_main_queue(), ^{
+                [weakSelf appendText:msg];
+            });
+        });
+
+        _carriage->connect(host.UTF8String, port);
+        self.carriageConnectBtn.title = @"Disconnect";
+        self.networkStatusLabel.stringValue = [NSString stringWithFormat:
+            @"Status: Connecting to %@:%u...", host, port];
+        [self appendText:[NSString stringWithFormat:@"[Network] Connecting to %@:%u...\n", host, port]];
+    }
+}
+
+- (void)carriageBonjourToggle:(id)sender {
+    NSButton *cb = (NSButton *)sender;
+    if (cb.state == NSControlStateValueOn) {
+        if (!_carriage) {
+            _carriage = new prime::CarriageClient(DATA_DIR.UTF8String);
+            __weak AppDelegate *weakSelf = self;
+            _carriage->set_status_callback([weakSelf](const std::string& status) {
+                NSString *msg = [NSString stringWithFormat:@"[Network] %s\n", status.c_str()];
+                dispatch_async(dispatch_get_main_queue(), ^{
+                    [weakSelf appendText:msg];
+                    [weakSelf refreshNetworkStatus];
+                });
+            });
+        }
+        _carriage->start_discovery();
+        self.networkStatusLabel.stringValue = @"Status: Searching for Conductor via Bonjour...";
+        [self appendText:@"[Network] Bonjour discovery started.\n"];
+    } else {
+        if (_carriage) {
+            _carriage->stop();
+            delete _carriage;
+            _carriage = nullptr;
+        }
+        self.networkStatusLabel.stringValue = @"Status: Bonjour discovery stopped";
+    }
+}
+
+// ── Test connection ──────────────────────────────────────────────────
+
+- (void)testNetworkConnection:(id)sender {
+    if (_conductor && _conductor->is_running()) {
+        size_t count = _conductor->carriage_count();
+        auto carriages = _conductor->connected_carriages();
+        NSMutableString *result = [NSMutableString string];
+        [result appendFormat:@"Conductor running -- %zu carriage(s) connected\n\n", count];
+        for (auto& c : carriages) {
+            [result appendFormat:@"  Host: %s | Cores: %d | GPU: %s | Connected: %s\n",
+                c.hostname.c_str(), c.cores, c.gpu_name.c_str(),
+                c.connected ? "Yes" : "No"];
+        }
+        if (carriages.empty()) {
+            [result appendString:@"  (no carriages connected yet)\n"];
+        }
+        self.connectedMachinesView.string = result;
+        self.networkStatusLabel.stringValue = [NSString stringWithFormat:
+            @"Status: %zu carriage(s) connected", count];
+    } else if (_carriage) {
+        NSMutableString *result = [NSMutableString string];
+        [result appendFormat:@"Carriage mode\n"];
+        [result appendFormat:@"  Connected: %s\n", _carriage->is_connected() ? "Yes" : "No"];
+        [result appendFormat:@"  Working: %s\n", _carriage->is_working() ? "Yes" : "No"];
+        std::string host = _carriage->conductor_host();
+        uint16_t port = _carriage->conductor_port();
+        if (!host.empty()) {
+            [result appendFormat:@"  Conductor: %s:%u\n", host.c_str(), port];
+        }
+        self.connectedMachinesView.string = result;
+        self.networkStatusLabel.stringValue = _carriage->is_connected()
+            ? @"Status: Connected to Conductor"
+            : @"Status: Not connected";
+    } else {
+        self.connectedMachinesView.string = @"No active connection. Start a server or connect to a Conductor.";
+        self.networkStatusLabel.stringValue = @"Status: Idle";
+    }
+}
+
+// ── Refresh network status (timer) ───────────────────────────────────
+
+- (void)refreshNetworkStatus {
+    if (!self.networkWindow || !self.networkWindow.isVisible) return;
+
+    if (_conductor && _conductor->is_running()) {
+        auto carriages = _conductor->connected_carriages();
+        NSMutableString *result = [NSMutableString string];
+        [result appendFormat:@"%-24s  %5s  %-20s  %s\n", "HOSTNAME", "CORES", "GPU", "STATUS"];
+        [result appendString:@"────────────────────────  ─────  ────────────────────  ──────\n"];
+        for (auto& c : carriages) {
+            [result appendFormat:@"%-24s  %5d  %-20s  %s\n",
+                c.hostname.c_str(), c.cores, c.gpu_name.c_str(),
+                c.connected ? "Active" : "Idle"];
+        }
+        if (carriages.empty()) {
+            [result appendString:@"\n  Waiting for carriages to connect...\n"];
+            [result appendFormat:@"  Server listening on port %u\n", _conductor->port()];
+        }
+        self.connectedMachinesView.string = result;
+        self.networkStatusLabel.stringValue = [NSString stringWithFormat:
+            @"Status: Conductor running -- %zu carriage(s)", _conductor->carriage_count()];
+        self.conductorStartStopBtn.title = @"Stop Server";
+    } else if (_carriage) {
+        NSMutableString *result = [NSMutableString string];
+        if (_carriage->is_connected()) {
+            [result appendFormat:@"Connected to Conductor at %s:%u\n",
+                _carriage->conductor_host().c_str(), _carriage->conductor_port()];
+            [result appendFormat:@"Working: %s\n", _carriage->is_working() ? "Yes" : "No"];
+        } else {
+            [result appendString:@"Searching for Conductor...\n"];
+        }
+        self.connectedMachinesView.string = result;
+        self.networkStatusLabel.stringValue = _carriage->is_connected()
+            ? @"Status: Connected to Conductor"
+            : @"Status: Searching...";
+        self.carriageConnectBtn.title = _carriage->is_connected() ? @"Disconnect" : @"Connect";
+    }
+}
+
+// ── Window delegate ──────────────────────────────────────────────────
+
+- (void)windowWillClose:(NSNotification *)notification {
+    if (notification.object == self.networkWindow) {
+        [self.networkRefreshTimer invalidate];
+        self.networkRefreshTimer = nil;
+    }
 }
 
 @end
