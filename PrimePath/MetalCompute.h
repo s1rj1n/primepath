@@ -43,4 +43,17 @@
                            count:(uint32_t)count
                      fermatIndex:(uint64_t)m;
 
+// Fused Mersenne sieve+test (entire pipeline on GPU)
+- (NSArray *)runMersenneFusedSieve:(uint64_t)exponent
+                           kStart:(uint64_t)k_start
+                           kCount:(uint64_t)k_count;
+
+// GPU-accelerated segmented sieve: marks composites in range [lo, lo+count)
+// Returns bitmap of odd composites. Bit i set = lo + 2*i + 1 is composite.
+// sievePrimes: small primes up to sqrt(lo+count), starting from 3.
+- (NSData *)runGPUSieve:(uint64_t)lo
+                  count:(uint64_t)oddCount
+            sievePrimes:(const uint64_t *)primes
+             numPrimes:(uint32_t)numPrimes;
+
 @end

@@ -7,6 +7,7 @@
 #include <chrono>
 #include <iomanip>
 #include <sys/utsname.h>
+#include <sys/sysctl.h>
 
 namespace primenet {
 
@@ -48,19 +49,45 @@ bool PrimeNetClient::register_machine() {
         _state.computer_name = hostname;
     }
 
+    // Hardware GUID: MD5-like hash of hostname
+    std::string hw_guid = _state.guid;  // reuse GUID for hardware ID
+
+    // Get system info for registration
+    int64_t ram_mb = 0;
+    int ncpu = 1;
+    {
+        int mib[2] = {CTL_HW, HW_MEMSIZE};
+        uint64_t memsize = 0;
+        size_t len = sizeof(memsize);
+        if (sysctl(mib, 2, &memsize, &len, NULL, 0) == 0)
+            ram_mb = (int64_t)(memsize / (1024 * 1024));
+        ncpu = (int)[[NSProcessInfo processInfo] processorCount];
+    }
+
     std::string url = "https://v5.mersenne.org/v5server/"
         "?px=GIMPS&v=0.95&t=uc"
         "&g=" + _state.guid +
-        "&hg=" + url_encode(_state.computer_name) +
-        "&wg=" + url_encode(_state.computer_name) +
+        "&hg=" + hw_guid +
+        "&wg="
+        "&a=" + url_encode("macOS,PrimePath,1.0") +
+        "&c=" + url_encode("Apple Silicon (Metal GPU)") +
+        "&f=" + url_encode("Metal,NEON,AES") +
+        "&L1=192&L2=4096&L3=0"
+        "&np=" + std::to_string(ncpu) +
+        "&hp=1"
+        "&m=" + std::to_string(ram_mb) +
+        "&s=3200"
+        "&h=24&r=1000"
         "&u=" + url_encode(_state.username) +
-        "&un=" + url_encode(machine_description()) +
-        "&ss=&sh=";
+        "&cn=" + url_encode(_state.computer_name) +
+        "&ss=19191919&sh=ABCDABCDABCDABCDABCDABCDABCDABCD";
 
     _log("PrimeNet: registering machine as '" + _state.computer_name +
          "' for user '" + _state.username + "'...");
+    _log("PrimeNet: URL=" + url);
 
     std::string response = http_get(url);
+    _log("PrimeNet: raw response: [" + response + "]");
     if (response.empty()) {
         _log("PrimeNet: registration failed -- no response from server.");
         return false;
@@ -73,7 +100,7 @@ bool PrimeNetClient::register_machine() {
         std::string code = kv["pnErrorResult"];
         std::string detail = kv.count("pnErrorDetail") ? kv["pnErrorDetail"] : "(no detail)";
         _log("PrimeNet: registration error " + code + " -- " + detail);
-        // Error code 1 means "already registered" which is fine
+        // Error code 1 or already registered is fine
         if (code == "1") {
             _log("PrimeNet: machine already registered (OK).");
             _state.registered = true;
@@ -106,7 +133,7 @@ bool PrimeNetClient::set_work_preference() {
         "?px=GIMPS&v=0.95&t=po"
         "&g=" + _state.guid +
         "&c=0&w=2"
-        "&ss=&sh=";
+        "&ss=19191919&sh=ABCDABCDABCDABCDABCDABCDABCDABCD";
 
     _log("PrimeNet: setting work preference to Trial Factoring...");
     std::string response = http_get(url);
@@ -141,7 +168,7 @@ Assignment PrimeNetClient::get_assignment() {
     std::string url = "https://v5.mersenne.org/v5server/"
         "?px=GIMPS&v=0.95&t=ga"
         "&g=" + _state.guid +
-        "&c=0&ss=&sh=";
+        "&c=0&ss=19191919&sh=ABCDABCDABCDABCDABCDABCDABCDABCD";
 
     _log("PrimeNet: requesting trial factoring assignment...");
     std::string response = http_get(url);
@@ -216,7 +243,7 @@ bool PrimeNetClient::submit_result(const TFResult& result) {
         url += "&f=" + result.factor;
     }
 
-    url += "&m=" + url_encode(msg) + "&ss=&sh=";
+    url += "&m=" + url_encode(msg) + "&ss=19191919&sh=ABCDABCDABCDABCDABCDABCDABCDABCD";
 
     _log("PrimeNet: submitting result -- " + msg);
     std::string response = http_get(url);

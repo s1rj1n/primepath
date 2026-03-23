@@ -121,6 +121,33 @@ int MetalBackend::fermat_factor_batch(const uint32_t *candidates, uint8_t *resul
     return hits;
 }
 
+std::vector<GPUBackend::FusedHit> MetalBackend::mersenne_fused_sieve(
+    uint64_t exponent, uint64_t k_start, uint64_t k_count) {
+    if (!_impl) return {};
+    MetalCompute *mc = (__bridge MetalCompute *)_impl;
+    NSArray *hits = [mc runMersenneFusedSieve:exponent kStart:k_start kCount:k_count];
+    std::vector<FusedHit> result;
+    for (NSArray *hit in hits) {
+        FusedHit fh;
+        fh.q_lo = [hit[0] unsignedLongLongValue];
+        fh.q_hi_and_k = [hit[1] unsignedLongLongValue];
+        result.push_back(fh);
+    }
+    return result;
+}
+
+std::vector<uint32_t> MetalBackend::gpu_sieve(uint64_t lo, uint64_t odd_count,
+                                                const uint64_t *sieve_primes, uint32_t num_primes) {
+    if (!_impl) return {};
+    MetalCompute *mc = (__bridge MetalCompute *)_impl;
+    NSData *data = [mc runGPUSieve:lo count:odd_count sievePrimes:sieve_primes numPrimes:num_primes];
+    if (!data) return {};
+    uint32_t words = (uint32_t)(data.length / sizeof(uint32_t));
+    std::vector<uint32_t> bitmap(words);
+    memcpy(bitmap.data(), data.bytes, data.length);
+    return bitmap;
+}
+
 double MetalBackend::gpu_utilization() const {
     if (!_impl) return 0.0;
     MetalCompute *mc = (__bridge MetalCompute *)_impl;

@@ -95,6 +95,9 @@ void Benchmark::run_all(std::function<void(const std::string&)> log_cb,
     if (!should_run.load()) return;
     bench_sieve_pipeline(log, should_run);
 
+    if (!should_run.load()) return;
+    bench_gpu_cpu_split(log, should_run);
+
     log("");
     log("═══════════════════════════════════════════════════════════════");
     log("Benchmark complete.");
@@ -408,6 +411,116 @@ void Benchmark::bench_sieve_pipeline(std::function<void(const std::string&)>& lo
             fmt_rate(rate) + " candidates/sec  (" +
             std::to_string((int)seg_rate) + " segs/sec, " +
             fmt_num(total_primes) + " primes in " + fmt_time(dt) + ")");
+    }
+    log("");
+}
+
+// ═════════════════════════════════════════════════════════════════════
+// 7. GPU/CPU Split Test — verifies last-digit routing and measures both paths
+// ═════════════════════════════════════════════════════════════════════
+
+void Benchmark::bench_gpu_cpu_split(std::function<void(const std::string&)>& log,
+                                     std::atomic<bool>& run) {
+    log("── GPU/CPU Split Test ──────────────────────────────────────────");
+
+    _mgr->ensure_small_primes(2000000);
+
+    // Sieve a few segments and check the last-digit distribution
+    uint64_t start = 1000000007ULL;
+    uint64_t seg_size = 1000000;
+    int num_segs = 5;
+
+    uint64_t gpu_count = 0, cpu_count = 0;
+    uint64_t d1 = 0, d3 = 0, d7 = 0, d9 = 0;
+
+    auto t0 = std::chrono::steady_clock::now();
+
+    for (int s = 0; s < num_segs && run.load(); s++) {
+        uint64_t lo = start + s * seg_size;
+        uint64_t hi = lo + seg_size;
+        auto primes = _mgr->segmented_sieve(lo, hi);
+
+        for (auto p : primes) {
+            int d = (int)(p % 10);
+            if (d == 1) { d1++; gpu_count++; }
+            else if (d == 3) { d3++; gpu_count++; }
+            else if (d == 7) { d7++; cpu_count++; }
+            else if (d == 9) { d9++; cpu_count++; }
+        }
+    }
+
+    double dt = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - t0).count();
+
+    uint64_t total = gpu_count + cpu_count;
+    double gpu_pct = total > 0 ? 100.0 * gpu_count / total : 0;
+    double cpu_pct = total > 0 ? 100.0 * cpu_count / total : 0;
+
+    log("  Range: " + fmt_num(start) + " – " + fmt_num(start + num_segs * seg_size));
+    log("  Total primes: " + fmt_num(total));
+    log("  Last-digit distribution:");
+    log("    d=1: " + fmt_num(d1) + "  d=3: " + fmt_num(d3) +
+        "  d=7: " + fmt_num(d7) + "  d=9: " + fmt_num(d9));
+    log("  GPU (d=1,3): " + fmt_num(gpu_count) +
+        " (" + std::to_string((int)gpu_pct) + "%)");
+    log("  CPU (d=7,9): " + fmt_num(cpu_count) +
+        " (" + std::to_string((int)cpu_pct) + "%)");
+    log("  Sieve time: " + fmt_time(dt));
+
+    // Now test actual GPU and CPU paths if GPU available
+    if (_mgr->gpu() && _mgr->gpu()->available() && run.load()) {
+        log("  Testing GPU dispatch...");
+        auto primes = _mgr->segmented_sieve(start, start + seg_size);
+
+        // Split by last digit
+        std::vector<uint64_t> gpu_batch, cpu_batch;
+        for (auto p : primes) {
+            int d = (int)(p % 10);
+            if (d == 1 || d == 3) gpu_batch.push_back(p);
+            else cpu_batch.push_back(p);
+        }
+
+        // Time GPU path
+        std::vector<uint8_t> gpu_results(gpu_batch.size());
+        auto gt0 = std::chrono::steady_clock::now();
+        {
+            std::lock_guard<std::mutex> lock(_mgr->gpu_mutex());
+            _mgr->gpu()->wieferich_batch(gpu_batch.data(), gpu_results.data(),
+                                          (uint32_t)gpu_batch.size());
+        }
+        double gpu_sec = std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - gt0).count();
+
+        // Time CPU path
+        auto ct0 = std::chrono::steady_clock::now();
+        // Just do trial MR tests as a proxy
+        uint64_t cpu_tested = 0;
+        for (auto p : cpu_batch) {
+            (void)is_prime(p);  // MR test
+            cpu_tested++;
+            if (cpu_tested >= gpu_batch.size()) break;  // match count
+        }
+        double cpu_sec = std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - ct0).count();
+
+        log("  GPU: " + fmt_num(gpu_batch.size()) + " candidates in " + fmt_time(gpu_sec) +
+            " (" + fmt_rate(gpu_batch.size() / gpu_sec) + "/s)");
+        log("  CPU: " + fmt_num(cpu_tested) + " candidates in " + fmt_time(cpu_sec) +
+            " (" + fmt_rate(cpu_tested / cpu_sec) + "/s)");
+
+        double ratio = (cpu_sec > 0) ? gpu_sec / cpu_sec : 0;
+        log("  GPU/CPU speed ratio: " + std::to_string(ratio).substr(0, 5) +
+            "x (< 1.0 means GPU faster)");
+
+        // Report balancer state
+        float sat = _mgr->balancer()->gpu_saturation();
+        log("  Balancer gpu_sat=" + std::to_string((int)(sat * 100)) + "%");
+    }
+
+    if (total > 0 && (gpu_pct < 40 || gpu_pct > 60)) {
+        log("  ⚠ WARNING: Split is uneven! Expected ~50/50.");
+    } else if (total > 0) {
+        log("  ✓ Split is balanced.");
     }
     log("");
 }

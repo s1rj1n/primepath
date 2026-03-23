@@ -667,6 +667,311 @@ kernel void mersenne_trial_batch(
 }
 
 // ═══════════════════════════════════════════════════════════════════════
+// Fused Mersenne TF: sieve + Barrett + primality test, all on GPU.
+//
+// Each thread handles one k-value end-to-end:
+//   1. Compute q = 2kp + 1
+//   2. Filter: q must be 1 or 7 (mod 8)
+//   3. Sieve by small primes (3..97)
+//   4. Compute Barrett constant mu = floor(2^192 / q)
+//   5. Compute 2^p mod q via binary exponentiation
+//   6. Write 1 if q divides 2^p - 1, else 0
+//
+// params[0] = exponent p
+// params[1] = k_start
+// params[2] = k_count
+// ═══════════════════════════════════════════════════════════════════════
+
+// Barrett mu computation on GPU: floor(2^192 / q) for 96-bit q
+// Uses iterative long division approach
+u96 gpu_compute_barrett_mu(u96 q) {
+    // We need floor(2^192 / q). Since q is 96 bits, result fits in 96 bits.
+    // Use 192-bit / 96-bit division via schoolbook long division.
+    //
+    // Dividend = 2^192 (193 bits). We'll compute 96 bits of quotient.
+    // Process 32 bits at a time, 3 iterations for 96-bit quotient.
+
+    // Start with remainder = 0, dividend digits come from 2^192
+    // 2^192 as 7 x 32-bit words: {0,0,0,0,0,0,1} (MSB first)
+    // Only the top word is 1, rest are 0.
+
+    // Simplified: use u96 division by repeated subtraction with shifts.
+    // Actually, let's use a direct approach with 128-bit intermediates.
+
+    // For correctness, compute mu digit by digit.
+    // mu = q0 * 2^64 + q1 * 2^32 + q2 where each qi is 32 bits.
+
+    // Step 1: estimate mu_hi (top 32 bits)
+    // 2^192 / q ~ 2^192 / (q.hi * 2^64) = 2^128 / q.hi (when q.hi > 0)
+
+    if (q.lo == 0 && q.mid == 0 && q.hi == 0) return {0, 0, 0};
+
+    // Use floating point for initial estimate, then refine
+    // q as float: q ~ q.hi * 2^64 + q.mid * 2^32 + q.lo
+    float fq = float(q.hi) * 18446744073709551616.0f + float(q.mid) * 4294967296.0f + float(q.lo);
+    if (fq < 1.0f) return {0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF};
+
+    // mu ~ 2^192 / q. Compute in float first for top bits estimate.
+    // 2^192 ~ 6.277e57
+    // We don't need perfect precision -- Barrett allows off-by-2.
+
+    // For a practical GPU Barrett, we can compute mu using Newton-Raphson
+    // or just use the existing u96 multiply infrastructure.
+
+    // Simpler approach: compute mu = floor(2^192 / q) using 192/96 division.
+    // Represent 2^192 as a u192 and divide.
+
+    // Schoolbook 192-bit / 96-bit division, producing 96-bit quotient.
+    // Process in 32-bit chunks from MSB.
+
+    // Remainder starts at 0. Dividend = {0,0,0,0,0,1} (LSB to MSB, word 5 = 1)
+    // We bring down 32 bits at a time from the dividend.
+
+    // Words of 2^192 from MSB: w6=1, w5=0, w4=0, w3=0, w2=0, w1=0
+    // (2^192 = 1 * 2^192, so word at position 192/32=6 is 1)
+
+    // We need to produce 3 quotient words (96 bits).
+    // Each iteration: remainder = remainder * 2^32 + next_dividend_word
+    //                 quotient_word = remainder / q
+    //                 remainder = remainder % q
+
+    // But remainder can be up to 96+32 = 128 bits, and we're dividing by 96-bit q.
+    // We need 128/96 division for each step. Use estimate + correction.
+
+    // Let's use a different, cleaner method: reciprocal via Newton's method in float,
+    // then refine using u96 multiply.
+
+    // Float reciprocal: 1/q * 2^192
+    // double has 53 bits of mantissa -- enough for a good starting estimate
+    // But Metal doesn't have double. Use float (23 bits) with refinement.
+
+    // Actually the simplest correct approach for GPU:
+    // Compute mu one 32-bit digit at a time using trial division.
+
+    // remainder = 2^192 mod (q * 2^64) ... this gets complex.
+
+    // PRACTICAL SHORTCUT: Since Barrett allows off-by-2 in the quotient estimate,
+    // we can use a slightly imprecise mu and it still works.
+    // Compute mu from float with 23 bits precision, pad the rest with 0.
+    // Then the sqrmod will do at most 2 extra corrections per step.
+    // This is actually fine for correctness!
+
+    // Better: use the property that for 96-bit q where q.hi != 0,
+    // mu fits in 96 bits and mu ~ 2^96 / q.hi (top 32 bits only).
+    // For q.hi == 0, mu is larger.
+
+    // BEST approach for Metal: compute Barrett constant on CPU for the first
+    // candidate, and since all candidates in a k-range have similar magnitude,
+    // we can verify and correct on GPU.
+
+    // Actually let me just do proper 192/96 long division on GPU.
+    // It's ~6 iterations, each doing a 128/96 divide. Not fast but only once per thread.
+
+    u96 mu = {0, 0, 0};
+
+    // We'll compute 3 words of quotient.
+    // Use a 128-bit remainder (u96 + 32 extra bits).
+    // Represent remainder as u128-like: {w0, w1, w2, w3} where value = w3*2^96 + w2*2^64 + w1*2^32 + w0
+
+    // Dividend 2^192 has 7 words (indices 0-6), word 6 = 1, rest = 0.
+    // We process words from MSB (word 6) down.
+
+    // After processing word 6: remainder = 1
+    // After processing word 5 (=0): remainder = 1 * 2^32 + 0 = 2^32
+    // After processing word 4 (=0): remainder = prev_remainder * 2^32
+    // etc. We start producing quotient digits once remainder >= q.
+
+    // Initialize: process the first 4 words of dividend (words 6,5,4,3)
+    // to build up a 128-bit remainder, then start dividing.
+
+    // Remainder after processing words 6..3: 1 * 2^(3*32) = 2^96
+    // This is exactly 1 in the "word 3" position.
+
+    // So initial 128-bit remainder = 2^96 = {0, 0, 0, 1} (4 x 32-bit words)
+    // Now produce quotient word by word.
+
+    // For each quotient word:
+    //   Bring in next dividend word (always 0 here since dividend is 2^192)
+    //   remainder = remainder * 2^32 + dividend_word
+    //   q_digit = remainder / q  (128-bit / 96-bit -> 32-bit quotient digit)
+    //   remainder = remainder - q_digit * q
+
+    // 128/96 division to get 32-bit quotient:
+    // Estimate: if remainder fits in 96 bits, q_digit = 0 or 1.
+    // If remainder uses all 128 bits, estimate q_digit = top_word / (q.hi + 1).
+
+    // Let me implement this properly.
+
+    // rem = 2^96 as a 128-bit number
+    uint rem3 = 1, rem2 = 0, rem1 = 0, rem0 = 0; // rem = rem3*2^96 + rem2*2^64 + rem1*2^32 + rem0
+
+    // Quotient words (MSB first): mu.hi, mu.mid, mu.lo
+    // We need to produce 3 quotient digits.
+
+    // For each of the 3 remaining dividend words (words 2, 1, 0 -- all zero):
+    for (int digit = 2; digit >= 0; digit--) {
+        // Shift remainder left by 32 and bring in next dividend word (0)
+        rem3 = rem2;
+        rem2 = rem1;
+        rem1 = rem0;
+        rem0 = 0; // dividend word is always 0
+
+        // Estimate quotient digit: qd = floor(rem / q)
+        // rem is 128 bits, q is 96 bits, qd is at most 32 bits
+        uint qd = 0;
+
+        // If rem3 > 0, we definitely have a quotient digit
+        if (rem3 > 0 || (rem3 == 0 && rem2 > q.hi) ||
+            (rem3 == 0 && rem2 == q.hi && rem1 > q.mid) ||
+            (rem3 == 0 && rem2 == q.hi && rem1 == q.mid && rem0 >= q.lo)) {
+
+            // Estimate: qd ~ rem3 * 2^32 / q.hi (if q.hi > 0)
+            if (q.hi > 0) {
+                ulong top = ((ulong)rem3 << 32) | rem2;
+                qd = (uint)(top / ((ulong)q.hi + 1));
+            } else if (q.mid > 0) {
+                ulong top = ((ulong)rem3 << 32) | rem2;
+                // q < 2^64, so qd could be large
+                qd = (uint)min((ulong)0xFFFFFFFF, top / ((ulong)q.mid + 1));
+            } else {
+                qd = 0xFFFFFFFF; // q is very small
+            }
+
+            // Compute rem -= qd * q using u96 multiply
+            // qd * q can be up to 128 bits
+            ulong p0 = (ulong)qd * q.lo;
+            ulong p1 = (ulong)qd * q.mid;
+            ulong p2 = (ulong)qd * q.hi;
+
+            uint s0 = (uint)p0;
+            ulong c1 = (p0 >> 32) + (uint)p1;
+            ulong c2 = (p1 >> 32) + (uint)p2 + (c1 >> 32);
+            uint s1 = (uint)c1;
+            uint s2 = (uint)c2;
+            uint s3 = (uint)(p2 >> 32) + (uint)(c2 >> 32);
+
+            // Subtract: rem -= s
+            uint borrow = 0;
+            uint nr0 = rem0 - s0;            borrow = (nr0 > rem0) ? 1 : 0;
+            uint nr1 = rem1 - s1 - borrow;   borrow = (rem1 < s1 + borrow) ? 1 : 0;
+            uint nr2 = rem2 - s2 - borrow;   borrow = (rem2 < s2 + borrow) ? 1 : 0;
+            uint nr3 = rem3 - s3 - borrow;
+
+            rem0 = nr0; rem1 = nr1; rem2 = nr2; rem3 = nr3;
+
+            // Correct: if remainder went negative (rem3 huge) or still >= q, adjust
+            // If rem3 > 0 or rem is negative (underflow), we overestimated
+            if (rem3 > 0x80000000u) {
+                // Underflow: add back q, decrease qd
+                ulong a0 = (ulong)rem0 + q.lo;
+                rem0 = (uint)a0;
+                ulong a1 = (ulong)rem1 + q.mid + (a0 >> 32);
+                rem1 = (uint)a1;
+                ulong a2 = (ulong)rem2 + q.hi + (a1 >> 32);
+                rem2 = (uint)a2;
+                rem3 += (uint)(a2 >> 32);
+                qd--;
+            }
+
+            // If remainder still >= q, add 1 to quotient
+            while (rem3 > 0 ||
+                   (rem2 > q.hi) ||
+                   (rem2 == q.hi && rem1 > q.mid) ||
+                   (rem2 == q.hi && rem1 == q.mid && rem0 >= q.lo)) {
+                ulong s0b = (ulong)rem0 - q.lo;
+                uint b = (s0b > (ulong)rem0) ? 1 : 0;
+                rem0 = (uint)s0b;
+                ulong s1b = (ulong)rem1 - q.mid - b;
+                b = ((ulong)rem1 < (ulong)q.mid + b) ? 1 : 0;
+                rem1 = (uint)s1b;
+                ulong s2b = (ulong)rem2 - q.hi - b;
+                b = ((ulong)rem2 < (ulong)q.hi + b) ? 1 : 0;
+                rem2 = (uint)s2b;
+                rem3 -= b;
+                qd++;
+            }
+        }
+
+        // Store quotient digit
+        if (digit == 2) mu.hi = qd;
+        else if (digit == 1) mu.mid = qd;
+        else mu.lo = qd;
+    }
+
+    return mu;
+}
+
+// Small primes for sieve and precomputed 2^64 mod sp (avoids per-thread loop)
+constant uint FUSED_SIEVE_PRIMES[] = {3,5,7,11,13,17,19,23,29,31,37,41,43,47,53,59,61,67,71,73,79,83,89,97};
+constant uint FUSED_POW64_MOD[]    = {1,1,2,5,3,1,17,6,24,16,12,16,41,25,15,5,16,17,10,2,51,36,67,61};
+// Each entry: 2^64 mod sp, verified by pow(2,64,sp) in Python.
+
+kernel void mersenne_fused_sieve(
+    device atomic_uint *hit_count  [[buffer(0)]],  // number of factors found
+    device ulong       *hit_factors [[buffer(1)]],  // found factors: pairs of (q_lo, q_hi_and_k)
+    device const ulong *params     [[buffer(2)]],  // [0]=p, [1]=k_start, [2]=k_count
+    uint gid [[thread_position_in_grid]])
+{
+    ulong p       = params[0];
+    ulong k_start = params[1];
+    ulong k_count = params[2];
+
+    if (gid >= (uint)k_count) return;
+
+    ulong k = k_start + gid;
+
+    // Step 1: compute q = 2kp + 1 using 128-bit arithmetic
+    // 2 * k * p: k is up to ~75 trillion (47 bits), p is ~29 bits = ~76 bits product
+    ulong kp_lo = k * p;  // low 64 bits of k*p
+    ulong kp_hi = mulhi(k, p);  // high 64 bits of k*p
+
+    // q = 2*kp + 1
+    ulong q_lo = (kp_lo << 1) | 1;  // shift left 1 and set bit 0
+    ulong q_hi_full = (kp_hi << 1) | (kp_lo >> 63);  // carry from shift
+
+    // Check if q > 96 bits (hi > 32 bits)
+    if (q_hi_full >> 32) return;
+    uint q_hi32 = (uint)q_hi_full;
+
+    // Step 2: q must be 1 or 7 (mod 8)
+    uint mod8 = (uint)(q_lo & 7);
+    if (mod8 != 1 && mod8 != 7) return;
+
+    // Step 3: sieve by small primes (using precomputed 2^64 mod sp)
+    for (int i = 0; i < 24; i++) {
+        ulong sp = FUSED_SIEVE_PRIMES[i];
+        ulong hi_mod = ((ulong)q_hi32 % sp);
+        ulong q_mod_sp = (hi_mod * FUSED_POW64_MOD[i] + q_lo % sp) % sp;
+        if (q_mod_sp == 0) return;
+    }
+
+    // Step 4: compute Barrett constant mu
+    u96 q = {(uint)q_lo, (uint)(q_lo >> 32), q_hi32};
+    u96 mu = gpu_compute_barrett_mu(q);
+
+    // Step 5: compute 2^p mod q
+    u96 acc = {2, 0, 0};
+    int top_bit = 63;
+    while (top_bit > 0 && !((p >> top_bit) & 1)) top_bit--;
+
+    for (int bit = top_bit - 1; bit >= 0; bit--) {
+        acc = u96_sqrmod(acc, q, mu);
+        if ((p >> bit) & 1) {
+            acc = u96_dblmod(acc, q);
+        }
+    }
+
+    // Step 6: if 2^p mod q == 1, we found a factor!
+    if (acc.lo == 1 && acc.mid == 0 && acc.hi == 0) {
+        uint idx = atomic_fetch_add_explicit(hit_count, 1, memory_order_relaxed);
+        if (idx < 1024) {  // limit stored hits
+            hit_factors[idx * 2]     = q_lo;
+            hit_factors[idx * 2 + 1] = ((ulong)q_hi32 << 32) | (k & 0xFFFFFFFF);
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════
 // Fermat Factor Search — test if q divides Fermat number F_m = 2^(2^m)+1
 //
 // Any factor of F_m has form q = k * 2^(m+2) + 1.
@@ -701,6 +1006,54 @@ kernel void fermat_factor_batch(
     u96 q_minus_1 = u96_sub(q, {1, 0, 0});
     results[gid] = (x.lo == q_minus_1.lo && x.mid == q_minus_1.mid &&
                     x.hi == q_minus_1.hi) ? 1 : 0;
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// GPU Segmented Sieve — mark composites in a bitmap
+//
+// Each thread handles one small prime: marks all multiples of that prime
+// in the [seg_lo, seg_lo + seg_size) range by setting bits in the bitmap.
+// CPU then scans the bitmap to extract surviving primes.
+//
+// params[0] = seg_lo (must be even — we only sieve odd numbers)
+// params[1] = seg_size (number of odd candidates = half the range)
+// sieve_primes: array of small primes (3, 5, 7, ..., up to sqrt(seg_hi))
+// bitmap: output, one bit per odd number. bit i represents seg_lo + 2*i + 1.
+//         bit=1 means composite. Initialized to 0 by CPU.
+// ═══════════════════════════════════════════════════════════════════════
+
+kernel void gpu_sieve_mark(
+    device atomic_uint   *bitmap      [[buffer(0)]],  // ceil(seg_size/32) uint32s
+    device const ulong   *sieve_primes [[buffer(1)]],
+    device const ulong   *params       [[buffer(2)]],  // [0]=seg_lo, [1]=seg_size, [2]=num_primes
+    uint gid [[thread_position_in_grid]])
+{
+    ulong num_primes = params[2];
+    if (gid >= (uint)num_primes) return;
+
+    ulong p = sieve_primes[gid];
+    ulong seg_lo = params[0];
+    ulong seg_size = params[1];  // number of odd slots
+    ulong seg_hi = seg_lo + seg_size * 2;  // actual range end
+
+    // Find first odd multiple of p >= seg_lo
+    ulong start = ((seg_lo + p - 1) / p) * p;
+    if (start % 2 == 0) start += p;
+    if (start == p) start += 2 * p;  // skip p itself
+
+    // Mark all odd multiples of p in range
+    for (ulong n = start; n < seg_hi; n += 2 * p) {
+        // Convert n to bit index: n = seg_lo + 2*idx + 1, but seg_lo is even
+        // so idx = (n - seg_lo - 1) / 2 ... but only if n > seg_lo and n is odd
+        if (n <= seg_lo) continue;
+        ulong idx = (n - seg_lo - 1) / 2;
+        if (idx >= seg_size) break;
+
+        // Set bit idx in bitmap using atomic OR
+        uint word = (uint)(idx / 32);
+        uint bit = (uint)(idx % 32);
+        atomic_fetch_or_explicit(&bitmap[word], 1u << bit, memory_order_relaxed);
+    }
 }
 
 // General primality test batch

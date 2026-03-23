@@ -44,6 +44,8 @@ private:
                          std::atomic<bool>& run);
     void bench_sieve_pipeline(std::function<void(const std::string&)>& log,
                               std::atomic<bool>& run);
+    void bench_gpu_cpu_split(std::function<void(const std::string&)>& log,
+                             std::atomic<bool>& run);
 
     // Helpers
     static std::string fmt_num(uint64_t n);

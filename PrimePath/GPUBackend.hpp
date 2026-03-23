@@ -58,6 +58,23 @@ public:
     virtual int fermat_factor_batch(const uint32_t *candidates, uint8_t *results,
                                     uint32_t count, uint64_t fermat_index) = 0;
 
+    // GPU-accelerated segmented sieve: returns bitmap of composites for odd numbers
+    // in [lo, lo + odd_count*2). Bit i set = lo + 2*i + 1 is composite.
+    // sieve_primes: array of primes from 3..sqrt(hi). Returns bitmap data.
+    virtual std::vector<uint32_t> gpu_sieve(uint64_t lo, uint64_t odd_count,
+                                             const uint64_t *sieve_primes, uint32_t num_primes) {
+        return {}; // default: not supported
+    }
+
+    // Fused Mersenne sieve+test: entire pipeline on GPU.
+    // Returns vector of (q_lo, q_hi_and_k) pairs for any factors found.
+    struct FusedHit { uint64_t q_lo; uint64_t q_hi_and_k; };
+    virtual std::vector<FusedHit> mersenne_fused_sieve(uint64_t exponent,
+                                                        uint64_t k_start,
+                                                        uint64_t k_count) {
+        return {}; // default: not supported
+    }
+
     // ── Performance stats ────────────────────────────────────────────
     virtual double gpu_utilization() const { return 0.0; }     // 0.0-1.0
     virtual uint64_t total_threads_dispatched() const { return 0; }
@@ -113,6 +130,11 @@ public:
                              uint32_t count, uint64_t exponent) override;
     int fermat_factor_batch(const uint32_t *candidates, uint8_t *results,
                             uint32_t count, uint64_t fermat_index) override;
+    std::vector<FusedHit> mersenne_fused_sieve(uint64_t exponent,
+                                                uint64_t k_start,
+                                                uint64_t k_count) override;
+    std::vector<uint32_t> gpu_sieve(uint64_t lo, uint64_t odd_count,
+                                     const uint64_t *sieve_primes, uint32_t num_primes) override;
 
     // Performance stats from Metal command buffer timing
     double gpu_utilization() const override;

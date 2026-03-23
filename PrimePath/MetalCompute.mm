@@ -21,6 +21,8 @@ static const uint32_t MAX_BATCH = 262144; // 256K max batch
     id<MTLComputePipelineState> _wilsonSegPSO;
     id<MTLComputePipelineState> _mersenneTrialPSO;
     id<MTLComputePipelineState> _fermatFactorPSO;
+    id<MTLComputePipelineState> _mersenneFusedPSO;
+    id<MTLComputePipelineState> _gpuSieveMarkPSO;
 
     // Pre-allocated ring buffers
     id<MTLBuffer> _ringInput[RING_SIZE];
@@ -72,6 +74,8 @@ static const uint32_t MAX_BATCH = 262144; // 256K max batch
     _wilsonSegPSO  = [self psoForFunction:@"wilson_segments"];
     _mersenneTrialPSO = [self psoForFunction:@"mersenne_trial_batch"];
     _fermatFactorPSO  = [self psoForFunction:@"fermat_factor_batch"];
+    _mersenneFusedPSO = [self psoForFunction:@"mersenne_fused_sieve"];
+    _gpuSieveMarkPSO  = [self psoForFunction:@"gpu_sieve_mark"];
 
     // Pre-allocate ring buffers for max batch size
     for (int i = 0; i < RING_SIZE; i++) {
@@ -351,6 +355,135 @@ static const uint32_t MAX_BATCH = 262144; // 256K max batch
     _windowGpuSec += gpuTimeSec;
 
     return [NSData dataWithBytes:outputBuf.contents length:count * sizeof(uint8_t)];
+}
+
+// ── Fused Mersenne sieve+test dispatch ─────────────────────────────
+// Runs the entire sieve+Barrett+primality pipeline on GPU.
+// Returns an array of (q_lo, q_hi_and_k) pairs for any factors found.
+- (NSArray *)runMersenneFusedSieve:(uint64_t)exponent
+                           kStart:(uint64_t)k_start
+                           kCount:(uint64_t)k_count {
+    if (!_mersenneFusedPSO || k_count == 0) return @[];
+
+    // Dispatch in large chunks to maximise GPU occupancy.
+    // Each thread is lightweight (most exit early on mod8/sieve), so we need
+    // millions of threads to keep the GPU cores busy.
+    uint64_t max_threads = 1 << 24;  // 16M threads per dispatch
+    NSMutableArray *allHits = [NSMutableArray array];
+
+    // Pre-allocate reusable buffers for the entire call to avoid per-chunk allocation overhead
+    id<MTLBuffer> hitCountBuf = [_device newBufferWithLength:sizeof(uint32_t)
+                                                     options:MTLResourceStorageModeShared];
+    id<MTLBuffer> hitFactorsBuf = [_device newBufferWithLength:1024 * 2 * sizeof(uint64_t)
+                                                        options:MTLResourceStorageModeShared];
+    id<MTLBuffer> paramsBuf = [_device newBufferWithLength:3 * sizeof(uint64_t)
+                                                    options:MTLResourceStorageModeShared];
+
+    NSUInteger threadGroupSize = _mersenneFusedPSO.maxTotalThreadsPerThreadgroup;
+    if (threadGroupSize > 1024) threadGroupSize = 1024;
+
+    for (uint64_t offset = 0; offset < k_count; offset += max_threads) {
+        uint64_t chunk = MIN(k_count - offset, max_threads);
+        uint64_t chunk_k_start = k_start + offset;
+
+        // Reset hit counter
+        memset(hitCountBuf.contents, 0, sizeof(uint32_t));
+
+        // Set params
+        uint64_t *paramsData = (uint64_t *)paramsBuf.contents;
+        paramsData[0] = exponent;
+        paramsData[1] = chunk_k_start;
+        paramsData[2] = chunk;
+
+        id<MTLCommandBuffer> cmdBuf = [_queue commandBuffer];
+        id<MTLComputeCommandEncoder> encoder = [cmdBuf computeCommandEncoder];
+        [encoder setComputePipelineState:_mersenneFusedPSO];
+        [encoder setBuffer:hitCountBuf   offset:0 atIndex:0];
+        [encoder setBuffer:hitFactorsBuf offset:0 atIndex:1];
+        [encoder setBuffer:paramsBuf     offset:0 atIndex:2];
+
+        [encoder dispatchThreads:MTLSizeMake((NSUInteger)chunk, 1, 1)
+           threadsPerThreadgroup:MTLSizeMake(threadGroupSize, 1, 1)];
+        [encoder endEncoding];
+        [cmdBuf commit];
+        [cmdBuf waitUntilCompleted];
+
+        // Track GPU time
+        double gpuTimeSec = 0;
+        if (@available(macOS 10.15, *)) {
+            CFTimeInterval gpuStart = cmdBuf.GPUStartTime;
+            CFTimeInterval gpuEnd = cmdBuf.GPUEndTime;
+            if (gpuEnd > gpuStart) gpuTimeSec = gpuEnd - gpuStart;
+        }
+        _totalThreads += chunk;
+        _totalBatches++;
+        _totalGpuTimeSec += gpuTimeSec;
+        _windowGpuSec += gpuTimeSec;
+
+        // Read hits
+        uint32_t numHits = *(uint32_t *)hitCountBuf.contents;
+        if (numHits > 1024) numHits = 1024;
+        uint64_t *factors = (uint64_t *)hitFactorsBuf.contents;
+        for (uint32_t i = 0; i < numHits; i++) {
+            [allHits addObject:@[@(factors[i * 2]), @(factors[i * 2 + 1])]];
+        }
+    }
+
+    return allHits;
+}
+
+// ── GPU segmented sieve dispatch ─────────────────────────────────────
+- (NSData *)runGPUSieve:(uint64_t)lo
+                  count:(uint64_t)oddCount
+            sievePrimes:(const uint64_t *)primes
+             numPrimes:(uint32_t)numPrimes {
+    if (!_gpuSieveMarkPSO || oddCount == 0 || numPrimes == 0) return nil;
+
+    // Bitmap: one bit per odd number, packed into uint32s
+    uint32_t bitmapWords = (uint32_t)((oddCount + 31) / 32);
+    size_t bitmapBytes = bitmapWords * sizeof(uint32_t);
+
+    id<MTLBuffer> bitmapBuf = [_device newBufferWithLength:bitmapBytes
+                                                    options:MTLResourceStorageModeShared];
+    memset(bitmapBuf.contents, 0, bitmapBytes);
+
+    id<MTLBuffer> primesBuf = [_device newBufferWithBytes:primes
+                                                   length:numPrimes * sizeof(uint64_t)
+                                                  options:MTLResourceStorageModeShared];
+
+    uint64_t paramsData[3] = {lo, oddCount, numPrimes};
+    id<MTLBuffer> paramsBuf = [_device newBufferWithBytes:paramsData
+                                                   length:sizeof(paramsData)
+                                                  options:MTLResourceStorageModeShared];
+
+    id<MTLCommandBuffer> cmdBuf = [_queue commandBuffer];
+    id<MTLComputeCommandEncoder> encoder = [cmdBuf computeCommandEncoder];
+    [encoder setComputePipelineState:_gpuSieveMarkPSO];
+    [encoder setBuffer:bitmapBuf offset:0 atIndex:0];
+    [encoder setBuffer:primesBuf offset:0 atIndex:1];
+    [encoder setBuffer:paramsBuf offset:0 atIndex:2];
+
+    NSUInteger tgSize = _gpuSieveMarkPSO.maxTotalThreadsPerThreadgroup;
+    if (tgSize > 256) tgSize = 256;
+    [encoder dispatchThreads:MTLSizeMake(numPrimes, 1, 1)
+       threadsPerThreadgroup:MTLSizeMake(MIN(tgSize, numPrimes), 1, 1)];
+    [encoder endEncoding];
+    [cmdBuf commit];
+    [cmdBuf waitUntilCompleted];
+
+    // Track stats
+    double gpuTimeSec = 0;
+    if (@available(macOS 10.15, *)) {
+        CFTimeInterval gpuStart = cmdBuf.GPUStartTime;
+        CFTimeInterval gpuEnd = cmdBuf.GPUEndTime;
+        if (gpuEnd > gpuStart) gpuTimeSec = gpuEnd - gpuStart;
+    }
+    _totalThreads += numPrimes;
+    _totalBatches++;
+    _totalGpuTimeSec += gpuTimeSec;
+    _windowGpuSec += gpuTimeSec;
+
+    return [NSData dataWithBytes:bitmapBuf.contents length:bitmapBytes];
 }
 
 // ── Fermat factor search dispatch ────────────────────────────────────

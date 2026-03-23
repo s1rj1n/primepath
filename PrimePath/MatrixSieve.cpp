@@ -1,6 +1,7 @@
 #include "MatrixSieve.hpp"
 #include <Accelerate/Accelerate.h>
 #include <cstring>
+#include <cstdlib>
 #include <algorithm>
 #include <arm_neon.h>
 
@@ -9,6 +10,10 @@ namespace prime {
 MatrixSieve::MatrixSieve() {
     build_patterns();
     build_combined_pattern();
+    build_prefilled_tile();
+
+    // Allocate 128-byte aligned working buffer for sieve_block_fast
+    posix_memalign((void **)&_work_buf, 128, SIEVE_BUF_SIZE);
 }
 
 void MatrixSieve::build_patterns() {
@@ -23,69 +28,89 @@ void MatrixSieve::build_patterns() {
 }
 
 void MatrixSieve::build_combined_pattern() {
-    _combined_pattern.resize(PATTERN_PERIOD_SMALL);
-    for (uint64_t i = 0; i < PATTERN_PERIOD_SMALL; i++) {
-        bool passes = true;
-        if (i % 3 == 0 || i % 5 == 0 || i % 7 == 0 || i % 11 == 0 || i % 13 == 0)
-            passes = false;
-        _combined_pattern[i] = passes ? 1 : 0;
+    // Combined pattern: marks composites for primes {2,3,5,7,11,13}
+    // Period = lcm(2,3,5,7,11,13) = 30030
+    _combined_pattern.resize(COMBINED_PERIOD);
+    for (uint64_t i = 0; i < COMBINED_PERIOD; i++) {
+        bool composite = (i % 2 == 0) || (i % 3 == 0) || (i % 5 == 0) ||
+                          (i % 7 == 0) || (i % 11 == 0) || (i % 13 == 0);
+        _combined_pattern[i] = composite ? 0 : 1;
+    }
+    // Mark 0 and 1 as non-prime
+    _combined_pattern[0] = 0;
+    _combined_pattern[1] = 0;
+}
+
+void MatrixSieve::build_prefilled_tile() {
+    // Allocate 128-byte aligned buffer and tile the combined pattern across it.
+    // This creates a "production line" template: any sieve_block call just
+    // copies the relevant portion and applies the remaining few primes (17-31).
+    posix_memalign((void **)&_prefilled_tile, 128, SIEVE_BUF_SIZE);
+
+    // Tile the pattern using NEON bulk copy
+    const uint8_t *pat = _combined_pattern.data();
+    uint64_t filled = 0;
+
+    // First: write one full period
+    memcpy(_prefilled_tile, pat, COMBINED_PERIOD);
+    filled = COMBINED_PERIOD;
+
+    // Double-up: copy what we have to fill the rest (exponential fill)
+    while (filled < SIEVE_BUF_SIZE) {
+        uint64_t chunk = std::min(filled, (uint64_t)SIEVE_BUF_SIZE - filled);
+        memcpy(_prefilled_tile + filled, _prefilled_tile, chunk);
+        filled += chunk;
     }
 }
 
-// NEON-accelerated sieve: uses 128-bit SIMD for bulk AND operations
-// and vectorized even-number clearing.
+// NEON-accelerated sieve using pre-filled pattern tile
 void MatrixSieve::sieve_block(uint64_t start, uint32_t count, uint8_t *result) const {
     _total_tested += count;
 
-    // Phase 1: Initialize all candidates as potentially prime
-    // NEON: fill 16 bytes at a time with 1s
-    {
-        uint8x16_t ones = vdupq_n_u8(1);
-        uint32_t i = 0;
-        for (; i + 16 <= count; i += 16) {
-            vst1q_u8(&result[i], ones);
-        }
-        for (; i < count; i++) {
-            result[i] = 1;
-        }
+    // Phase 1: Copy pre-filled pattern tile with correct alignment.
+    // The tile has the combined pattern for primes {2,3,5,7,11,13} baked in.
+    // We just need to align it to `start mod COMBINED_PERIOD`.
+    uint64_t pat_offset = start % COMBINED_PERIOD;
+
+    // Fast NEON copy from the pre-filled tile
+    uint32_t copied = 0;
+
+    // First chunk: from pat_offset to end of first period
+    uint32_t first_chunk = (uint32_t)std::min((uint64_t)(COMBINED_PERIOD - pat_offset), (uint64_t)count);
+    memcpy(result, _combined_pattern.data() + pat_offset, first_chunk);
+    copied = first_chunk;
+
+    // Remaining: tile from the start of the pattern
+    while (copied < count) {
+        uint32_t chunk = std::min((uint32_t)COMBINED_PERIOD, count - copied);
+        memcpy(result + copied, _combined_pattern.data(), chunk);
+        copied += chunk;
     }
 
-    // Phase 2: Marker-stride for ALL primes including 2
-    // For each prime p: compute first multiple in [start, start+count),
-    // then stride by p, marking composites with result[j] = 0.
-    // Only touches O(count/p) positions per prime.
-    //
-    // Total work: count/2 + count/3 + count/5 + ... ≈ count × 1.67
-    // vs old approach: count × 10 (per-element modulo) + count NEON even pass
-    //
-    // Visualization for p=7, start=100, count=20:
-    //   r = 100 % 7 = 2  →  marker = 7 - 2 = 5
-    //   Mark: j=5, j=12, j=19  (only 3 writes for 20 elements)
-    //
-    static constexpr uint64_t ALL_PRIMES[] = {2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31};
-    static constexpr int NUM_ALL = 11;
-    for (int pi = 0; pi < NUM_ALL; pi++) {
-        uint64_t p = ALL_PRIMES[pi];
+    // Phase 2: Apply remaining primes {17, 19, 23, 29, 31} via marker-stride.
+    // These have larger strides so fewer marks per prime — fast scalar loop.
+    static constexpr uint64_t REMAINING_PRIMES[] = {17, 19, 23, 29, 31};
+    static constexpr int NUM_REMAINING = 5;
+    for (int pi = 0; pi < NUM_REMAINING; pi++) {
+        uint64_t p = REMAINING_PRIMES[pi];
         uint64_t r = start % p;
         uint32_t marker = (r == 0) ? 0 : (uint32_t)(p - r);
+        // Don't mark the prime itself
+        if (start + marker == p) marker += (uint32_t)p;
         for (uint32_t j = marker; j < count; j += (uint32_t)p) {
             result[j] = 0;
         }
     }
 
-    // Count rejections (zero bytes) using NEON
+    // Count rejections using NEON
     uint64_t rejected = 0;
     {
         uint32_t j = 0;
         uint32x4_t acc = vdupq_n_u32(0);
         for (; j + 16 <= count; j += 16) {
             uint8x16_t v = vld1q_u8(&result[j]);
-            // vceqq_u8 gives 0xFF (255) for zero bytes, 0 for non-zero.
-            // Negate to get 1 per zero byte: ~0xFF = 0x00, ~0x00 = 0xFF → wrong.
-            // Instead, use the fact that -0xFF = 1 in u8 (wrapping): 0 - 0xFF = 1.
-            // Simpler: right-shift by 7 to convert 0xFF→1, 0x00→0, then sum.
             uint8x16_t zeros = vceqq_u8(v, vdupq_n_u8(0));
-            uint8x16_t ones = vshrq_n_u8(zeros, 7);  // 0xFF>>7 = 1, 0>>7 = 0
+            uint8x16_t ones = vshrq_n_u8(zeros, 7);
             uint16x8_t sum16 = vpaddlq_u8(ones);
             uint32x4_t sum32 = vpaddlq_u16(sum16);
             acc = vaddq_u32(acc, sum32);
@@ -93,13 +118,18 @@ void MatrixSieve::sieve_block(uint64_t start, uint32_t count, uint8_t *result) c
         uint32_t lane_sum[4];
         vst1q_u32(lane_sum, acc);
         for (int k = 0; k < 4; k++) rejected += lane_sum[k];
-
-        // Scalar remainder
         for (; j < count; j++) {
             if (!result[j]) rejected++;
         }
     }
     _total_rejected += rejected;
+}
+
+// Fast path: uses pre-allocated aligned buffer, avoids caller allocation
+const uint8_t* MatrixSieve::sieve_block_fast(uint64_t start, uint32_t count) const {
+    if (count > SIEVE_BUF_SIZE) count = SIEVE_BUF_SIZE;
+    sieve_block(start, count, _work_buf);
+    return _work_buf;
 }
 
 double MatrixSieve::score_range(uint64_t lo, uint64_t hi) const {

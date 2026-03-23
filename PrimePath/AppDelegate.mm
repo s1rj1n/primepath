@@ -3253,13 +3253,49 @@ static const int EQ_HISTORY = 32; // number of vertical bars (time history)
     runWorkBtn.autoresizingMask = NSViewMinYMargin;
     [cv addSubview:runWorkBtn];
 
-    NSButton *submitBtn = [self buttonAt:NSMakeRect(362, y - 24, 110, 24)
+    NSButton *stopBtn = [self buttonAt:NSMakeRect(362, y - 24, 50, 24)
+        title:@"Stop" action:@selector(gimpsStopAssignment:)];
+    stopBtn.font = [NSFont boldSystemFontOfSize:10];
+    stopBtn.autoresizingMask = NSViewMinYMargin;
+    [cv addSubview:stopBtn];
+
+    NSButton *submitBtn = [self buttonAt:NSMakeRect(418, y - 24, 110, 24)
         title:@"Submit Results" action:@selector(gimpsSubmitResults:)];
     submitBtn.font = [NSFont systemFontOfSize:10];
     submitBtn.autoresizingMask = NSViewMinYMargin;
     [cv addSubview:submitBtn];
 
-    y -= 34;
+    y -= 30;
+
+    // Batch size option
+    NSTextField *batchLbl = [[NSTextField alloc] initWithFrame:NSMakeRect(14, y - 16, 80, 14)];
+    batchLbl.stringValue = @"Sieve batch:";
+    batchLbl.font = [NSFont systemFontOfSize:10];
+    batchLbl.bezeled = NO; batchLbl.editable = NO; batchLbl.drawsBackground = NO;
+    batchLbl.autoresizingMask = NSViewMinYMargin;
+    [cv addSubview:batchLbl];
+
+    NSPopUpButton *batchPopup = [[NSPopUpButton alloc] initWithFrame:NSMakeRect(94, y - 18, 140, 20) pullsDown:NO];
+    [batchPopup addItemWithTitle:@"10M (light)"];
+    [batchPopup addItemWithTitle:@"50M (medium)"];
+    [batchPopup addItemWithTitle:@"100M (default)"];
+    [batchPopup addItemWithTitle:@"500M (heavy)"];
+    [batchPopup addItemWithTitle:@"1B (max CPU)"];
+    batchPopup.font = [NSFont systemFontOfSize:10];
+    batchPopup.tag = 8030;
+    [batchPopup selectItemAtIndex:2]; // default 100M
+    batchPopup.autoresizingMask = NSViewMinYMargin;
+    [cv addSubview:batchPopup];
+
+    NSTextField *batchHint = [[NSTextField alloc] initWithFrame:NSMakeRect(240, y - 16, 280, 14)];
+    batchHint.stringValue = @"k-values per sieve pass. Higher = more CPU, faster progress.";
+    batchHint.font = [NSFont systemFontOfSize:9];
+    batchHint.textColor = [NSColor secondaryLabelColor];
+    batchHint.bezeled = NO; batchHint.editable = NO; batchHint.drawsBackground = NO;
+    batchHint.autoresizingMask = NSViewMinYMargin | NSViewWidthSizable;
+    [cv addSubview:batchHint];
+
+    y -= 26;
 
     // Separator
     NSBox *sep2 = [[NSBox alloc] initWithFrame:NSMakeRect(14, y, W - 28, 1)];
@@ -3404,6 +3440,21 @@ static const int EQ_HISTORY = 32; // number of vertical bars (time history)
         return;
     }
 
+    // Read batch size from GIMPS panel popup
+    NSWindow *win = [sender window];
+    if (win) {
+        NSPopUpButton *batchPopup = [win.contentView viewWithTag:8030];
+        if (batchPopup) {
+            uint64_t sizes[] = {10000000, 50000000, 100000000, 500000000, 1000000000};
+            int idx = (int)batchPopup.indexOfSelectedItem;
+            if (idx >= 0 && idx < 5) {
+                _taskMgr->mersenne_k_batch.store(sizes[idx]);
+                [self appendText:[NSString stringWithFormat:@"GIMPS: sieve batch = %lluM k-values\n",
+                    sizes[idx] / 1000000]];
+            }
+        }
+    }
+
     auto& assignment = _primenet->state().assignments.front();
     uint64_t exponent = assignment.exponent;
 
@@ -3416,14 +3467,32 @@ static const int EQ_HISTORY = 32; // number of vertical bars (time history)
             return;
         }
         it->second.end_pos = exponent;
-        it->second.current_pos = 1;  // start from k=1
+
+        // Calculate starting k for bit_lo: q = 2kp + 1 >= 2^bit_lo
+        // k >= (2^bit_lo - 1) / (2 * p)
+        // Use double for the 2^bit_lo calculation since bit_lo can be 76+
+        double q_min = pow(2.0, assignment.bit_lo);
+        uint64_t k_start = (uint64_t)(q_min / (2.0 * (double)exponent));
+        if (k_start < 1) k_start = 1;
+        it->second.current_pos = k_start;
 
         [self appendText:[NSString stringWithFormat:
-            @"GIMPS: starting M%llu TF from %d to %d bits (assignment %s)\n",
+            @"GIMPS: starting M%llu TF from %d to %d bits, k=%llu (assignment %s)\n",
             exponent, (int)assignment.bit_lo, (int)assignment.bit_hi,
-            assignment.key.c_str()]];
+            k_start, assignment.key.c_str()]];
 
         _taskMgr->start_task(prime::TaskType::MersenneTrial);
+    }
+}
+
+- (void)gimpsStopAssignment:(id)sender {
+    auto& tasks = _taskMgr->tasks();
+    auto it = tasks.find(prime::TaskType::MersenneTrial);
+    if (it != tasks.end() && it->second.status == prime::TaskStatus::Running) {
+        _taskMgr->pause_task(prime::TaskType::MersenneTrial);
+        [self appendText:@"GIMPS: Mersenne TF stopped.\n"];
+    } else {
+        [self appendText:@"GIMPS: Mersenne TF is not running.\n"];
     }
 }
 

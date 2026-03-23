@@ -5,6 +5,7 @@
 #include <iomanip>
 #include <deque>
 #include <pthread.h>
+#include <arm_neon.h>
 
 // GPU compute is accessed via the abstract GPUBackend interface (GPUBackend.hpp)
 // This allows swapping Metal (macOS), Vulkan (Windows), CUDA, or CPU fallback.
@@ -34,8 +35,10 @@ TaskManager::TaskManager(const std::string& data_dir) : _data_dir(data_dir) {
     _pool = std::make_unique<ThreadPool>();
     _matrix_sieve = std::make_unique<MatrixSieve>();
     _predictor = std::make_unique<PseudoprimePredictor>();
+    _balancer = std::make_unique<LoadBalancer>();
     log("Thread pool: " + std::to_string(_pool->size()) + " workers");
     log("Matrix sieve: pre-filter using primes {3,5,7,11,13,17,19,23,29,31}");
+    log("Load balancer: NEON saturation prediction active");
 }
 
 TaskManager::~TaskManager() { stop_all(); }
@@ -524,29 +527,25 @@ std::vector<uint64_t> TaskManager::segmented_sieve(uint64_t lo, uint64_t hi) {
     if (hi < lo) return {};
     uint64_t size = hi - lo + 1;
 
-    // Single working buffer — no redundant arrays
-    // MatrixSieve fills it directly, remaining sieve marks in-place
+    // ── CPU sieve (NEON tile pattern) ──────────────────────────────────
+    // Sieve always runs on CPU using pre-filled NEON pattern tile.
+    // GPU is reserved for the actual number-theoretic tests (Wieferich, etc.)
+    // or Mersenne fused kernel. Mixing sieve into GPU creates contention.
     std::vector<uint8_t> buf(size);
 
     if (_matrix_sieve && size <= UINT32_MAX) {
-        // NEON marker-stride fills buf: 1=candidate, 0=composite for primes {2..31}
         _matrix_sieve->sieve_block(lo, (uint32_t)size, buf.data());
     } else {
-        // Fallback: fill with 1, mark evens
         std::fill(buf.begin(), buf.end(), 1);
         uint32_t evStart = (lo % 2 == 0) ? 0 : 1;
         for (uint64_t j = evStart; j < size; j += 2) buf[j] = 0;
     }
 
-    // Remaining small primes (37+) — marker-stride sieve.
-    // Dense primes (p <= size): stride loop, marks many positions per prime.
-    // Sparse primes (p > size): at most one mark per prime, direct write.
     uint64_t sieve_start_prime = _matrix_sieve ? 37 : 3;
     uint8_t *buf_data = buf.data();
     const uint64_t *primes_data = _small_primes.data();
     size_t num_primes = _small_primes.size();
 
-    // Phase 1: sieve with pre-computed small primes (up to cap, typically 500M)
     for (size_t pi = 0; pi < num_primes; pi++) {
         uint64_t p = primes_data[pi];
         if (p < sieve_start_prime) continue;
@@ -554,7 +553,6 @@ std::vector<uint64_t> TaskManager::segmented_sieve(uint64_t lo, uint64_t hi) {
 
         uint64_t r = lo % p;
         uint64_t marker = (r == 0) ? 0 : (p - r);
-        // Don't mark the prime itself as composite
         if (lo + marker == p) marker += p;
 
         if (p <= size) {
@@ -568,29 +566,92 @@ std::vector<uint64_t> TaskManager::segmented_sieve(uint64_t lo, uint64_t hi) {
         }
     }
 
-    // Phase 2: if small_primes don't reach sqrt(hi), the sieve is incomplete.
-    // Survivors may include semiprimes (p*q where both > small_limit).
-    // Use deterministic Miller-Rabin to filter composites during collection.
     uint64_t sqrt_hi = (uint64_t)sqrt((double)hi) + 1;
     uint64_t small_limit = _small_primes.empty() ? 0 : _small_primes.back();
     bool need_mr_filter = (small_limit < sqrt_hi);
 
-    // Collect survivors — estimate capacity from prime density to avoid reallocs
     double ln_lo = (lo > 1) ? std::log((double)lo) : 1.0;
-    size_t est = (size_t)(1.15 * size / ln_lo);  // ~15% margin over pi(n) estimate
+    size_t est = (size_t)(1.15 * size / ln_lo);
     std::vector<uint64_t> result;
     result.reserve(est);
-    for (uint64_t i = 0; i < size; i++) {
+
+    // NEON-accelerated survivor extraction: scan 16 bytes at a time.
+    // Skip all-zero chunks (no survivors) without checking individual bytes.
+    uint64_t i = 0;
+    uint8x16_t vzero = vdupq_n_u8(0);
+    for (; i + 16 <= size; i += 16) {
+        uint8x16_t v = vld1q_u8(&buf_data[i]);
+        // Quick check: if entire 16-byte block is zero, skip it
+        uint8x16_t cmp = vceqq_u8(v, vzero);
+        // vmaxvq_u8 of cmp: if all equal zero, result is 0xFF; if any non-zero, <0xFF
+        // Actually: cmp has 0xFF where buf==0, 0x00 where buf!=0
+        // vminvq_u8(cmp): if all 0xFF (all zero), result=0xFF → skip
+        if (vminvq_u8(cmp) == 0xFF) continue; // entire block is composite
+
+        // At least one survivor — check individually
+        for (int k = 0; k < 16; k++) {
+            if (buf_data[i + k] && lo + i + k >= 2) {
+                uint64_t n = lo + i + k;
+                if (need_mr_filter && !prime::is_prime(n)) continue;
+                result.push_back(n);
+            }
+        }
+    }
+    // Scalar tail
+    for (; i < size; i++) {
         if (buf_data[i] && lo + i >= 2) {
             uint64_t n = lo + i;
-            // If sieve was incomplete (small primes < sqrt(hi)), verify with
-            // deterministic Miller-Rabin. For n < 3.317×10^24, bases {2,3,5,7,11,13,17,19,23,29,31,37}
-            // give a deterministic result (no pseudoprimes exist below this bound).
             if (need_mr_filter && !prime::is_prime(n)) continue;
             result.push_back(n);
         }
     }
     return result;
+}
+
+// ── GPU pacing ──────────────────────────────────────────────────────
+// Uses the NEON scheduling matrix to enforce adaptive pacing.
+// pace_gpu() checks saturation and sleeps if GPU is running hot.
+// finish_gpu() records dispatch completion for the rolling window.
+
+static int64_t now_us() {
+    return std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
+// pace_gpu: called BEFORE acquiring gpu_mutex.
+// Sleeps to enforce adaptive gap based on measured GPU saturation.
+// Stores dispatch start time in thread-local for finish_gpu().
+static thread_local int64_t tl_gpu_start_us = 0;
+
+void TaskManager::pace_gpu() {
+    // No sleep here — sleeping wastes CPU cycles. The advise() ratio
+    // controls how much work goes to GPU vs CPU. pace_gpu just marks
+    // the start time so finish_gpu can measure actual GPU busy time.
+    tl_gpu_start_us = now_us();
+}
+
+// finish_gpu: called AFTER releasing gpu_mutex.
+// Measures actual GPU busy time, feeds it to the scheduling matrix,
+// and signals the request pool that GPU has capacity for more work.
+void TaskManager::finish_gpu() {
+    int64_t end = now_us();
+    _last_gpu_dispatch_us.store(end, std::memory_order_relaxed);
+
+    int64_t busy = end - tl_gpu_start_us;
+    if (busy > 0) {
+        _balancer->record_gpu_busy(busy);
+    }
+
+    // Only signal GPU idle if it was actually idle (gap since last dispatch).
+    // Don't flood the pool with requests between rapid-fire dispatches.
+    if (busy > 0) {
+        int64_t gap = end - tl_gpu_start_us;
+        // Only post if GPU was idle for at least as long as it was busy
+        // (i.e. < 50% utilisation in this dispatch cycle)
+        if (gap > busy * 2) {
+            _balancer->gpu_idle();
+        }
+    }
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────
@@ -825,25 +886,13 @@ static std::vector<uint32_t> cpu_batch_test(const uint64_t *cands, uint32_t coun
     return hits;
 }
 
-// Adaptive CPU/GPU split: starts at 30% CPU, adjusts based on measured wall times
-// so both finish segments at roughly the same time.
+// Legacy AdaptiveSplit kept for backward compatibility (unused tasks)
 struct AdaptiveSplit {
     double cpu_ratio = 0.3;
-    double last_cpu_sec = 0;
-    double last_gpu_sec = 0;
-
     void update(double cpu_sec, double gpu_sec) {
-        last_cpu_sec = cpu_sec;
-        last_gpu_sec = gpu_sec;
         if (cpu_sec < 0.001 || gpu_sec < 0.001) return;
-        // If CPU finished faster, give it more work next time (and vice versa)
-        double total = cpu_sec + gpu_sec;
-        // Target: cpu_ratio such that cpu_count/cpu_rate == gpu_count/gpu_rate
-        // Approximate: adjust ratio toward gpu_sec/total (GPU took longer → give CPU more)
-        double target = gpu_sec / total;
-        // Smooth: move 20% toward target each iteration to avoid oscillation
+        double target = gpu_sec / (cpu_sec + gpu_sec);
         cpu_ratio = cpu_ratio * 0.8 + target * 0.2;
-        // Clamp to [0.05, 0.80] — always give both sides meaningful work
         if (cpu_ratio < 0.05) cpu_ratio = 0.05;
         if (cpu_ratio > 0.80) cpu_ratio = 0.80;
     }
@@ -861,7 +910,8 @@ void TaskManager::run_wieferich(SearchTask& task) {
     auto last_save = std::chrono::steady_clock::now();
     uint64_t summary_start = task.current_pos;
     uint64_t summary_tested = 0, summary_hits = 0;
-    AdaptiveSplit split;
+    uint64_t diag_gpu_sent = 0, diag_cpu_sent = 0;
+    double diag_gpu_sec = 0, diag_cpu_sec = 0;
 
     SievePipeline pipeline(this, task.current_pos, SEGMENT_SIZE, PREFETCH_DEPTH);
 
@@ -873,12 +923,9 @@ void TaskManager::run_wieferich(SearchTask& task) {
         return true;
     });
 
-    // GPU batch accumulator — at 10^15 density (~29K primes/1M seg), each
-    // segment only fills 11% of the 256K GPU batch. We accumulate across
-    // segments, dispatching when we have a meaningful batch OR after 2s
-    // to keep the GPU fed without long stalls.
-    static const uint32_t GPU_ACCUM_MIN = GPU_BATCH / 4;  // 64K min — still 2-3x old per-seg size
-    static const double GPU_FLUSH_SEC = 2.0;               // flush stale accumulator after 2s
+    // GPU batch accumulator
+    static const uint32_t GPU_ACCUM_MIN = GPU_BATCH / 4;
+    static const double GPU_FLUSH_SEC = 2.0;
 
     std::vector<uint64_t> gpu_accum;
     gpu_accum.reserve(GPU_BATCH + SEGMENT_SIZE);
@@ -909,8 +956,11 @@ void TaskManager::run_wieferich(SearchTask& task) {
             if (!task.should_run.load()) break;
             uint32_t n = (uint32_t)std::min((size_t)GPU_BATCH, gpu_accum.size() - off);
             if (tl_gpu_results.size() < n) tl_gpu_results.resize(n);
+
+            pace_gpu();
             { std::lock_guard<std::mutex> glock(_gpu_mutex);
               _gpu->wieferich_batch(gpu_accum.data() + off, tl_gpu_results.data(), n); }
+            finish_gpu();
             for (uint32_t i = 0; i < n; i++) {
                 if (tl_gpu_results[i]) {
                     uint64_t candidate = gpu_accum[off + i];
@@ -955,9 +1005,6 @@ void TaskManager::run_wieferich(SearchTask& task) {
             }
         }
         double gpu_sec = std::chrono::duration<double>(std::chrono::steady_clock::now() - gpu_t0).count();
-        log("GPU Wieferich done: " + std::to_string(gpu_sec * 1000.0) + "ms");
-        if (accum_cpu_sec > 0.001 || gpu_sec > 0.001)
-            split.update(accum_cpu_sec, gpu_sec);
         accum_cpu_sec = 0;
         gpu_accum.clear();
         last_gpu_flush = std::chrono::steady_clock::now();
@@ -970,41 +1017,57 @@ void TaskManager::run_wieferich(SearchTask& task) {
         auto primes = pipeline.next_segment();
 
         if (!primes.empty()) {
-            uint32_t total = (uint32_t)primes.size();
-            uint32_t cpu_count = (uint32_t)(total * split.cpu_ratio);
+            // ── Last-digit split: deterministic, zero-overhead 50/50 ──
+            // Primes >5 end in 1,3,7,9. Route by last digit:
+            //   GPU: ends in 1 or 3
+            //   CPU: ends in 7 or 9
+            // If GPU is reserved (Mersenne TF), everything goes to CPU.
+            bool gpu_ok = (gpu_owner.load() < 0);
 
-            // Accumulate GPU portion across segments (hard-capped to prevent OOM)
-            {
-                size_t gpu_count = primes.size() - cpu_count;
-                size_t room = (gpu_accum.size() < GPU_ACCUM_HARD_CAP)
-                              ? GPU_ACCUM_HARD_CAP - gpu_accum.size() : 0;
-                size_t to_add = std::min(gpu_count, room);
-                if (to_add > 0) {
-                    gpu_accum.insert(gpu_accum.end(),
-                                   primes.begin() + cpu_count,
-                                   primes.begin() + cpu_count + to_add);
+            std::vector<uint64_t> cpu_batch;
+            cpu_batch.reserve(primes.size() / 2 + 64);
+
+            for (auto p : primes) {
+                int d = (int)(p % 10);
+                if (gpu_ok && (d == 1 || d == 3)) {
+                    // GPU path — accumulate
+                    if (gpu_accum.size() < GPU_ACCUM_HARD_CAP)
+                        gpu_accum.push_back(p);
+                    else
+                        cpu_batch.push_back(p);  // overflow → CPU
+                } else {
+                    // CPU path
+                    cpu_batch.push_back(p);
                 }
             }
 
-            // Dispatch when accumulator is large enough OR stale (time-based flush)
+            diag_gpu_sent += primes.size() - cpu_batch.size();
+            diag_cpu_sent += cpu_batch.size();
+
+            // Dispatch GPU accumulator when full or stale
             double since_flush = std::chrono::duration<double>(
                 std::chrono::steady_clock::now() - last_gpu_flush).count();
             if (gpu_accum.size() >= GPU_ACCUM_HARD_CAP ||
                 gpu_accum.size() >= GPU_BATCH ||
                 (gpu_accum.size() >= GPU_ACCUM_MIN && since_flush >= GPU_FLUSH_SEC) ||
                 (!gpu_accum.empty() && since_flush >= GPU_FLUSH_SEC * 2)) {
+                auto gt0 = std::chrono::steady_clock::now();
                 flush_gpu_accum();
+                diag_gpu_sec += std::chrono::duration<double>(
+                    std::chrono::steady_clock::now() - gt0).count();
             }
 
-            // CPU processes its portion (run on worker thread, parallel_for uses pool)
+            // CPU processes its portion (parallel_for uses thread pool)
             auto cpu_t0 = std::chrono::steady_clock::now();
-            auto cpu_hits = cpu_batch_test(primes.data(), cpu_count,
+            auto cpu_hits = cpu_batch_test(cpu_batch.data(), (uint32_t)cpu_batch.size(),
                 cpu_wieferich_test, *_pool);
             double cpu_sec = std::chrono::duration<double>(std::chrono::steady_clock::now() - cpu_t0).count();
             accum_cpu_sec += cpu_sec;
+            diag_cpu_sec += cpu_sec;
+            _balancer->cpu_idle();
 
             for (auto idx : cpu_hits) {
-                uint64_t candidate = primes[idx];
+                uint64_t candidate = cpu_batch[idx];
                 if (_predictor->is_predicted(candidate)) {
                     log("PSEUDOPRIME FILTERED (CPU): " + std::to_string(candidate));
                     save_discovery({TaskType::Wieferich, candidate, 0,
@@ -1025,8 +1088,8 @@ void TaskManager::run_wieferich(SearchTask& task) {
                 log("*** WIEFERICH PRIME FOUND (CPU): " + std::to_string(candidate) + " ***");
             }
 
-            task.tested_count += total;
-            summary_tested += total;
+            task.tested_count += primes.size();
+            summary_tested += primes.size();
         }
 
         auto dt = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
@@ -1054,6 +1117,16 @@ void TaskManager::run_wieferich(SearchTask& task) {
         if (std::chrono::duration<double>(now - last_save).count() > SAVE_INTERVAL_SEC) {
             save_scan_summary(TaskType::Wieferich, summary_start, task.current_pos, summary_tested, summary_hits);
             save_state();
+            // ── DIAGNOSTIC: GPU/CPU split stats ──
+            float gpu_sat = _balancer->gpu_saturation();
+            log("[DIAG Wieferich] GPU=" + std::to_string(diag_gpu_sent) +
+                " CPU=" + std::to_string(diag_cpu_sent) +
+                " gpu_sec=" + std::to_string(diag_gpu_sec).substr(0,5) +
+                " cpu_sec=" + std::to_string(diag_cpu_sec).substr(0,5) +
+                " gpu_sat=" + std::to_string((int)(gpu_sat * 100)) + "%" +
+                " gpu_accum=" + std::to_string(gpu_accum.size()));
+            diag_gpu_sent = 0; diag_cpu_sent = 0;
+            diag_gpu_sec = 0; diag_cpu_sec = 0;
             last_save = now;
             summary_start = task.current_pos;
             summary_tested = 0;
@@ -1094,7 +1167,9 @@ void TaskManager::run_wallsunsun(SearchTask& task) {
     auto last_save = std::chrono::steady_clock::now();
     uint64_t summary_start = task.current_pos;
     uint64_t summary_tested = 0, summary_hits = 0;
-    AdaptiveSplit split;
+    uint64_t diag_gpu_sent = 0, diag_cpu_sent = 0;
+    double diag_gpu_sec = 0, diag_cpu_sec = 0;
+
 
     SievePipeline pipeline(this, task.current_pos, SEGMENT_SIZE, PREFETCH_DEPTH);
 
@@ -1135,8 +1210,10 @@ void TaskManager::run_wallsunsun(SearchTask& task) {
             if (!task.should_run.load()) break;
             uint32_t n = (uint32_t)std::min((size_t)GPU_BATCH, gpu_accum.size() - off);
             if (tl_gpu_results.size() < n) tl_gpu_results.resize(n);
+            pace_gpu();
             { std::lock_guard<std::mutex> glock(_gpu_mutex);
               _gpu->wallsunsun_batch(gpu_accum.data() + off, tl_gpu_results.data(), n); }
+            finish_gpu();
             for (uint32_t i = 0; i < n; i++) {
                 if (tl_gpu_results[i]) {
                     uint64_t candidate = gpu_accum[off + i];
@@ -1176,9 +1253,6 @@ void TaskManager::run_wallsunsun(SearchTask& task) {
                 }
             }
         }
-        double gpu_sec = std::chrono::duration<double>(std::chrono::steady_clock::now() - gpu_t0).count();
-        if (accum_cpu_sec > 0.001 || gpu_sec > 0.001)
-            split.update(accum_cpu_sec, gpu_sec);
         accum_cpu_sec = 0;
         gpu_accum.clear();
         last_gpu_flush = std::chrono::steady_clock::now();
@@ -1191,21 +1265,25 @@ void TaskManager::run_wallsunsun(SearchTask& task) {
         auto primes = pipeline.next_segment();
 
         if (!primes.empty()) {
-            uint32_t total = (uint32_t)primes.size();
-            uint32_t cpu_count = (uint32_t)(total * split.cpu_ratio);
+            // ── Last-digit split: 1,3 → GPU | 7,9 → CPU ──
+            bool gpu_ok = (gpu_owner.load() < 0);
+            std::vector<uint64_t> cpu_batch;
+            cpu_batch.reserve(primes.size() / 2 + 64);
 
-            // Accumulate GPU portion (hard-capped to prevent OOM)
-            {
-                size_t gpu_count = primes.size() - cpu_count;
-                size_t room = (gpu_accum.size() < GPU_ACCUM_HARD_CAP)
-                              ? GPU_ACCUM_HARD_CAP - gpu_accum.size() : 0;
-                size_t to_add = std::min(gpu_count, room);
-                if (to_add > 0) {
-                    gpu_accum.insert(gpu_accum.end(),
-                                   primes.begin() + cpu_count,
-                                   primes.begin() + cpu_count + to_add);
+            for (auto p : primes) {
+                int d = (int)(p % 10);
+                if (gpu_ok && (d == 1 || d == 3)) {
+                    if (gpu_accum.size() < GPU_ACCUM_HARD_CAP)
+                        gpu_accum.push_back(p);
+                    else
+                        cpu_batch.push_back(p);
+                } else {
+                    cpu_batch.push_back(p);
                 }
             }
+
+            diag_gpu_sent += primes.size() - cpu_batch.size();
+            diag_cpu_sent += cpu_batch.size();
 
             double since_flush = std::chrono::duration<double>(
                 std::chrono::steady_clock::now() - last_gpu_flush).count();
@@ -1213,18 +1291,22 @@ void TaskManager::run_wallsunsun(SearchTask& task) {
                 gpu_accum.size() >= GPU_BATCH ||
                 (gpu_accum.size() >= GPU_ACCUM_MIN_W && since_flush >= GPU_FLUSH_SEC_W) ||
                 (!gpu_accum.empty() && since_flush >= GPU_FLUSH_SEC_W * 2)) {
+                auto gt0 = std::chrono::steady_clock::now();
                 flush_gpu_accum();
+                diag_gpu_sec += std::chrono::duration<double>(
+                    std::chrono::steady_clock::now() - gt0).count();
             }
 
-            // CPU processes its portion (run on worker thread, parallel_for uses pool)
             auto cpu_t0 = std::chrono::steady_clock::now();
-            auto cpu_hits = cpu_batch_test(primes.data(), cpu_count,
+            auto cpu_hits = cpu_batch_test(cpu_batch.data(), (uint32_t)cpu_batch.size(),
                 cpu_wallsunsun_test, *_pool);
             double cpu_sec = std::chrono::duration<double>(std::chrono::steady_clock::now() - cpu_t0).count();
             accum_cpu_sec += cpu_sec;
+            diag_cpu_sec += cpu_sec;
+            _balancer->cpu_idle();
 
             for (auto idx : cpu_hits) {
-                uint64_t candidate = primes[idx];
+                uint64_t candidate = cpu_batch[idx];
                 if (_predictor->is_predicted(candidate)) {
                     log("PSEUDOPRIME FILTERED (CPU): " + std::to_string(candidate));
                     save_discovery({TaskType::WallSunSun, candidate, 0,
@@ -1245,8 +1327,8 @@ void TaskManager::run_wallsunsun(SearchTask& task) {
                 log("*** WALL-SUN-SUN PRIME FOUND (CPU): " + std::to_string(candidate) + " ***");
             }
 
-            task.tested_count += total;
-            summary_tested += total;
+            task.tested_count += primes.size();
+            summary_tested += primes.size();
         }
 
         auto dt = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
@@ -1273,6 +1355,15 @@ void TaskManager::run_wallsunsun(SearchTask& task) {
         if (std::chrono::duration<double>(now - last_save).count() > SAVE_INTERVAL_SEC) {
             save_scan_summary(TaskType::WallSunSun, summary_start, task.current_pos, summary_tested, summary_hits);
             save_state();
+            float gpu_sat = _balancer->gpu_saturation();
+            log("[DIAG WallSunSun] GPU=" + std::to_string(diag_gpu_sent) +
+                " CPU=" + std::to_string(diag_cpu_sent) +
+                " gpu_sec=" + std::to_string(diag_gpu_sec).substr(0,5) +
+                " cpu_sec=" + std::to_string(diag_cpu_sec).substr(0,5) +
+                " gpu_sat=" + std::to_string((int)(gpu_sat * 100)) + "%" +
+                " gpu_accum=" + std::to_string(gpu_accum.size()));
+            diag_gpu_sent = 0; diag_cpu_sent = 0;
+            diag_gpu_sec = 0; diag_cpu_sec = 0;
             last_save = now;
             summary_start = task.current_pos;
             summary_tested = 0;
@@ -1470,7 +1561,10 @@ void TaskManager::run_wilson(SearchTask& task) {
                     if (!task.should_run.load()) break;
                     uint32_t n = (uint32_t)std::min((size_t)GPU_BATCH, small_primes.size() - offset);
                     if (tl_gpu_results.size() < n) tl_gpu_results.resize(n);
-                    _gpu->wilson_batch(small_primes.data() + offset, tl_gpu_results.data(), n);
+                    pace_gpu();
+                    { std::lock_guard<std::mutex> glock(_gpu_mutex);
+                      _gpu->wilson_batch(small_primes.data() + offset, tl_gpu_results.data(), n); }
+                    finish_gpu();
                     for (uint32_t i = 0; i < n; i++) {
                         if (tl_gpu_results[i]) {
                             task.found_count++;
@@ -1491,8 +1585,12 @@ void TaskManager::run_wilson(SearchTask& task) {
             auto test_wilson_segmented = [&](uint64_t p) -> bool {
                 uint32_t num_seg = wilson_segments_for(p);
                 std::vector<uint64_t> partial_lo(num_seg), partial_hi(num_seg);
-                int rc = _gpu->wilson_segmented(p, num_seg,
-                    partial_lo.data(), partial_hi.data());
+                pace_gpu();
+                int rc;
+                { std::lock_guard<std::mutex> glock(_gpu_mutex);
+                  rc = _gpu->wilson_segmented(p, num_seg,
+                    partial_lo.data(), partial_hi.data()); }
+                finish_gpu();
                 if (rc < 0) {
                     // CPU fallback
                     unsigned __int128 p_sq = (unsigned __int128)p * p;
@@ -1731,7 +1829,7 @@ static void run_sophie_search(TaskManager* mgr, SearchTask& task, GPUBackend* gp
     auto last_save = std::chrono::steady_clock::now();
     uint64_t summary_start = task.current_pos;
     uint64_t summary_tested = 0, summary_hits = 0;
-    AdaptiveSplit split;
+
 
     SievePipeline pipeline(mgr, task.current_pos, SEGMENT_SIZE, PREFETCH_DEPTH);
 
@@ -1752,19 +1850,18 @@ static void run_sophie_search(TaskManager* mgr, SearchTask& task, GPUBackend* gp
             if (!task.should_run.load()) break;
             uint32_t n = (uint32_t)std::min((size_t)GPU_BATCH, gpu_accum.size() - off);
             if (tl_gpu_results.size() < n) tl_gpu_results.resize(n);
+            mgr->pace_gpu();
             { std::lock_guard<std::mutex> glock(mgr->gpu_mutex());
               gpu->sophie_batch(gpu_accum.data() + off, tl_gpu_results.data(), n); }
+            mgr->finish_gpu();
             for (uint32_t i = 0; i < n; i++) {
                 if (tl_gpu_results[i]) {
                     gpu_hits++;
                 }
             }
         }
-        double gpu_sec = std::chrono::duration<double>(std::chrono::steady_clock::now() - gpu_t0).count();
         task.found_count += gpu_hits;
         summary_hits += gpu_hits;
-        if (accum_cpu_sec > 0.001 || gpu_sec > 0.001)
-            split.update(accum_cpu_sec, gpu_sec);
         accum_cpu_sec = 0;
         gpu_accum.clear();
         last_gpu_flush = std::chrono::steady_clock::now();
@@ -1776,19 +1873,20 @@ static void run_sophie_search(TaskManager* mgr, SearchTask& task, GPUBackend* gp
 
         auto primes_in_seg = pipeline.next_segment();
         if (!primes_in_seg.empty()) {
-            uint32_t total = (uint32_t)primes_in_seg.size();
-            uint32_t cpu_count = (uint32_t)(total * split.cpu_ratio);
+            // ── Last-digit split: 1,3 → GPU | 7,9 → CPU ──
+            bool gpu_ok = (mgr->gpu_owner.load() < 0) && gpu;
+            std::vector<uint64_t> cpu_batch;
+            cpu_batch.reserve(primes_in_seg.size() / 2 + 64);
 
-            // Accumulate GPU portion (hard-capped to prevent OOM)
-            {
-                size_t gpu_count = primes_in_seg.size() - cpu_count;
-                size_t room = (gpu_accum.size() < GPU_ACCUM_HARD_CAP)
-                              ? GPU_ACCUM_HARD_CAP - gpu_accum.size() : 0;
-                size_t to_add = std::min(gpu_count, room);
-                if (to_add > 0) {
-                    gpu_accum.insert(gpu_accum.end(),
-                                   primes_in_seg.begin() + cpu_count,
-                                   primes_in_seg.begin() + cpu_count + to_add);
+            for (auto p : primes_in_seg) {
+                int d = (int)(p % 10);
+                if (gpu_ok && (d == 1 || d == 3)) {
+                    if (gpu_accum.size() < GPU_ACCUM_HARD_CAP)
+                        gpu_accum.push_back(p);
+                    else
+                        cpu_batch.push_back(p);
+                } else {
+                    cpu_batch.push_back(p);
                 }
             }
 
@@ -1801,17 +1899,18 @@ static void run_sophie_search(TaskManager* mgr, SearchTask& task, GPUBackend* gp
                 flush_gpu_accum();
             }
 
-            // CPU processes its portion (run on worker thread, parallel_for uses pool)
+            // CPU processes its portion
             auto cpu_t0 = std::chrono::steady_clock::now();
-            auto cpu_hits = cpu_batch_test(primes_in_seg.data(), cpu_count,
+            auto cpu_hits = cpu_batch_test(cpu_batch.data(), (uint32_t)cpu_batch.size(),
                 cpu_sophie_test, mgr->pool());
             double cpu_sec = std::chrono::duration<double>(std::chrono::steady_clock::now() - cpu_t0).count();
             accum_cpu_sec += cpu_sec;
+            mgr->balancer()->cpu_idle();
 
             task.found_count += cpu_hits.size();
             summary_hits += cpu_hits.size();
-            task.tested_count += total;
-            summary_tested += total;
+            task.tested_count += primes_in_seg.size();
+            summary_tested += primes_in_seg.size();
         }
 
         auto dt = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
@@ -2049,50 +2148,74 @@ static void pack_candidate(uint64_t q_lo64, uint32_t q_hi32,
 }
 
 // Sieve candidates for Mersenne trial factoring of 2^p - 1.
-// Candidates: q = 2kp + 1 where q ≡ 1 or 7 (mod 8) and q not divisible by small primes.
+// Candidates: q = 2kp + 1 where q = 1 or 7 (mod 8) and q not divisible by small primes.
+// Parallelized across CPU cores for throughput.
 static std::vector<uint32_t> sieve_mersenne_candidates(
     uint64_t p, uint64_t k_start, uint64_t k_count,
     uint64_t &k_end_out)
 {
-    // Small primes for sieving
     static const uint64_t SIEVE_PRIMES[] = {
         3,5,7,11,13,17,19,23,29,31,37,41,43,47,53,59,61,67,71,73,79,83,89,97
     };
 
-    std::vector<uint32_t> packed;
-    packed.reserve(k_count / 4 * 6);  // rough estimate: ~25% survive sieve
-
     uint64_t k_end = k_start + k_count;
     k_end_out = k_end;
 
-    for (uint64_t k = k_start; k < k_end; k++) {
-        // q = 2kp + 1
-        unsigned __int128 q128 = (unsigned __int128)2 * k * p + 1;
+    // Split work across threads
+    unsigned nthreads = std::thread::hardware_concurrency();
+    if (nthreads < 1) nthreads = 4;
+    if (nthreads > 16) nthreads = 16;
 
-        // Skip if q > 96 bits (our arithmetic limit)
-        if (q128 >> 96) continue;
+    // Each thread sieves its own chunk and produces a local packed vector
+    std::vector<std::vector<uint32_t>> thread_results(nthreads);
+    std::vector<std::thread> threads;
 
-        uint64_t q_lo = (uint64_t)q128;
-        uint32_t q_hi = (uint32_t)(q128 >> 64);
+    uint64_t chunk = k_count / nthreads;
 
-        // q must be ≡ 1 or 7 (mod 8)
-        uint32_t mod8 = q_lo & 7;
-        if (mod8 != 1 && mod8 != 7) continue;
+    for (unsigned t = 0; t < nthreads; t++) {
+        uint64_t my_start = k_start + t * chunk;
+        uint64_t my_end = (t == nthreads - 1) ? k_end : my_start + chunk;
 
-        // Sieve by small primes
-        bool rejected = false;
-        for (uint64_t sp : SIEVE_PRIMES) {
-            if (q128 % sp == 0) {
-                // q itself might equal sp (if q is small), in which case it IS prime
-                if (q128 != sp) { rejected = true; break; }
+        threads.emplace_back([&, t, my_start, my_end, p]() {
+            auto& local = thread_results[t];
+            local.reserve((my_end - my_start) / 6 * 6);
+
+            for (uint64_t k = my_start; k < my_end; k++) {
+                unsigned __int128 q128 = (unsigned __int128)2 * k * p + 1;
+
+                if (q128 >> 96) continue;
+
+                uint64_t q_lo = (uint64_t)q128;
+                uint32_t q_hi = (uint32_t)(q128 >> 64);
+
+                uint32_t mod8 = q_lo & 7;
+                if (mod8 != 1 && mod8 != 7) continue;
+
+                bool rejected = false;
+                for (uint64_t sp : SIEVE_PRIMES) {
+                    if (q128 % sp == 0) {
+                        if (q128 != sp) { rejected = true; break; }
+                    }
+                }
+                if (rejected) continue;
+
+                size_t idx = local.size();
+                local.resize(idx + 6);
+                pack_candidate(q_lo, q_hi, local.data() + idx);
             }
-        }
-        if (rejected) continue;
+        });
+    }
 
-        // Pack q + Barrett constant
-        size_t idx = packed.size();
-        packed.resize(idx + 6);
-        pack_candidate(q_lo, q_hi, packed.data() + idx);
+    for (auto& th : threads) th.join();
+
+    // Merge results
+    size_t total = 0;
+    for (auto& v : thread_results) total += v.size();
+
+    std::vector<uint32_t> packed;
+    packed.reserve(total);
+    for (auto& v : thread_results) {
+        packed.insert(packed.end(), v.begin(), v.end());
     }
 
     return packed;
@@ -2115,46 +2238,70 @@ void TaskManager::run_mersenne_trial(SearchTask& task) {
     log("Mersenne TF: testing 2^" + std::to_string(exponent) +
         " - 1 for factors q = 2kp+1, starting at k=" + std::to_string(task.current_pos));
 
-    static constexpr uint64_t K_BATCH = 1000000;  // sieve 1M k-values at a time
-    static constexpr uint32_t GPU_BATCH_SIZE = 65536;
+    const uint64_t K_BATCH = mersenne_k_batch.load();  // configurable from GIMPS panel
+    static constexpr uint32_t GPU_BATCH_SIZE = 262144;  // 256K per GPU dispatch
 
     auto last_save = std::chrono::steady_clock::now();
     uint64_t summary_start = task.current_pos;
     uint64_t summary_tested = 0, summary_hits = 0;
 
+    // Try fused GPU path (sieve+test entirely on GPU)
+    bool use_fused = false;
+    {
+        std::lock_guard<std::mutex> lock(_gpu_mutex);
+        // Test with a trivial call — if it returns empty but doesn't fail, backend supports it
+        // CPUBackend returns {} (default), MetalBackend returns actual results
+        // We detect support by checking if the backend is not CPUBackend
+        use_fused = (_gpu && _gpu->name() != "CPU (fallback)");
+    }
+
+    if (use_fused) {
+        log("Mersenne TF: using fused GPU sieve+test (entire pipeline on Metal)");
+        log("Mersenne TF: GPU exclusive mode — other tasks will use CPU only");
+        gpu_owner.store((int)TaskType::MersenneTrial);
+    }
+
     while (task.should_run.load()) {
         throttle_if_needed(this);
         auto t0 = std::chrono::steady_clock::now();
 
-        // Sieve a batch of k-values on CPU
-        uint64_t k_end;
-        auto packed = sieve_mersenne_candidates(exponent, task.current_pos, K_BATCH, k_end);
-        uint32_t n_candidates = (uint32_t)(packed.size() / 6);
+        if (use_fused) {
+            // ── Fused GPU path: sieve + Barrett + modexp all on GPU ──
+            // Dispatch in GPU_FUSED_CHUNK-sized pieces, releasing the mutex between
+            // chunks so other tasks can interleave their GPU work.
+            uint64_t k_pos = task.current_pos;
+            uint64_t k_end = k_pos + K_BATCH;
 
-        if (n_candidates > 0) {
-            // Dispatch to GPU in sub-batches
-            std::vector<uint8_t> results(n_candidates);
-            for (uint32_t offset = 0; offset < n_candidates; offset += GPU_BATCH_SIZE) {
-                if (!task.should_run.load()) break;
-                uint32_t batch = std::min(GPU_BATCH_SIZE, n_candidates - offset);
+            while (k_pos < k_end && task.should_run.load()) {
+                // Adaptive chunk: shrink when GPU is hot to leave breathing room
+                float sat = _balancer->gpu_saturation();
+                uint64_t GPU_FUSED_CHUNK;
+                if (sat > 0.70f)      GPU_FUSED_CHUNK = 1ULL << 20;  // 1M — hot
+                else if (sat > 0.55f) GPU_FUSED_CHUNK = 1ULL << 22;  // 4M — warm
+                else                  GPU_FUSED_CHUNK = 1ULL << 24;  // 16M — cool
 
-                std::lock_guard<std::mutex> lock(_gpu_mutex);
-                _gpu->mersenne_trial_batch(packed.data() + offset * 6,
-                                           results.data() + offset, batch, exponent);
-            }
+                uint64_t chunk = std::min(GPU_FUSED_CHUNK, k_end - k_pos);
+                std::vector<GPUBackend::FusedHit> hits;
+                pace_gpu();
+                {
+                    std::lock_guard<std::mutex> lock(_gpu_mutex);
+                    hits = _gpu->mersenne_fused_sieve(exponent, k_pos, chunk);
+                }
+                finish_gpu();
 
-            // Check for hits
-            for (uint32_t i = 0; i < n_candidates; i++) {
-                if (results[i]) {
-                    // Reconstruct q from packed data
-                    uint64_t q_lo = packed[i*6] | ((uint64_t)packed[i*6+1] << 32);
-                    uint32_t q_hi = packed[i*6+2];
-                    uint64_t q_val = (q_hi == 0) ? q_lo : q_lo;  // for display
-                    // If q > 64 bits, need special handling for display
+                // Yield between GPU dispatches so CPU tasks get scheduled
+                if (sat > 0.55f) {
+                    std::this_thread::yield();
+                }
+
+                for (auto& fh : hits) {
+                    uint64_t q_lo = fh.q_lo;
+                    uint64_t q_hi_and_k = fh.q_hi_and_k;
+                    uint32_t q_hi = (uint32_t)(q_hi_and_k & 0xFFFFFFFF);
+                    uint64_t q_val = q_lo;
                     std::string q_str = std::to_string(q_val);
                     if (q_hi > 0) {
                         unsigned __int128 q128 = ((unsigned __int128)q_hi << 64) | q_lo;
-                        // Convert 128-bit to string
                         char buf[40];
                         unsigned __int128 tmp = q128;
                         int pos = 39;
@@ -2170,13 +2317,64 @@ void TaskManager::run_mersenne_trial(SearchTask& task) {
                     save_discovery({TaskType::MersenneTrial, q_val, exponent,
                         PrimeClass::Composite, task.current_pos, q_str, timestamp()});
                 }
+
+                task.tested_count += chunk;
+                summary_tested += chunk;
+                k_pos += chunk;
             }
 
-            task.tested_count += n_candidates;
-            summary_tested += n_candidates;
-        }
+            task.current_pos = k_end;
 
-        task.current_pos = k_end;
+        } else {
+            // ── Legacy path: CPU sieve → GPU test ──
+            uint64_t k_end;
+            auto packed = sieve_mersenne_candidates(exponent, task.current_pos, K_BATCH, k_end);
+            uint32_t n_candidates = (uint32_t)(packed.size() / 6);
+
+            if (n_candidates > 0) {
+                std::vector<uint8_t> results(n_candidates);
+                for (uint32_t offset = 0; offset < n_candidates; offset += GPU_BATCH_SIZE) {
+                    if (!task.should_run.load()) break;
+                    uint32_t batch = std::min(GPU_BATCH_SIZE, n_candidates - offset);
+
+                    pace_gpu();
+                    { std::lock_guard<std::mutex> lock(_gpu_mutex);
+                      _gpu->mersenne_trial_batch(packed.data() + offset * 6,
+                                                 results.data() + offset, batch, exponent); }
+                    finish_gpu();
+                }
+
+                for (uint32_t i = 0; i < n_candidates; i++) {
+                    if (results[i]) {
+                        uint64_t q_lo = packed[i*6] | ((uint64_t)packed[i*6+1] << 32);
+                        uint32_t q_hi = packed[i*6+2];
+                        uint64_t q_val = (q_hi == 0) ? q_lo : q_lo;
+                        std::string q_str = std::to_string(q_val);
+                        if (q_hi > 0) {
+                            unsigned __int128 q128 = ((unsigned __int128)q_hi << 64) | q_lo;
+                            char buf[40];
+                            unsigned __int128 tmp = q128;
+                            int pos = 39;
+                            buf[pos] = 0;
+                            while (tmp > 0) { buf[--pos] = '0' + (int)(tmp % 10); tmp /= 10; }
+                            q_str = &buf[pos];
+                        }
+
+                        task.found_count++;
+                        summary_hits++;
+                        log("*** MERSENNE FACTOR FOUND: 2^" + std::to_string(exponent) +
+                            " - 1 has factor " + q_str + " ***");
+                        save_discovery({TaskType::MersenneTrial, q_val, exponent,
+                            PrimeClass::Composite, task.current_pos, q_str, timestamp()});
+                    }
+                }
+
+                task.tested_count += n_candidates;
+                summary_tested += n_candidates;
+            }
+
+            task.current_pos = k_end;
+        }
 
         auto dt = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
         task.rate = dt > 0 ? K_BATCH / dt : 0;
@@ -2193,6 +2391,7 @@ void TaskManager::run_mersenne_trial(SearchTask& task) {
         }
     }
 
+    gpu_owner.store(-1);
     if (summary_tested > 0)
         save_scan_summary(TaskType::MersenneTrial, summary_start, task.current_pos,
                           summary_tested, summary_hits);
@@ -2291,9 +2490,11 @@ void TaskManager::run_fermat_factor(SearchTask& task) {
                 if (!task.should_run.load()) break;
                 uint32_t batch = std::min(GPU_BATCH_SIZE, n_candidates - offset);
 
-                std::lock_guard<std::mutex> lock(_gpu_mutex);
-                _gpu->fermat_factor_batch(packed.data() + offset * 6,
-                                          results.data() + offset, batch, m);
+                pace_gpu();
+                { std::lock_guard<std::mutex> lock(_gpu_mutex);
+                  _gpu->fermat_factor_batch(packed.data() + offset * 6,
+                                            results.data() + offset, batch, m); }
+                finish_gpu();
             }
 
             for (uint32_t i = 0; i < n_candidates; i++) {

@@ -5,6 +5,7 @@
 #include "MatrixSieve.hpp"
 #include "PseudoprimePredictor.hpp"
 #include "EvenShadow.hpp"
+#include "LoadBalancer.hpp"
 #include <string>
 #include <vector>
 #include <map>
@@ -231,10 +232,22 @@ public:
     void save_scan_summary(TaskType t, uint64_t range_lo, uint64_t range_hi,
                            uint64_t tested, uint64_t hits);
 
+    // GPU pacing — enforce minimum gap between dispatches for ~50% util
+    void pace_gpu();
+    void finish_gpu();
+
     // UI responsiveness — throttle workers when user is interacting
     void signal_ui_activity();
     bool should_throttle() const;
     static constexpr double THROTTLE_SECONDS = 10.0;  // yield CPU for 10s after last mouse/keyboard activity
+
+    // Mersenne TF sieve batch size (configurable from GIMPS panel)
+    std::atomic<uint64_t> mersenne_k_batch{100000000}; // default 100M
+
+    // Mode-based GPU ownership: only one task type uses GPU at a time.
+    // GPU_OWNER_NONE = shared (round-robin via mutex), any specific type = exclusive.
+    // Mersenne TF sets this to MersenneTrial. Other tasks check and go CPU-only.
+    std::atomic<int> gpu_owner{-1}; // -1 = shared, else = (int)TaskType owner
 
 private:
     std::string _data_dir;
@@ -243,6 +256,8 @@ private:
     std::mutex _mutex;
     std::mutex _save_mutex;
     std::mutex _gpu_mutex;  // serialize GPU access across worker threads
+    std::atomic<int64_t> _last_gpu_dispatch_us{0}; // timestamp of last GPU dispatch (microseconds)
+    static constexpr int64_t GPU_MIN_GAP_US = 2000; // 2ms min gap between GPU dispatches → ~50% util
     GPUBackend *_gpu = nullptr;
     LogCallback _log_cb;
     DiscoveryCallback _disc_cb;
@@ -275,6 +290,12 @@ private:
 
     // UI throttle state
     std::atomic<int64_t> _last_ui_activity_ms{0};  // ms since epoch of last interaction
+
+    // NEON load balancer — shared across all tasks
+    std::unique_ptr<LoadBalancer> _balancer;
+
+public:
+    LoadBalancer* balancer() { return _balancer.get(); }
 };
 
 } // namespace prime

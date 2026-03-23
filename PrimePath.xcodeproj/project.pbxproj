@@ -26,6 +26,7 @@
 		AA00002200000022 /* ConductorServer.mm in Sources */ = {isa = PBXBuildFile; fileRef = BB00003200000032 /* ConductorServer.mm */; };
 		AA00002300000023 /* TCPSocket.cpp in Sources */ = {isa = PBXBuildFile; fileRef = BB00003300000033 /* TCPSocket.cpp */; };
 		AA00002400000024 /* PrimeNetClient.mm in Sources */ = {isa = PBXBuildFile; fileRef = BB00003A0000003A /* PrimeNetClient.mm */; };
+		AA00002500000025 /* LoadBalancer.cpp in Sources */ = {isa = PBXBuildFile; fileRef = BB00003C0000003C /* LoadBalancer.cpp */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
@@ -68,6 +69,8 @@
 		BB00003900000039 /* WorkSplitter.hpp */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.h; path = WorkSplitter.hpp; sourceTree = "<group>"; };
 		BB00003A0000003A /* PrimeNetClient.mm */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.objcpp; path = PrimeNetClient.mm; sourceTree = "<group>"; };
 		BB00003B0000003B /* PrimeNetClient.hpp */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.h; path = PrimeNetClient.hpp; sourceTree = "<group>"; };
+		BB00003C0000003C /* LoadBalancer.cpp */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.cpp; path = LoadBalancer.cpp; sourceTree = "<group>"; };
+		BB00003D0000003D /* LoadBalancer.hpp */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.h; path = LoadBalancer.hpp; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -116,6 +119,8 @@
 				BB00001900000019 /* KnownPrimes.hpp */,
 				BB0000200000001A /* PseudoprimePredictor.hpp */,
 				BB0000210000001B /* EvenShadow.hpp */,
+				BB00003D0000003D /* LoadBalancer.hpp */,
+				BB00003C0000003C /* LoadBalancer.cpp */,
 				BB0000230000001D /* Benchmark.hpp */,
 				BB0000220000001C /* Benchmark.cpp */,
 				DD00000500000005 /* Network */,
@@ -228,6 +233,7 @@
 				AA00002200000022 /* ConductorServer.mm in Sources */,
 				AA00002300000023 /* TCPSocket.cpp in Sources */,
 				AA00002400000024 /* PrimeNetClient.mm in Sources */,
+				AA00002500000025 /* LoadBalancer.cpp in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
