@@ -69,6 +69,18 @@ A configurable pipeline builder window lets you construct custom search and anal
 
 Each stage shows estimated cost (ms per 1M candidates) and rejection percentage. Stages can be reordered and enabled/disabled individually. The stage list is scrollable to accommodate all available stages.
 
+### GIMPS Integration
+
+PrimePath connects directly to [mersenne.org](https://www.mersenne.org) (GIMPS -- Great Internet Mersenne Prime Search) via the PrimeNet v5 API. From the GIMPS panel you can:
+
+- **Register** your machine with your mersenne.org account
+- **Get work** -- fetch trial factoring assignments from the server
+- **Run assignments** -- automatically configure the Metal GPU Mersenne TF engine for the assigned exponent and bit range
+- **Submit results** -- report factors found (or no-factor) back to mersenne.org
+- **Local results file** -- all results are also written to `results.json.txt` in mfaktc-compatible JSON format
+
+This makes PrimePath the first Metal GPU client that can contribute to GIMPS trial factoring.
+
 ### Distributed Search (Needs Testing)
 
 PrimePath includes distributed search capabilities that allow splitting large search ranges across multiple machines. This feature is implemented but **needs further testing** before it can be considered production-ready. If you have access to multiple Apple Silicon machines and want to help test distributed search, please open an issue or reach out.

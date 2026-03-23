@@ -25,6 +25,7 @@
 		AA00002100000021 /* CarriageClient.mm in Sources */ = {isa = PBXBuildFile; fileRef = BB00003100000031 /* CarriageClient.mm */; };
 		AA00002200000022 /* ConductorServer.mm in Sources */ = {isa = PBXBuildFile; fileRef = BB00003200000032 /* ConductorServer.mm */; };
 		AA00002300000023 /* TCPSocket.cpp in Sources */ = {isa = PBXBuildFile; fileRef = BB00003300000033 /* TCPSocket.cpp */; };
+		AA00002400000024 /* PrimeNetClient.mm in Sources */ = {isa = PBXBuildFile; fileRef = BB00003A0000003A /* PrimeNetClient.mm */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
@@ -65,6 +66,8 @@
 		BB00003700000037 /* NetworkProtocol.hpp */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.h; path = NetworkProtocol.hpp; sourceTree = "<group>"; };
 		BB00003800000038 /* TCPSocket.hpp */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.h; path = TCPSocket.hpp; sourceTree = "<group>"; };
 		BB00003900000039 /* WorkSplitter.hpp */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.h; path = WorkSplitter.hpp; sourceTree = "<group>"; };
+		BB00003A0000003A /* PrimeNetClient.mm */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.objcpp; path = PrimeNetClient.mm; sourceTree = "<group>"; };
+		BB00003B0000003B /* PrimeNetClient.hpp */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.h; path = PrimeNetClient.hpp; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -152,6 +155,8 @@
 				BB00003800000038 /* TCPSocket.hpp */,
 				BB00003300000033 /* TCPSocket.cpp */,
 				BB00003900000039 /* WorkSplitter.hpp */,
+				BB00003B0000003B /* PrimeNetClient.hpp */,
+				BB00003A0000003A /* PrimeNetClient.mm */,
 			);
 			path = Network;
 			sourceTree = "<group>";
@@ -222,6 +227,7 @@
 				AA00002100000021 /* CarriageClient.mm in Sources */,
 				AA00002200000022 /* ConductorServer.mm in Sources */,
 				AA00002300000023 /* TCPSocket.cpp in Sources */,
+				AA00002400000024 /* PrimeNetClient.mm in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};

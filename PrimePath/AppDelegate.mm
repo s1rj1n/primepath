@@ -14,6 +14,7 @@
 #include <future>
 #include "Network/ConductorServer.hpp"
 #include "Network/CarriageClient.hpp"
+#include "Network/PrimeNetClient.hpp"
 #include "DataTools.hpp"
 
 static NSString *const DATA_DIR = @"/Users/sergeinester/Documents/primes/primelocations";
@@ -183,6 +184,8 @@ static const int EQ_HISTORY = 32; // number of vertical bars (time history)
     // Distributed computing
     prime::ConductorServer *_conductor;
     prime::CarriageClient  *_carriage;
+    // GIMPS / PrimeNet integration
+    primenet::PrimeNetClient *_primenet;
     // Test catalog
     std::vector<TestCatalogEntry> _testCatalog;
     std::vector<size_t> _testDisplayOrder;  // indices into _testCatalog (flat, with category headers as SIZE_MAX)
@@ -310,6 +313,18 @@ static const int EQ_HISTORY = 32; // number of vertical bars (time history)
     // Load saved state (restores positions from previous session)
     _taskMgr->load_state();
     _taskMgr->save_state();
+
+    // Init GIMPS / PrimeNet client
+    _primenet = new primenet::PrimeNetClient(
+        std::string(DATA_DIR.UTF8String),
+        [weakSelf](const std::string& msg) {
+            NSString *s = [NSString stringWithFormat:@"%@\n",
+                [NSString stringWithUTF8String:msg.c_str()]];
+            dispatch_async(dispatch_get_main_queue(), ^{
+                [weakSelf appendText:s];
+            });
+        });
+    _primenet->set_username("s1rj1n");
 
     [self loadTestCatalog];
     [self buildUI];
@@ -658,7 +673,13 @@ static const int EQ_HISTORY = 32; // number of vertical bars (time history)
     pipelineBtn.autoresizingMask = NSViewMinYMargin;
     [cv addSubview:pipelineBtn];
 
-    self.checkAtDiscoveryButton = [[NSButton alloc] initWithFrame:NSMakeRect(M + 496, y - 22, 150, 18)];
+    NSButton *gimpsBtn = [self buttonAt:NSMakeRect(M + 496, y - 22, 56, 22)
+        title:@"GIMPS" action:@selector(showGIMPSPanel:)];
+    gimpsBtn.font = [NSFont boldSystemFontOfSize:10];
+    gimpsBtn.autoresizingMask = NSViewMinYMargin;
+    [cv addSubview:gimpsBtn];
+
+    self.checkAtDiscoveryButton = [[NSButton alloc] initWithFrame:NSMakeRect(M + 558, y - 22, 150, 18)];
     self.checkAtDiscoveryButton.buttonType = NSButtonTypeSwitch;
     self.checkAtDiscoveryButton.title = @"CheckAtDiscovery";
     self.checkAtDiscoveryButton.font = [NSFont systemFontOfSize:9];
@@ -3136,6 +3157,324 @@ static const int EQ_HISTORY = 32; // number of vertical bars (time history)
     b.title = title; b.bezelStyle = NSBezelStyleRounded;
     b.target = self; b.action = action;
     return b;
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// GIMPS / PrimeNet Panel
+// ═══════════════════════════════════════════════════════════════════════
+
+- (void)showGIMPSPanel:(id)sender {
+    NSWindow *win = [[NSWindow alloc]
+        initWithContentRect:NSMakeRect(200, 200, 560, 480)
+        styleMask:(NSWindowStyleMaskTitled | NSWindowStyleMaskClosable | NSWindowStyleMaskResizable)
+        backing:NSBackingStoreBuffered defer:NO];
+    win.title = @"GIMPS / PrimeNet Integration";
+    win.releasedWhenClosed = NO;
+    win.minSize = NSMakeSize(480, 400);
+
+    NSView *cv = win.contentView;
+    CGFloat W = cv.frame.size.width;
+    CGFloat y = cv.frame.size.height - 14;
+
+    // Title
+    NSTextField *title = [[NSTextField alloc] initWithFrame:NSMakeRect(14, y - 20, 400, 18)];
+    title.stringValue = @"GIMPS -- Great Internet Mersenne Prime Search";
+    title.font = [NSFont boldSystemFontOfSize:13];
+    title.bezeled = NO; title.editable = NO; title.drawsBackground = NO;
+    title.autoresizingMask = NSViewMinYMargin;
+    [cv addSubview:title];
+    y -= 28;
+
+    NSTextField *desc = [[NSTextField alloc] initWithFrame:NSMakeRect(14, y - 28, W - 28, 28)];
+    desc.stringValue = @"Connect to mersenne.org to get trial factoring assignments and report results.\nPrimePath uses Metal GPU for 96-bit Barrett modular exponentiation.";
+    desc.font = [NSFont systemFontOfSize:10];
+    desc.textColor = [NSColor secondaryLabelColor];
+    desc.bezeled = NO; desc.editable = NO; desc.drawsBackground = NO;
+    desc.maximumNumberOfLines = 0;
+    desc.autoresizingMask = NSViewMinYMargin | NSViewWidthSizable;
+    [cv addSubview:desc];
+    y -= 36;
+
+    // Separator
+    NSBox *sep = [[NSBox alloc] initWithFrame:NSMakeRect(14, y, W - 28, 1)];
+    sep.boxType = NSBoxSeparator;
+    sep.autoresizingMask = NSViewMinYMargin | NSViewWidthSizable;
+    [cv addSubview:sep];
+    y -= 12;
+
+    // Username field
+    NSTextField *userLbl = [[NSTextField alloc] initWithFrame:NSMakeRect(14, y - 16, 80, 14)];
+    userLbl.stringValue = @"Username:";
+    userLbl.font = [NSFont systemFontOfSize:10];
+    userLbl.bezeled = NO; userLbl.editable = NO; userLbl.drawsBackground = NO;
+    userLbl.autoresizingMask = NSViewMinYMargin;
+    [cv addSubview:userLbl];
+
+    NSTextField *userField = [[NSTextField alloc] initWithFrame:NSMakeRect(94, y - 18, 160, 20)];
+    userField.font = [NSFont monospacedSystemFontOfSize:11 weight:NSFontWeightRegular];
+    userField.stringValue = [NSString stringWithUTF8String:_primenet->username().c_str()];
+    userField.tag = 8001;
+    userField.autoresizingMask = NSViewMinYMargin;
+    [cv addSubview:userField];
+
+    // Status indicator
+    NSTextField *statusLbl = [[NSTextField alloc] initWithFrame:NSMakeRect(270, y - 16, 200, 14)];
+    statusLbl.font = [NSFont systemFontOfSize:10];
+    statusLbl.bezeled = NO; statusLbl.editable = NO; statusLbl.drawsBackground = NO;
+    statusLbl.autoresizingMask = NSViewMinYMargin;
+    if (_primenet->is_registered()) {
+        statusLbl.stringValue = @"Registered";
+        statusLbl.textColor = [NSColor colorWithSRGBRed:0.2 green:0.7 blue:0.2 alpha:1.0];
+    } else {
+        statusLbl.stringValue = @"Not registered";
+        statusLbl.textColor = [NSColor secondaryLabelColor];
+    }
+    statusLbl.tag = 8010;
+    [cv addSubview:statusLbl];
+
+    y -= 28;
+
+    // Buttons row
+    NSButton *registerBtn = [self buttonAt:NSMakeRect(14, y - 24, 100, 24)
+        title:@"Register" action:@selector(gimpsRegister:)];
+    registerBtn.font = [NSFont systemFontOfSize:10];
+    registerBtn.autoresizingMask = NSViewMinYMargin;
+    [cv addSubview:registerBtn];
+
+    NSButton *getWorkBtn = [self buttonAt:NSMakeRect(120, y - 24, 110, 24)
+        title:@"Get Work" action:@selector(gimpsGetWork:)];
+    getWorkBtn.font = [NSFont boldSystemFontOfSize:10];
+    getWorkBtn.autoresizingMask = NSViewMinYMargin;
+    [cv addSubview:getWorkBtn];
+
+    NSButton *runWorkBtn = [self buttonAt:NSMakeRect(236, y - 24, 120, 24)
+        title:@"Run Assignment" action:@selector(gimpsRunAssignment:)];
+    runWorkBtn.font = [NSFont boldSystemFontOfSize:10];
+    runWorkBtn.autoresizingMask = NSViewMinYMargin;
+    [cv addSubview:runWorkBtn];
+
+    NSButton *submitBtn = [self buttonAt:NSMakeRect(362, y - 24, 110, 24)
+        title:@"Submit Results" action:@selector(gimpsSubmitResults:)];
+    submitBtn.font = [NSFont systemFontOfSize:10];
+    submitBtn.autoresizingMask = NSViewMinYMargin;
+    [cv addSubview:submitBtn];
+
+    y -= 34;
+
+    // Separator
+    NSBox *sep2 = [[NSBox alloc] initWithFrame:NSMakeRect(14, y, W - 28, 1)];
+    sep2.boxType = NSBoxSeparator;
+    sep2.autoresizingMask = NSViewMinYMargin | NSViewWidthSizable;
+    [cv addSubview:sep2];
+    y -= 8;
+
+    // Assignments list header
+    NSTextField *assignHdr = [[NSTextField alloc] initWithFrame:NSMakeRect(14, y - 14, 200, 14)];
+    assignHdr.stringValue = @"Current Assignments";
+    assignHdr.font = [NSFont boldSystemFontOfSize:10];
+    assignHdr.bezeled = NO; assignHdr.editable = NO; assignHdr.drawsBackground = NO;
+    assignHdr.autoresizingMask = NSViewMinYMargin;
+    [cv addSubview:assignHdr];
+    y -= 18;
+
+    // Assignment info area
+    NSTextField *assignInfo = [[NSTextField alloc] initWithFrame:NSMakeRect(14, y - 60, W - 28, 60)];
+    assignInfo.font = [NSFont monospacedSystemFontOfSize:10 weight:NSFontWeightRegular];
+    assignInfo.bezeled = NO; assignInfo.editable = NO; assignInfo.drawsBackground = NO;
+    assignInfo.maximumNumberOfLines = 0;
+    assignInfo.tag = 8020;
+    assignInfo.autoresizingMask = NSViewMinYMargin | NSViewWidthSizable;
+    [cv addSubview:assignInfo];
+
+    // Populate assignments
+    if (_primenet->pending_count() > 0) {
+        NSMutableString *astr = [NSMutableString string];
+        for (auto& a : _primenet->state().assignments) {
+            [astr appendFormat:@"M%llu  TF %d-%d bits  [%s]\n",
+                a.exponent, (int)a.bit_lo, (int)a.bit_hi,
+                a.key.c_str()];
+        }
+        assignInfo.stringValue = astr;
+    } else {
+        assignInfo.stringValue = @"No assignments. Click 'Get Work' to fetch from mersenne.org.";
+        assignInfo.textColor = [NSColor secondaryLabelColor];
+    }
+
+    y -= 68;
+
+    // Separator
+    NSBox *sep3 = [[NSBox alloc] initWithFrame:NSMakeRect(14, y, W - 28, 1)];
+    sep3.boxType = NSBoxSeparator;
+    sep3.autoresizingMask = NSViewMinYMargin | NSViewWidthSizable;
+    [cv addSubview:sep3];
+    y -= 8;
+
+    // Log area
+    NSTextField *logHdr = [[NSTextField alloc] initWithFrame:NSMakeRect(14, y - 14, 200, 14)];
+    logHdr.stringValue = @"PrimeNet Log";
+    logHdr.font = [NSFont boldSystemFontOfSize:10];
+    logHdr.bezeled = NO; logHdr.editable = NO; logHdr.drawsBackground = NO;
+    logHdr.autoresizingMask = NSViewMinYMargin;
+    [cv addSubview:logHdr];
+    y -= 18;
+
+    NSScrollView *logScroll = [[NSScrollView alloc] initWithFrame:NSMakeRect(14, 10, W - 28, y - 10)];
+    logScroll.hasVerticalScroller = YES;
+    logScroll.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
+    NSTextView *logView = [[NSTextView alloc] initWithFrame:NSMakeRect(0, 0, W - 32, y - 10)];
+    logView.editable = NO;
+    logView.font = [NSFont monospacedSystemFontOfSize:10 weight:NSFontWeightRegular];
+    logView.autoresizingMask = NSViewWidthSizable;
+    logScroll.documentView = logView;
+    logScroll.identifier = @"gimpsLog";
+    [cv addSubview:logScroll];
+
+    [win makeKeyAndOrderFront:nil];
+}
+
+// ── GIMPS Actions ────────────────────────────────────────────────────
+
+- (void)gimpsRegister:(id)sender {
+    NSWindow *win = [sender window];
+    NSView *cv = win.contentView;
+    NSTextField *userField = [cv viewWithTag:8001];
+    NSTextField *statusLbl = [cv viewWithTag:8010];
+
+    if (userField) {
+        std::string user = userField.stringValue.UTF8String;
+        if (!user.empty()) {
+            _primenet->set_username(user);
+        }
+    }
+
+    __weak AppDelegate *weakSelf = self;
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        @autoreleasepool {
+            AppDelegate *s = weakSelf;
+            if (!s) return;
+            bool ok = s->_primenet->register_machine();
+            if (ok) {
+                s->_primenet->set_work_preference();
+            }
+            dispatch_async(dispatch_get_main_queue(), ^{
+                if (statusLbl) {
+                    if (s->_primenet->is_registered()) {
+                        statusLbl.stringValue = @"Registered";
+                        statusLbl.textColor = [NSColor colorWithSRGBRed:0.2 green:0.7 blue:0.2 alpha:1.0];
+                    } else {
+                        statusLbl.stringValue = @"Registration failed";
+                        statusLbl.textColor = [NSColor colorWithSRGBRed:0.8 green:0.2 blue:0.2 alpha:1.0];
+                    }
+                }
+            });
+        }
+    });
+}
+
+- (void)gimpsGetWork:(id)sender {
+    NSWindow *win = [sender window];
+    NSView *cv = win.contentView;
+    NSTextField *assignInfo = [cv viewWithTag:8020];
+
+    __weak AppDelegate *weakSelf = self;
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        @autoreleasepool {
+            AppDelegate *s = weakSelf;
+            if (!s) return;
+            auto assignment = s->_primenet->fetch_work();
+            dispatch_async(dispatch_get_main_queue(), ^{
+                if (assignInfo && assignment.valid) {
+                    NSMutableString *astr = [NSMutableString string];
+                    for (auto& a : s->_primenet->state().assignments) {
+                        [astr appendFormat:@"M%llu  TF %d-%d bits  [%s]\n",
+                            a.exponent, (int)a.bit_lo, (int)a.bit_hi,
+                            a.key.c_str()];
+                    }
+                    assignInfo.stringValue = astr;
+                    assignInfo.textColor = [NSColor labelColor];
+                }
+            });
+        }
+    });
+}
+
+- (void)gimpsRunAssignment:(id)sender {
+    if (_primenet->pending_count() == 0) {
+        [self appendText:@"GIMPS: no assignments to run. Get work first.\n"];
+        return;
+    }
+
+    auto& assignment = _primenet->state().assignments.front();
+    uint64_t exponent = assignment.exponent;
+
+    // Configure the Mersenne TF task with this exponent
+    auto& tasks = _taskMgr->tasks();
+    auto it = tasks.find(prime::TaskType::MersenneTrial);
+    if (it != tasks.end()) {
+        if (it->second.status == prime::TaskStatus::Running) {
+            [self appendText:@"GIMPS: Mersenne TF is already running. Stop it first.\n"];
+            return;
+        }
+        it->second.end_pos = exponent;
+        it->second.current_pos = 1;  // start from k=1
+
+        [self appendText:[NSString stringWithFormat:
+            @"GIMPS: starting M%llu TF from %d to %d bits (assignment %s)\n",
+            exponent, (int)assignment.bit_lo, (int)assignment.bit_hi,
+            assignment.key.c_str()]];
+
+        _taskMgr->start_task(prime::TaskType::MersenneTrial);
+    }
+}
+
+- (void)gimpsSubmitResults:(id)sender {
+    // Check for completed Mersenne TF work
+    auto& tasks = _taskMgr->tasks();
+    auto it = tasks.find(prime::TaskType::MersenneTrial);
+    if (it == tasks.end()) return;
+
+    if (_primenet->pending_count() == 0) {
+        [self appendText:@"GIMPS: no assignments to submit results for.\n"];
+        return;
+    }
+
+    auto& assignment = _primenet->state().assignments.front();
+
+    // Check discoveries for this exponent
+    bool found_factor = false;
+    std::string factor_str;
+    for (auto& d : _taskMgr->discoveries()) {
+        if (d.type == prime::TaskType::MersenneTrial && d.value2 == assignment.exponent) {
+            found_factor = true;
+            factor_str = d.divisors.empty() ? std::to_string(d.value) : d.divisors;
+            break;
+        }
+    }
+
+    primenet::TFResult result;
+    result.exponent = assignment.exponent;
+    result.bit_lo = assignment.bit_lo;
+    result.bit_hi = assignment.bit_hi;
+    result.factor_found = found_factor;
+    result.factor = factor_str;
+    result.assignment_key = assignment.key;
+    result.range_complete = (it->second.status != prime::TaskStatus::Running);
+
+    __weak AppDelegate *weakSelf = self;
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        @autoreleasepool {
+            AppDelegate *s = weakSelf;
+            if (!s) return;
+            bool ok = s->_primenet->submit_result(result);
+            dispatch_async(dispatch_get_main_queue(), ^{
+                if (ok) {
+                    [s appendText:@"GIMPS: result submitted to mersenne.org.\n"];
+                } else {
+                    [s appendText:@"GIMPS: failed to submit result. Check log.\n"];
+                }
+            });
+        }
+    });
 }
 
 // ═══════════════════════════════════════════════════════════════════════
