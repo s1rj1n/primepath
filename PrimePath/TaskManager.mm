@@ -26,8 +26,8 @@ static const char* pclass_str(PrimeClass c);  // forward declaration
 static const uint64_t SEGMENT_SIZE = 1048576;   // 1M — fits in E-core L2 slice (1MB each)
 static const uint32_t GPU_BATCH = 262144;       // 256K batch — matches MetalCompute MAX_BATCH
 static const int SAVE_INTERVAL_SEC = 30;
-static const int PREFETCH_DEPTH = 24;  // deep prefetch keeps sieve pipeline always full
-static const size_t GPU_ACCUM_HARD_CAP = 4 * 1024 * 1024;  // 4M entries (~32 MB) — force flush if GPU stalls
+static const int PREFETCH_DEPTH = 8;   // moderate prefetch — keeps pipeline full without excessive memory use
+static const size_t GPU_ACCUM_HARD_CAP = 512 * 1024;  // 512K entries (~4 MB) — force flush before memory pressure builds
 
 // ── Constructor / Destructor ────────────────────────────────────────
 
@@ -460,6 +460,7 @@ void TaskManager::start_task(TaskType t) {
     save_state(); // persist that we're starting
 
     task.worker = std::thread([this, t, &task]() {
+        @autoreleasepool {
         // Set worker thread to utility QoS so UI thread always gets priority
         pthread_set_qos_class_self_np(QOS_CLASS_UTILITY, 0);
 
@@ -482,6 +483,7 @@ void TaskManager::start_task(TaskType t) {
         save_state();
         log(std::string(task_name(task.type)) + " paused at " +
             std::to_string(task.current_pos));
+        } // @autoreleasepool
     });
 }
 
@@ -510,6 +512,10 @@ void TaskManager::stop_all() {
 // ── Segmented sieve ─────────────────────────────────────────────────
 
 void TaskManager::ensure_small_primes(uint64_t up_to) {
+    // Guard against concurrent calls from multiple worker threads
+    static std::mutex sp_mutex;
+    std::lock_guard<std::mutex> lock(sp_mutex);
+
     uint64_t need = (uint64_t)sqrt((double)up_to) + 100;
     if (!_small_primes.empty() && _small_primes.back() >= need) return;
     if (need > 500000000) need = 500000000; // cap at 500M — ~60MB RAM for sieve table
@@ -1011,6 +1017,7 @@ void TaskManager::run_wieferich(SearchTask& task) {
     };
 
     while (task.should_run.load()) {
+      @autoreleasepool {
         throttle_if_needed(this);
         auto t0 = std::chrono::steady_clock::now();
 
@@ -1153,6 +1160,7 @@ void TaskManager::run_wieferich(SearchTask& task) {
             (uint64_t)_small_primes.back() * _small_primes.back()) {
             ensure_small_primes(task.current_pos + SEGMENT_SIZE * 100);
         }
+      } // @autoreleasepool
     }
     // Flush any remaining primes in the GPU accumulator
     flush_gpu_accum();
@@ -1259,6 +1267,7 @@ void TaskManager::run_wallsunsun(SearchTask& task) {
     };
 
     while (task.should_run.load()) {
+      @autoreleasepool {
         throttle_if_needed(this);
         auto t0 = std::chrono::steady_clock::now();
 
@@ -1375,6 +1384,7 @@ void TaskManager::run_wallsunsun(SearchTask& task) {
                     std::this_thread::sleep_for(std::chrono::seconds(2));
             }
         }
+      } // @autoreleasepool
     }
     flush_gpu_accum();
     if (predict_future.valid()) predict_future.get();
@@ -1539,6 +1549,7 @@ void TaskManager::run_wilson(SearchTask& task) {
     SievePipeline pipeline(this, task.current_pos, SEGMENT_SIZE, PREFETCH_DEPTH);
 
     while (task.should_run.load()) {
+      @autoreleasepool {
         throttle_if_needed(this);
         auto primes = pipeline.next_segment();
         auto t0 = std::chrono::steady_clock::now();
@@ -1661,6 +1672,7 @@ void TaskManager::run_wilson(SearchTask& task) {
             (uint64_t)_small_primes.back() * _small_primes.back()) {
             ensure_small_primes(task.current_pos + SEGMENT_SIZE * 100);
         }
+      } // @autoreleasepool
     }
     pipeline.drain();
     if (summary_tested > 0)
@@ -1731,6 +1743,7 @@ static void run_pair_adjacency(TaskManager* mgr, SearchTask& task,
     }
 
     while (task.should_run.load()) {
+      @autoreleasepool {
         throttle_if_needed(mgr);
         auto t0 = std::chrono::steady_clock::now();
 
@@ -1818,6 +1831,7 @@ static void run_pair_adjacency(TaskManager* mgr, SearchTask& task,
                     std::this_thread::sleep_for(std::chrono::seconds(2));
             }
         }
+      } // @autoreleasepool
     }
     pipeline.drain();
     if (summary_tested > 0)
@@ -1868,6 +1882,7 @@ static void run_sophie_search(TaskManager* mgr, SearchTask& task, GPUBackend* gp
     };
 
     while (task.should_run.load()) {
+      @autoreleasepool {
         throttle_if_needed(mgr);
         auto t0 = std::chrono::steady_clock::now();
 
@@ -1931,6 +1946,7 @@ static void run_sophie_search(TaskManager* mgr, SearchTask& task, GPUBackend* gp
                     std::this_thread::sleep_for(std::chrono::seconds(2));
             }
         }
+      } // @autoreleasepool
     }
     flush_gpu_accum();
     pipeline.drain();
@@ -1974,6 +1990,7 @@ void TaskManager::run_emirp(SearchTask& task) {
     SievePipeline pipeline(this, task.current_pos, SEGMENT_SIZE, PREFETCH_DEPTH);
 
     while (task.should_run.load()) {
+      @autoreleasepool {
         throttle_if_needed(this);
         auto t0 = std::chrono::steady_clock::now();
         auto primes = pipeline.next_segment();
@@ -2010,6 +2027,7 @@ void TaskManager::run_emirp(SearchTask& task) {
                     std::this_thread::sleep_for(std::chrono::seconds(2));
             }
         }
+      } // @autoreleasepool
     }
     pipeline.drain();
     if (summary_tested > 0)
@@ -2024,6 +2042,7 @@ void TaskManager::run_general(SearchTask& task) {
     SievePipeline pipeline(this, task.current_pos, SEGMENT_SIZE, PREFETCH_DEPTH);
 
     while (task.should_run.load()) {
+      @autoreleasepool {
         throttle_if_needed(this);
         auto t0 = std::chrono::steady_clock::now();
         auto primes_in_seg = pipeline.next_segment();
@@ -2045,6 +2064,7 @@ void TaskManager::run_general(SearchTask& task) {
                     std::this_thread::sleep_for(std::chrono::seconds(2));
             }
         }
+      } // @autoreleasepool
     }
     pipeline.drain();
 }
@@ -2149,66 +2169,169 @@ static void pack_candidate(uint64_t q_lo64, uint32_t q_hi32,
 
 // Sieve candidates for Mersenne trial factoring of 2^p - 1.
 // Candidates: q = 2kp + 1 where q = 1 or 7 (mod 8) and q not divisible by small primes.
-// Parallelized across CPU cores for throughput.
+//
+// Uses bitmap sieve: for each small prime sp, compute the first k in the range
+// where sp | q, then mark off every sp-th k from there.  This avoids per-candidate
+// modular division and lets the CPU do O(k_count * sum(1/sp)) work total instead
+// of O(k_count * n_primes).  Keeps CPU busy so GPU only gets quality candidates.
+//
+// Parallelized: phase 1 (bitmap marking) uses all cores, phase 2 (packing) uses all cores.
+
+// 168 primes up to 1009 — eliminates ~80% of candidates before GPU
+static const uint64_t SIEVE_PRIMES_BIG[] = {
+    3,5,7,11,13,17,19,23,29,31,37,41,43,47,53,59,61,67,71,73,79,83,89,97,
+    101,103,107,109,113,127,131,137,139,149,151,157,163,167,173,179,181,191,
+    193,197,199,211,223,227,229,233,239,241,251,257,263,269,271,277,281,283,
+    293,307,311,313,317,331,337,347,349,353,359,367,373,379,383,389,397,401,
+    409,419,421,431,433,439,443,449,457,461,463,467,479,487,491,499,503,509,
+    521,523,541,547,557,563,569,571,577,587,593,599,601,607,613,617,619,631,
+    641,643,647,653,659,661,673,677,683,691,701,709,719,727,733,739,743,751,
+    757,761,769,773,787,797,809,811,821,823,827,829,839,853,857,859,863,877,
+    881,883,887,907,911,919,929,937,941,947,953,967,971,977,983,991,997,1009
+};
+static const int N_SIEVE_PRIMES_BIG = sizeof(SIEVE_PRIMES_BIG) / sizeof(SIEVE_PRIMES_BIG[0]);
+
 static std::vector<uint32_t> sieve_mersenne_candidates(
     uint64_t p, uint64_t k_start, uint64_t k_count,
     uint64_t &k_end_out)
 {
-    static const uint64_t SIEVE_PRIMES[] = {
-        3,5,7,11,13,17,19,23,29,31,37,41,43,47,53,59,61,67,71,73,79,83,89,97
-    };
-
     uint64_t k_end = k_start + k_count;
     k_end_out = k_end;
 
-    // Split work across threads
     unsigned nthreads = std::thread::hardware_concurrency();
     if (nthreads < 1) nthreads = 4;
-    if (nthreads > 16) nthreads = 16;
 
-    // Each thread sieves its own chunk and produces a local packed vector
-    std::vector<std::vector<uint32_t>> thread_results(nthreads);
-    std::vector<std::thread> threads;
+    // ── Phase 1: Bitmap sieve ──────────────────────────────────────────
+    // Bit = 0 means candidate survives.  We mark bits for rejected k-values.
+    // Use bytes for simplicity (no atomic bit ops needed in single-threaded marking).
+    std::vector<uint8_t> sieve(k_count, 0);
 
-    uint64_t chunk = k_count / nthreads;
+    // For each small prime sp, q = 2kp + 1 is divisible by sp when:
+    //   2kp + 1 ≡ 0 (mod sp)  →  k ≡ -(2p)^{-1} (mod sp)
+    // We find k_first = first k >= k_start with sp | q, then mark every sp-th k.
 
-    for (unsigned t = 0; t < nthreads; t++) {
-        uint64_t my_start = k_start + t * chunk;
-        uint64_t my_end = (t == nthreads - 1) ? k_end : my_start + chunk;
+    // Parallelize across sieve primes — each thread handles a subset
+    {
+        std::vector<std::thread> threads;
+        int primes_per_thread = (N_SIEVE_PRIMES_BIG + (int)nthreads - 1) / (int)nthreads;
 
-        threads.emplace_back([&, t, my_start, my_end, p]() {
-            auto& local = thread_results[t];
-            local.reserve((my_end - my_start) / 6 * 6);
+        for (unsigned t = 0; t < nthreads; t++) {
+            int sp_start = t * primes_per_thread;
+            int sp_end = std::min(sp_start + primes_per_thread, N_SIEVE_PRIMES_BIG);
+            if (sp_start >= N_SIEVE_PRIMES_BIG) break;
 
-            for (uint64_t k = my_start; k < my_end; k++) {
-                unsigned __int128 q128 = (unsigned __int128)2 * k * p + 1;
+            threads.emplace_back([&sieve, p, k_start, k_count, sp_start, sp_end]() {
+                for (int si = sp_start; si < sp_end; si++) {
+                    uint64_t sp = SIEVE_PRIMES_BIG[si];
 
-                if (q128 >> 96) continue;
+                    // Find modular inverse of (2p) mod sp
+                    // inv = (2p)^{-1} mod sp using extended Euclidean
+                    uint64_t twop_mod = (2 * (p % sp)) % sp;
+                    if (twop_mod == 0) continue;  // sp | 2p, degenerate
 
-                uint64_t q_lo = (uint64_t)q128;
-                uint32_t q_hi = (uint32_t)(q128 >> 64);
+                    // Modular inverse via Fermat (sp is prime): inv = twop^{sp-2} mod sp
+                    uint64_t inv = 1, base = twop_mod, exp = sp - 2;
+                    while (exp > 0) {
+                        if (exp & 1) inv = (inv * base) % sp;
+                        base = (base * base) % sp;
+                        exp >>= 1;
+                    }
 
-                uint32_t mod8 = q_lo & 7;
-                if (mod8 != 1 && mod8 != 7) continue;
+                    // k ≡ -inv ≡ (sp - inv) mod sp  → q divisible by sp
+                    uint64_t k_residue = (sp - inv) % sp;
 
-                bool rejected = false;
-                for (uint64_t sp : SIEVE_PRIMES) {
-                    if (q128 % sp == 0) {
-                        if (q128 != sp) { rejected = true; break; }
+                    // First k in [k_start, ...) with k ≡ k_residue (mod sp)
+                    uint64_t k_mod = k_start % sp;
+                    uint64_t offset;
+                    if (k_mod <= k_residue)
+                        offset = k_residue - k_mod;
+                    else
+                        offset = sp - k_mod + k_residue;
+
+                    // Mark every sp-th k from there
+                    // But skip if q == sp itself (q is the prime, not composite)
+                    for (uint64_t idx = offset; idx < k_count; idx += sp) {
+                        sieve[idx] = 1;
                     }
                 }
-                if (rejected) continue;
-
-                size_t idx = local.size();
-                local.resize(idx + 6);
-                pack_candidate(q_lo, q_hi, local.data() + idx);
-            }
-        });
+            });
+        }
+        for (auto& th : threads) th.join();
     }
 
-    for (auto& th : threads) th.join();
+    // ── Phase 1b: mod-8 filter ─────────────────────────────────────────
+    // q = 2kp + 1; q mod 8 depends on (2kp) mod 8.
+    // Mark k-values where q mod 8 ∉ {1, 7}.
+    // Since p is odd (prime > 2), 2p mod 8 is fixed for the batch.
+    // q mod 8 = (2kp + 1) mod 8 = ((2p mod 8) * (k mod 4) + 1) mod 8
+    // We can precompute which k mod 4 residues are valid.
+    {
+        uint64_t twop_mod8 = (2 * (p % 8)) % 8;
+        bool k_mod4_valid[4];
+        for (int r = 0; r < 4; r++) {
+            uint64_t q_mod8 = (twop_mod8 * r + 1) % 8;
+            k_mod4_valid[r] = (q_mod8 == 1 || q_mod8 == 7);
+        }
 
-    // Merge results
+        // Count valid residues — if all 4 are valid, skip this filter
+        int n_valid = 0;
+        for (int r = 0; r < 4; r++) if (k_mod4_valid[r]) n_valid++;
+
+        if (n_valid < 4) {
+            // Parallelize mod-8 marking
+            uint64_t chunk = k_count / nthreads;
+            std::vector<std::thread> threads;
+            for (unsigned t = 0; t < nthreads; t++) {
+                uint64_t my_start = t * chunk;
+                uint64_t my_end = (t == nthreads - 1) ? k_count : my_start + chunk;
+                threads.emplace_back([&sieve, &k_mod4_valid, k_start, my_start, my_end]() {
+                    for (uint64_t idx = my_start; idx < my_end; idx++) {
+                        if (sieve[idx]) continue;  // already rejected
+                        int r = (int)((k_start + idx) % 4);
+                        if (!k_mod4_valid[r]) sieve[idx] = 1;
+                    }
+                });
+            }
+            for (auto& th : threads) th.join();
+        }
+    }
+
+    // ── Phase 2: Pack survivors ────────────────────────────────────────
+    // Each thread scans its portion of the bitmap and packs surviving candidates.
+    std::vector<std::vector<uint32_t>> thread_results(nthreads);
+    {
+        uint64_t chunk = k_count / nthreads;
+        std::vector<std::thread> threads;
+
+        for (unsigned t = 0; t < nthreads; t++) {
+            uint64_t my_start = t * chunk;
+            uint64_t my_end = (t == nthreads - 1) ? k_count : my_start + chunk;
+
+            threads.emplace_back([&, t, my_start, my_end, p, k_start]() {
+                auto& local = thread_results[t];
+                // Estimate ~10% survival rate
+                local.reserve((my_end - my_start) / 10 * 6);
+
+                for (uint64_t idx = my_start; idx < my_end; idx++) {
+                    if (sieve[idx]) continue;
+
+                    uint64_t k = k_start + idx;
+                    unsigned __int128 q128 = (unsigned __int128)2 * k * p + 1;
+                    if (q128 >> 96) continue;
+
+                    uint64_t q_lo = (uint64_t)q128;
+                    uint32_t q_hi = (uint32_t)(q128 >> 64);
+
+                    size_t pos = local.size();
+                    local.resize(pos + 6);
+                    pack_candidate(q_lo, q_hi, local.data() + pos);
+                }
+            });
+        }
+        for (auto& th : threads) th.join();
+    }
+
+    // Merge
     size_t total = 0;
     for (auto& v : thread_results) total += v.size();
 
@@ -2245,42 +2368,67 @@ void TaskManager::run_mersenne_trial(SearchTask& task) {
     uint64_t summary_start = task.current_pos;
     uint64_t summary_tested = 0, summary_hits = 0;
 
-    // Try fused GPU path (sieve+test entirely on GPU)
+    // Strategy: GPU does Mersenne TF exclusively (fused sieve+modexp).
+    // CPU runs complementary high-value searches (WallSunSun, Wieferich) in parallel.
+    // This keeps BOTH fully utilized — GPU on Mersenne, CPU on rare-prime hunts.
     bool use_fused = false;
     {
         std::lock_guard<std::mutex> lock(_gpu_mutex);
-        // Test with a trivial call — if it returns empty but doesn't fail, backend supports it
-        // CPUBackend returns {} (default), MetalBackend returns actual results
-        // We detect support by checking if the backend is not CPUBackend
         use_fused = (_gpu && _gpu->name() != "CPU (fallback)");
     }
 
+    // Auto-start complementary CPU tasks when GPU handles Mersenne
+    std::vector<TaskType> auto_started_cpu_tasks;
     if (use_fused) {
-        log("Mersenne TF: using fused GPU sieve+test (entire pipeline on Metal)");
-        log("Mersenne TF: GPU exclusive mode — other tasks will use CPU only");
+        log("Mersenne TF: GPU-exclusive mode — GPU does fused sieve+modexp");
         gpu_owner.store((int)TaskType::MersenneTrial);
+
+        // Start CPU-intensive searches on a separate thread to avoid
+        // calling start_task() from within a worker (which can deadlock on join).
+        const TaskType cpu_tasks[] = {
+            TaskType::WallSunSun,   // 0 known — holy grail
+            TaskType::Wieferich,    // only 2 known
+        };
+        for (auto ct : cpu_tasks) {
+            auto it = _tasks.find(ct);
+            if (it != _tasks.end() && it->second.status != TaskStatus::Running) {
+                auto_started_cpu_tasks.push_back(ct);
+            }
+        }
+        if (!auto_started_cpu_tasks.empty()) {
+            // Launch on a detached thread so start_task's join() doesn't block this worker
+            auto tasks_to_start = auto_started_cpu_tasks;
+            std::thread([this, tasks_to_start]() {
+                for (auto ct : tasks_to_start) {
+                    log("Mersenne TF: auto-starting " + std::string(task_name(ct)) +
+                        " search on CPU (complementary workload)");
+                    start_task(ct);
+                }
+            }).detach();
+        } else {
+            log("Mersenne TF: no idle CPU tasks to auto-start (may already be running)");
+        }
+    } else {
+        log("Mersenne TF: CPU-only mode (no Metal backend)");
     }
 
-    while (task.should_run.load()) {
-        throttle_if_needed(this);
-        auto t0 = std::chrono::steady_clock::now();
+    if (use_fused) {
+        // ── GPU-exclusive Mersenne TF ─────────────────────────────────
+        // GPU runs fused sieve+modexp kernel. CPU is free for other tasks.
+        uint64_t gpu_log_ctr = 0;
+        uint64_t total_hits = 0;
 
-        if (use_fused) {
-            // ── Fused GPU path: sieve + Barrett + modexp all on GPU ──
-            // Dispatch in GPU_FUSED_CHUNK-sized pieces, releasing the mutex between
-            // chunks so other tasks can interleave their GPU work.
+        while (task.should_run.load()) {
+          @autoreleasepool {
+            throttle_if_needed(this);
+
             uint64_t k_pos = task.current_pos;
             uint64_t k_end = k_pos + K_BATCH;
 
             while (k_pos < k_end && task.should_run.load()) {
-                // Adaptive chunk: shrink when GPU is hot to leave breathing room
-                float sat = _balancer->gpu_saturation();
-                uint64_t GPU_FUSED_CHUNK;
-                if (sat > 0.70f)      GPU_FUSED_CHUNK = 1ULL << 20;  // 1M — hot
-                else if (sat > 0.55f) GPU_FUSED_CHUNK = 1ULL << 22;  // 4M — warm
-                else                  GPU_FUSED_CHUNK = 1ULL << 24;  // 16M — cool
-
+                uint64_t GPU_FUSED_CHUNK = 1ULL << 22;  // 4M per dispatch (avoids GPU watchdog timeout)
                 uint64_t chunk = std::min(GPU_FUSED_CHUNK, k_end - k_pos);
+
                 std::vector<GPUBackend::FusedHit> hits;
                 pace_gpu();
                 {
@@ -2288,11 +2436,6 @@ void TaskManager::run_mersenne_trial(SearchTask& task) {
                     hits = _gpu->mersenne_fused_sieve(exponent, k_pos, chunk);
                 }
                 finish_gpu();
-
-                // Yield between GPU dispatches so CPU tasks get scheduled
-                if (sat > 0.55f) {
-                    std::this_thread::yield();
-                }
 
                 for (auto& fh : hits) {
                     uint64_t q_lo = fh.q_lo;
@@ -2302,92 +2445,106 @@ void TaskManager::run_mersenne_trial(SearchTask& task) {
                     std::string q_str = std::to_string(q_val);
                     if (q_hi > 0) {
                         unsigned __int128 q128 = ((unsigned __int128)q_hi << 64) | q_lo;
-                        char buf[40];
+                        char buf[40]; int pos = 39; buf[pos] = 0;
                         unsigned __int128 tmp = q128;
-                        int pos = 39;
-                        buf[pos] = 0;
                         while (tmp > 0) { buf[--pos] = '0' + (int)(tmp % 10); tmp /= 10; }
                         q_str = &buf[pos];
                     }
-
+                    total_hits++;
                     task.found_count++;
-                    summary_hits++;
                     log("*** MERSENNE FACTOR FOUND: 2^" + std::to_string(exponent) +
                         " - 1 has factor " + q_str + " ***");
                     save_discovery({TaskType::MersenneTrial, q_val, exponent,
-                        PrimeClass::Composite, task.current_pos, q_str, timestamp()});
+                        PrimeClass::Composite, k_pos, q_str, timestamp()});
                 }
 
-                task.tested_count += chunk;
                 summary_tested += chunk;
+                task.tested_count += chunk;
                 k_pos += chunk;
             }
 
             task.current_pos = k_end;
 
-        } else {
-            // ── Legacy path: CPU sieve → GPU test ──
+            auto now = std::chrono::steady_clock::now();
+            double elapsed = std::chrono::duration<double>(now - last_save).count();
+            if (elapsed > SAVE_INTERVAL_SEC) {
+                // Summary log only on save intervals (~30s)
+                double rate = summary_tested / elapsed;
+                log("Mersenne TF: " + std::to_string(task.tested_count / 1000000) +
+                    "M tested, " + std::to_string((uint64_t)(rate / 1e6)) +
+                    "M/s, k=" + std::to_string(task.current_pos));
+                save_scan_summary(TaskType::MersenneTrial, summary_start, task.current_pos,
+                                  summary_tested, summary_hits);
+                save_state();
+                last_save = now;
+                summary_start = task.current_pos;
+                summary_tested = 0;
+                summary_hits = 0;
+            }
+          } // @autoreleasepool per batch
+        }
+
+        // Stop auto-started CPU tasks when Mersenne TF stops
+        // Signal them to stop (don't call pause_task from worker — it joins)
+        for (auto ct : auto_started_cpu_tasks) {
+            auto it = _tasks.find(ct);
+            if (it != _tasks.end() && it->second.status == TaskStatus::Running) {
+                log("Mersenne TF: stopping auto-started " + std::string(task_name(ct)));
+                it->second.should_run.store(false);
+            }
+        }
+
+    } else {
+        // ── CPU-only fallback ────────────────────────────────────────
+        while (task.should_run.load()) {
+          @autoreleasepool {
+            throttle_if_needed(this);
+
             uint64_t k_end;
             auto packed = sieve_mersenne_candidates(exponent, task.current_pos, K_BATCH, k_end);
             uint32_t n_candidates = (uint32_t)(packed.size() / 6);
 
-            if (n_candidates > 0) {
-                std::vector<uint8_t> results(n_candidates);
-                for (uint32_t offset = 0; offset < n_candidates; offset += GPU_BATCH_SIZE) {
-                    if (!task.should_run.load()) break;
-                    uint32_t batch = std::min(GPU_BATCH_SIZE, n_candidates - offset);
-
-                    pace_gpu();
-                    { std::lock_guard<std::mutex> lock(_gpu_mutex);
-                      _gpu->mersenne_trial_batch(packed.data() + offset * 6,
-                                                 results.data() + offset, batch, exponent); }
-                    finish_gpu();
+            // CPU modexp
+            for (uint32_t i = 0; i < n_candidates; i++) {
+                if (!task.should_run.load()) break;
+                uint32_t *c = packed.data() + i * 6;
+                unsigned __int128 q128 = (unsigned __int128)c[2] << 64 |
+                                         (unsigned __int128)c[1] << 32 | c[0];
+                if (q128 < 2) continue;
+                unsigned __int128 acc = 2;
+                uint64_t exp = exponent;
+                int top = 63;
+                while (top > 0 && !((exp >> top) & 1)) top--;
+                for (int bit = top - 1; bit >= 0; bit--) {
+                    acc = acc * acc % q128;
+                    if ((exp >> bit) & 1)
+                        acc = (acc << 1) % q128;
                 }
-
-                for (uint32_t i = 0; i < n_candidates; i++) {
-                    if (results[i]) {
-                        uint64_t q_lo = packed[i*6] | ((uint64_t)packed[i*6+1] << 32);
-                        uint32_t q_hi = packed[i*6+2];
-                        uint64_t q_val = (q_hi == 0) ? q_lo : q_lo;
-                        std::string q_str = std::to_string(q_val);
-                        if (q_hi > 0) {
-                            unsigned __int128 q128 = ((unsigned __int128)q_hi << 64) | q_lo;
-                            char buf[40];
-                            unsigned __int128 tmp = q128;
-                            int pos = 39;
-                            buf[pos] = 0;
-                            while (tmp > 0) { buf[--pos] = '0' + (int)(tmp % 10); tmp /= 10; }
-                            q_str = &buf[pos];
-                        }
-
-                        task.found_count++;
-                        summary_hits++;
-                        log("*** MERSENNE FACTOR FOUND: 2^" + std::to_string(exponent) +
-                            " - 1 has factor " + q_str + " ***");
-                        save_discovery({TaskType::MersenneTrial, q_val, exponent,
-                            PrimeClass::Composite, task.current_pos, q_str, timestamp()});
-                    }
+                if (acc == 1) {
+                    uint64_t q_lo = (uint64_t)q128;
+                    std::string q_str = std::to_string(q_lo);
+                    task.found_count++;
+                    summary_hits++;
+                    log("*** MERSENNE FACTOR FOUND: 2^" + std::to_string(exponent) +
+                        " - 1 has factor " + q_str + " ***");
                 }
-
-                task.tested_count += n_candidates;
-                summary_tested += n_candidates;
             }
 
+            task.tested_count += n_candidates;
+            summary_tested += n_candidates;
             task.current_pos = k_end;
-        }
 
-        auto dt = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
-        task.rate = dt > 0 ? K_BATCH / dt : 0;
-
-        auto now = std::chrono::steady_clock::now();
-        if (std::chrono::duration<double>(now - last_save).count() > SAVE_INTERVAL_SEC) {
-            save_scan_summary(TaskType::MersenneTrial, summary_start, task.current_pos,
-                              summary_tested, summary_hits);
-            save_state();
-            last_save = now;
-            summary_start = task.current_pos;
-            summary_tested = 0;
-            summary_hits = 0;
+            auto now = std::chrono::steady_clock::now();
+            if (std::chrono::duration<double>(now - last_save).count() > SAVE_INTERVAL_SEC) {
+                save_scan_summary(TaskType::MersenneTrial, summary_start, task.current_pos,
+                                  summary_tested, summary_hits);
+                save_state();
+                last_save = now;
+                summary_start = task.current_pos;
+                summary_tested = 0;
+                summary_hits = 0;
+            }
+          } // @autoreleasepool
         }
     }
 
@@ -2477,6 +2634,7 @@ void TaskManager::run_fermat_factor(SearchTask& task) {
     uint64_t summary_tested = 0, summary_hits = 0;
 
     while (task.should_run.load()) {
+      @autoreleasepool {
         throttle_if_needed(this);
         auto t0 = std::chrono::steady_clock::now();
 
@@ -2540,6 +2698,7 @@ void TaskManager::run_fermat_factor(SearchTask& task) {
             summary_tested = 0;
             summary_hits = 0;
         }
+      } // @autoreleasepool
     }
 
     if (summary_tested > 0)

@@ -236,8 +236,8 @@ bool PrimeNetClient::submit_result(const TFResult& result) {
         "&r=" + std::to_string(result_type) +
         "&d=1"
         "&n=" + std::to_string(result.exponent) +
-        "&sf=" + std::to_string(result.bit_lo) +
-        "&ef=" + std::to_string(result.bit_hi);
+        "&sf=" + std::to_string((int)result.bit_lo) +
+        "&ef=" + std::to_string((int)result.bit_hi);
 
     if (result.factor_found) {
         url += "&f=" + result.factor;
@@ -450,7 +450,7 @@ std::string PrimeNetClient::http_get(const std::string& url) {
 
         __block NSData *responseData = nil;
         __block NSError *responseError = nil;
-        __block BOOL done = NO;
+        __block NSHTTPURLResponse *httpResponse = nil;
 
         dispatch_semaphore_t sem = dispatch_semaphore_create(0);
         NSURLSessionDataTask *task = [[NSURLSession sharedSession]
@@ -458,7 +458,8 @@ std::string PrimeNetClient::http_get(const std::string& url) {
             completionHandler:^(NSData *data, NSURLResponse *response, NSError *error) {
                 responseData = data;
                 responseError = error;
-                done = YES;
+                if ([response isKindOfClass:[NSHTTPURLResponse class]])
+                    httpResponse = (NSHTTPURLResponse *)response;
                 dispatch_semaphore_signal(sem);
             }];
         [task resume];
@@ -470,10 +471,19 @@ std::string PrimeNetClient::http_get(const std::string& url) {
             return "";
         }
 
-        if (responseData) {
-            return std::string((const char *)responseData.bytes, responseData.length);
+        if (httpResponse) {
+            long status = (long)httpResponse.statusCode;
+            if (status != 200) {
+                _log("PrimeNet HTTP status: " + std::to_string(status));
+            }
         }
-        return "";
+
+        if (!responseData) {
+            _log("PrimeNet: timeout — no response received within 30 seconds.");
+            return "";
+        }
+
+        return std::string((const char *)responseData.bytes, responseData.length);
     }
 }
 

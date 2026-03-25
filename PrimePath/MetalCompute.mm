@@ -32,6 +32,23 @@ static const uint32_t MAX_BATCH = 262144; // 256K max batch
     uint32_t _ringBatchCount[RING_SIZE];          // count for each in-flight batch
     int _ringIdx;
 
+    // Pre-allocated reusable buffers for Mersenne/Fermat per-call dispatch
+    // Avoids new buffer allocation every call — major source of memory pressure
+    id<MTLBuffer> _mersenneInputBuf;
+    id<MTLBuffer> _mersenneOutputBuf;
+    id<MTLBuffer> _mersenneParamsBuf;
+    uint32_t _mersenneInputCap;  // current capacity in candidates
+
+    id<MTLBuffer> _fermatInputBuf;
+    id<MTLBuffer> _fermatOutputBuf;
+    id<MTLBuffer> _fermatParamsBuf;
+    uint32_t _fermatInputCap;
+
+    // Pre-allocated buffers for fused Mersenne (reused across calls)
+    id<MTLBuffer> _fusedHitCountBuf;
+    id<MTLBuffer> _fusedHitFactorsBuf;
+    id<MTLBuffer> _fusedParamsBuf;
+
     // GPU timing stats
     uint64_t _totalThreads;
     uint64_t _totalBatches;
@@ -89,6 +106,28 @@ static const uint32_t MAX_BATCH = 262144; // 256K max batch
         _ringBatchCount[i] = 0;
     }
     _ringIdx = 0;
+
+    // Pre-allocate reusable buffers for Mersenne/Fermat dispatch
+    _mersenneInputCap = MAX_BATCH;
+    _mersenneInputBuf  = [_device newBufferWithLength:(size_t)MAX_BATCH * 6 * sizeof(uint32_t)
+                                              options:MTLResourceStorageModeShared];
+    _mersenneOutputBuf = [_device newBufferWithLength:MAX_BATCH * sizeof(uint8_t)
+                                              options:MTLResourceStorageModeShared];
+    _mersenneParamsBuf = [_device newBufferWithLength:2 * sizeof(uint64_t)
+                                              options:MTLResourceStorageModeShared];
+    _fermatInputCap = MAX_BATCH;
+    _fermatInputBuf  = [_device newBufferWithLength:(size_t)MAX_BATCH * 6 * sizeof(uint32_t)
+                                            options:MTLResourceStorageModeShared];
+    _fermatOutputBuf = [_device newBufferWithLength:MAX_BATCH * sizeof(uint8_t)
+                                            options:MTLResourceStorageModeShared];
+    _fermatParamsBuf = [_device newBufferWithLength:2 * sizeof(uint64_t)
+                                            options:MTLResourceStorageModeShared];
+    _fusedHitCountBuf   = [_device newBufferWithLength:sizeof(uint32_t)
+                                               options:MTLResourceStorageModeShared];
+    _fusedHitFactorsBuf = [_device newBufferWithLength:1024 * 2 * sizeof(uint64_t)
+                                               options:MTLResourceStorageModeShared];
+    _fusedParamsBuf     = [_device newBufferWithLength:3 * sizeof(uint64_t)
+                                               options:MTLResourceStorageModeShared];
 
     _totalThreads = 0;
     _totalBatches = 0;
@@ -317,23 +356,21 @@ static const uint32_t MAX_BATCH = 262144; // 256K max batch
 
     for (int i = 0; i < RING_SIZE; i++) [self waitForSlot:i];
 
+    // Use pre-allocated reusable buffers instead of allocating per call
     size_t inputSize = (size_t)count * 6 * sizeof(uint32_t);
-    id<MTLBuffer> inputBuf = [_device newBufferWithBytes:candidates length:inputSize
-                                                 options:MTLResourceStorageModeShared];
-    id<MTLBuffer> outputBuf = [_device newBufferWithLength:count * sizeof(uint8_t)
-                                                   options:MTLResourceStorageModeShared];
-    memset(outputBuf.contents, 0, count);
+    memcpy(_mersenneInputBuf.contents, candidates, inputSize);
+    memset(_mersenneOutputBuf.contents, 0, count);
 
-    uint64_t paramsData[2] = {p, (uint64_t)count};
-    id<MTLBuffer> paramsBuf = [_device newBufferWithBytes:paramsData length:sizeof(paramsData)
-                                                  options:MTLResourceStorageModeShared];
+    uint64_t *paramsData = (uint64_t *)_mersenneParamsBuf.contents;
+    paramsData[0] = p;
+    paramsData[1] = (uint64_t)count;
 
     id<MTLCommandBuffer> cmdBuf = [_queue commandBuffer];
     id<MTLComputeCommandEncoder> encoder = [cmdBuf computeCommandEncoder];
     [encoder setComputePipelineState:_mersenneTrialPSO];
-    [encoder setBuffer:inputBuf  offset:0 atIndex:0];
-    [encoder setBuffer:outputBuf offset:0 atIndex:1];
-    [encoder setBuffer:paramsBuf offset:0 atIndex:2];
+    [encoder setBuffer:_mersenneInputBuf  offset:0 atIndex:0];
+    [encoder setBuffer:_mersenneOutputBuf offset:0 atIndex:1];
+    [encoder setBuffer:_mersenneParamsBuf offset:0 atIndex:2];
 
     NSUInteger threadGroupSize = _mersenneTrialPSO.maxTotalThreadsPerThreadgroup;
     if (threadGroupSize > 256) threadGroupSize = 256;
@@ -354,7 +391,7 @@ static const uint32_t MAX_BATCH = 262144; // 256K max batch
     _totalGpuTimeSec += gpuTimeSec;
     _windowGpuSec += gpuTimeSec;
 
-    return [NSData dataWithBytes:outputBuf.contents length:count * sizeof(uint8_t)];
+    return [NSData dataWithBytes:_mersenneOutputBuf.contents length:count * sizeof(uint8_t)];
 }
 
 // ── Fused Mersenne sieve+test dispatch ─────────────────────────────
@@ -365,19 +402,11 @@ static const uint32_t MAX_BATCH = 262144; // 256K max batch
                            kCount:(uint64_t)k_count {
     if (!_mersenneFusedPSO || k_count == 0) return @[];
 
-    // Dispatch in large chunks to maximise GPU occupancy.
-    // Each thread is lightweight (most exit early on mod8/sieve), so we need
-    // millions of threads to keep the GPU cores busy.
-    uint64_t max_threads = 1 << 24;  // 16M threads per dispatch
+    // Dispatch in chunks sized to avoid GPU watchdog timeout (~2-5s limit).
+    // Each thread does sieve + Barrett + modexp — heavier than a simple kernel.
+    // 4M threads keeps dispatch under ~1s on most Apple Silicon GPUs.
+    uint64_t max_threads = 1 << 22;  // 4M threads per dispatch (was 16M — caused GPU timeout)
     NSMutableArray *allHits = [NSMutableArray array];
-
-    // Pre-allocate reusable buffers for the entire call to avoid per-chunk allocation overhead
-    id<MTLBuffer> hitCountBuf = [_device newBufferWithLength:sizeof(uint32_t)
-                                                     options:MTLResourceStorageModeShared];
-    id<MTLBuffer> hitFactorsBuf = [_device newBufferWithLength:1024 * 2 * sizeof(uint64_t)
-                                                        options:MTLResourceStorageModeShared];
-    id<MTLBuffer> paramsBuf = [_device newBufferWithLength:3 * sizeof(uint64_t)
-                                                    options:MTLResourceStorageModeShared];
 
     NSUInteger threadGroupSize = _mersenneFusedPSO.maxTotalThreadsPerThreadgroup;
     if (threadGroupSize > 1024) threadGroupSize = 1024;
@@ -387,10 +416,10 @@ static const uint32_t MAX_BATCH = 262144; // 256K max batch
         uint64_t chunk_k_start = k_start + offset;
 
         // Reset hit counter
-        memset(hitCountBuf.contents, 0, sizeof(uint32_t));
+        memset(_fusedHitCountBuf.contents, 0, sizeof(uint32_t));
 
         // Set params
-        uint64_t *paramsData = (uint64_t *)paramsBuf.contents;
+        uint64_t *paramsData = (uint64_t *)_fusedParamsBuf.contents;
         paramsData[0] = exponent;
         paramsData[1] = chunk_k_start;
         paramsData[2] = chunk;
@@ -398,9 +427,9 @@ static const uint32_t MAX_BATCH = 262144; // 256K max batch
         id<MTLCommandBuffer> cmdBuf = [_queue commandBuffer];
         id<MTLComputeCommandEncoder> encoder = [cmdBuf computeCommandEncoder];
         [encoder setComputePipelineState:_mersenneFusedPSO];
-        [encoder setBuffer:hitCountBuf   offset:0 atIndex:0];
-        [encoder setBuffer:hitFactorsBuf offset:0 atIndex:1];
-        [encoder setBuffer:paramsBuf     offset:0 atIndex:2];
+        [encoder setBuffer:_fusedHitCountBuf   offset:0 atIndex:0];
+        [encoder setBuffer:_fusedHitFactorsBuf offset:0 atIndex:1];
+        [encoder setBuffer:_fusedParamsBuf     offset:0 atIndex:2];
 
         [encoder dispatchThreads:MTLSizeMake((NSUInteger)chunk, 1, 1)
            threadsPerThreadgroup:MTLSizeMake(threadGroupSize, 1, 1)];
@@ -421,9 +450,9 @@ static const uint32_t MAX_BATCH = 262144; // 256K max batch
         _windowGpuSec += gpuTimeSec;
 
         // Read hits
-        uint32_t numHits = *(uint32_t *)hitCountBuf.contents;
+        uint32_t numHits = *(uint32_t *)_fusedHitCountBuf.contents;
         if (numHits > 1024) numHits = 1024;
-        uint64_t *factors = (uint64_t *)hitFactorsBuf.contents;
+        uint64_t *factors = (uint64_t *)_fusedHitFactorsBuf.contents;
         for (uint32_t i = 0; i < numHits; i++) {
             [allHits addObject:@[@(factors[i * 2]), @(factors[i * 2 + 1])]];
         }
@@ -495,23 +524,21 @@ static const uint32_t MAX_BATCH = 262144; // 256K max batch
 
     for (int i = 0; i < RING_SIZE; i++) [self waitForSlot:i];
 
+    // Use pre-allocated reusable buffers
     size_t inputSize = (size_t)count * 6 * sizeof(uint32_t);
-    id<MTLBuffer> inputBuf = [_device newBufferWithBytes:candidates length:inputSize
-                                                 options:MTLResourceStorageModeShared];
-    id<MTLBuffer> outputBuf = [_device newBufferWithLength:count * sizeof(uint8_t)
-                                                   options:MTLResourceStorageModeShared];
-    memset(outputBuf.contents, 0, count);
+    memcpy(_fermatInputBuf.contents, candidates, inputSize);
+    memset(_fermatOutputBuf.contents, 0, count);
 
-    uint64_t paramsData[2] = {m, (uint64_t)count};
-    id<MTLBuffer> paramsBuf = [_device newBufferWithBytes:paramsData length:sizeof(paramsData)
-                                                  options:MTLResourceStorageModeShared];
+    uint64_t *paramsData = (uint64_t *)_fermatParamsBuf.contents;
+    paramsData[0] = m;
+    paramsData[1] = (uint64_t)count;
 
     id<MTLCommandBuffer> cmdBuf = [_queue commandBuffer];
     id<MTLComputeCommandEncoder> encoder = [cmdBuf computeCommandEncoder];
     [encoder setComputePipelineState:_fermatFactorPSO];
-    [encoder setBuffer:inputBuf  offset:0 atIndex:0];
-    [encoder setBuffer:outputBuf offset:0 atIndex:1];
-    [encoder setBuffer:paramsBuf offset:0 atIndex:2];
+    [encoder setBuffer:_fermatInputBuf  offset:0 atIndex:0];
+    [encoder setBuffer:_fermatOutputBuf offset:0 atIndex:1];
+    [encoder setBuffer:_fermatParamsBuf offset:0 atIndex:2];
 
     NSUInteger threadGroupSize = _fermatFactorPSO.maxTotalThreadsPerThreadgroup;
     if (threadGroupSize > 256) threadGroupSize = 256;
@@ -532,7 +559,7 @@ static const uint32_t MAX_BATCH = 262144; // 256K max batch
     _totalGpuTimeSec += gpuTimeSec;
     _windowGpuSec += gpuTimeSec;
 
-    return [NSData dataWithBytes:outputBuf.contents length:count * sizeof(uint8_t)];
+    return [NSData dataWithBytes:_fermatOutputBuf.contents length:count * sizeof(uint8_t)];
 }
 
 - (BOOL)runWilsonSegments:(uint64_t)prime

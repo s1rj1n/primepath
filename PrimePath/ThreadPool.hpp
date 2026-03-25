@@ -8,6 +8,11 @@
 #include <atomic>
 #include <future>
 
+// ObjC autorelease pool C API — works in both .cpp and .mm translation units.
+// Prevents Metal command buffers and NSData objects from accumulating.
+extern "C" void *objc_autoreleasePoolPush(void);
+extern "C" void  objc_autoreleasePoolPop(void *pool);
+
 namespace prime {
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -87,7 +92,11 @@ private:
                 task = std::move(_tasks.front());
                 _tasks.pop();
             }
+            // Drain ObjC autorelease pool per task to prevent Metal/NSData accumulation.
+            // Uses C runtime API so this compiles in both .cpp and .mm translation units.
+            void *pool = objc_autoreleasePoolPush();
             task();
+            objc_autoreleasePoolPop(pool);
         }
     }
 };

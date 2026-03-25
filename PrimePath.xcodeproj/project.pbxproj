@@ -14,7 +14,7 @@
 		AA00000500000005 /* Metal.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = BB00001000000010 /* Metal.framework */; };
 		AA00000700000007 /* MetalCompute.mm in Sources */ = {isa = PBXBuildFile; fileRef = BB00000900000009 /* MetalCompute.mm */; };
 		AA00000800000008 /* MetalBridge.mm in Sources */ = {isa = PBXBuildFile; fileRef = BB00001100000011 /* MetalBridge.mm */; };
-		AA00000900000009 /* TaskManager.cpp in Sources */ = {isa = PBXBuildFile; fileRef = BB00000B0000000B /* TaskManager.cpp */; };
+		AA00000900000009 /* TaskManager.mm in Sources */ = {isa = PBXBuildFile; fileRef = BB00000B0000000B /* TaskManager.mm */; };
 		AA00001000000010 /* PrimeShaders.metal in Sources */ = {isa = PBXBuildFile; fileRef = BB00000D0000000D /* PrimeShaders.metal */; };
 		AA00001100000011 /* GPUBackend.cpp in Sources */ = {isa = PBXBuildFile; fileRef = BB00001200000012 /* GPUBackend.cpp */; };
 		AA00001200000012 /* MetalBackend.mm in Sources */ = {isa = PBXBuildFile; fileRef = BB00001300000013 /* MetalBackend.mm */; };
@@ -27,6 +27,8 @@
 		AA00002300000023 /* TCPSocket.cpp in Sources */ = {isa = PBXBuildFile; fileRef = BB00003300000033 /* TCPSocket.cpp */; };
 		AA00002400000024 /* PrimeNetClient.mm in Sources */ = {isa = PBXBuildFile; fileRef = BB00003A0000003A /* PrimeNetClient.mm */; };
 		AA00002500000025 /* LoadBalancer.cpp in Sources */ = {isa = PBXBuildFile; fileRef = BB00003C0000003C /* LoadBalancer.cpp */; };
+		AA00002600000026 /* IOKit.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = BB00003E0000003E /* IOKit.framework */; };
+		AA00002700000027 /* AppIcon.icns in Resources */ = {isa = PBXBuildFile; fileRef = BB00003F0000003F /* AppIcon.icns */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
@@ -40,7 +42,7 @@
 		BB00000800000008 /* MetalCompute.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = MetalCompute.h; sourceTree = "<group>"; };
 		BB00000900000009 /* MetalCompute.mm */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.objcpp; path = MetalCompute.mm; sourceTree = "<group>"; };
 		BB00000A0000000A /* TaskManager.hpp */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.h; path = TaskManager.hpp; sourceTree = "<group>"; };
-		BB00000B0000000B /* TaskManager.cpp */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.cpp; path = TaskManager.cpp; sourceTree = "<group>"; };
+		BB00000B0000000B /* TaskManager.mm */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.objcpp; path = TaskManager.mm; sourceTree = "<group>"; };
 		BB00000D0000000D /* PrimeShaders.metal */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.metal; path = PrimeShaders.metal; sourceTree = "<group>"; };
 		BB00000E0000000E /* PrimePath.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = PrimePath.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		BB00001000000010 /* Metal.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = Metal.framework; path = System/Library/Frameworks/Metal.framework; sourceTree = SDKROOT; };
@@ -71,6 +73,8 @@
 		BB00003B0000003B /* PrimeNetClient.hpp */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.h; path = PrimeNetClient.hpp; sourceTree = "<group>"; };
 		BB00003C0000003C /* LoadBalancer.cpp */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.cpp; path = LoadBalancer.cpp; sourceTree = "<group>"; };
 		BB00003D0000003D /* LoadBalancer.hpp */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.h; path = LoadBalancer.hpp; sourceTree = "<group>"; };
+		BB00003E0000003E /* IOKit.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = IOKit.framework; path = System/Library/Frameworks/IOKit.framework; sourceTree = SDKROOT; };
+		BB00003F0000003F /* AppIcon.icns */ = {isa = PBXFileReference; lastKnownFileType = image.icns; path = AppIcon.icns; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -81,10 +85,22 @@
 				AA00000400000004 /* Cocoa.framework in Frameworks */,
 				AA00000500000005 /* Metal.framework in Frameworks */,
 				AA00001400000014 /* Accelerate.framework in Frameworks */,
+				AA00002600000026 /* IOKit.framework in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
 /* End PBXFrameworksBuildPhase section */
+
+/* Begin PBXResourcesBuildPhase section */
+		CC00000200000002 /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				AA00002700000027 /* AppIcon.icns in Resources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXResourcesBuildPhase section */
 
 /* Begin PBXGroup section */
 		DD00000100000001 = {
@@ -108,7 +124,7 @@
 				BB00000900000009 /* MetalCompute.mm */,
 				BB00001100000011 /* MetalBridge.mm */,
 				BB00000A0000000A /* TaskManager.hpp */,
-				BB00000B0000000B /* TaskManager.cpp */,
+				BB00000B0000000B /* TaskManager.mm */,
 				BB00000D0000000D /* PrimeShaders.metal */,
 				BB00001400000014 /* GPUBackend.hpp */,
 				BB00001200000012 /* GPUBackend.cpp */,
@@ -125,6 +141,7 @@
 				BB0000220000001C /* Benchmark.cpp */,
 				DD00000500000005 /* Network */,
 				BB00000700000007 /* Info.plist */,
+			BB00003F0000003F /* AppIcon.icns */,
 			);
 			path = PrimePath;
 			sourceTree = "<group>";
@@ -135,6 +152,7 @@
 				BB00000600000006 /* Cocoa.framework */,
 				BB00001000000010 /* Metal.framework */,
 				BB00001800000018 /* Accelerate.framework */,
+				BB00003E0000003E /* IOKit.framework */,
 			);
 			name = Frameworks;
 			sourceTree = "<group>";
@@ -175,6 +193,7 @@
 			buildPhases = (
 				FF00000100000001 /* Sources */,
 				CC00000100000001 /* Frameworks */,
+				CC00000200000002 /* Resources */,
 			);
 			buildRules = (
 			);
@@ -222,7 +241,7 @@
 				AA00000300000003 /* PrimeEngine.cpp in Sources */,
 				AA00000700000007 /* MetalCompute.mm in Sources */,
 				AA00000800000008 /* MetalBridge.mm in Sources */,
-				AA00000900000009 /* TaskManager.cpp in Sources */,
+				AA00000900000009 /* TaskManager.mm in Sources */,
 				AA00001000000010 /* PrimeShaders.metal in Sources */,
 				AA00001100000011 /* GPUBackend.cpp in Sources */,
 				AA00001200000012 /* MetalBackend.mm in Sources */,

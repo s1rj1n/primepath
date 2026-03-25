@@ -16,6 +16,7 @@
 #include "Network/CarriageClient.hpp"
 #include "Network/PrimeNetClient.hpp"
 #include "DataTools.hpp"
+#import <IOKit/pwr_mgt/IOPMLib.h>
 
 static NSString *const DATA_DIR = @"/Users/sergeinester/Documents/primes/primelocations";
 
@@ -173,9 +174,12 @@ static const int EQ_HISTORY = 32; // number of vertical bars (time history)
     std::thread _checkThread;
     std::atomic<bool> _benchRunning;
     std::thread _benchThread;
-    // CPU monitoring delta state
-    uint64_t _prevIdleTicks;
-    uint64_t _prevTotalTicks;
+    // CPU monitoring delta state (process-only)
+    uint64_t _prevProcCPU_ns;       // previous process CPU time (user+system) in nanoseconds
+    uint64_t _prevWallClock_ns;     // previous wall clock time in nanoseconds
+    // NEON/SIMD monitoring delta state
+    uint64_t _prevNeonTested;
+    uint64_t _prevNeonRejected;
     // Disk I/O monitoring
     uint64_t _prevDiskReadBytes;
     uint64_t _prevDiskWriteBytes;
@@ -186,11 +190,20 @@ static const int EQ_HISTORY = 32; // number of vertical bars (time history)
     prime::CarriageClient  *_carriage;
     // GIMPS / PrimeNet integration
     primenet::PrimeNetClient *_primenet;
+    // Power management — prevent sleep while tasks are running
+    IOPMAssertionID _sleepAssertionID;
+    BOOL _preventSleepEnabled;
     // Test catalog
     std::vector<TestCatalogEntry> _testCatalog;
     std::vector<size_t> _testDisplayOrder;  // indices into _testCatalog (flat, with category headers as SIZE_MAX)
     std::vector<std::string> _testCategories; // category names for headers
     int _selectedTestIdx;  // index into _testCatalog, -1 if none
+    // Log ring buffer — batched updates to avoid NSTextView memory accumulation
+    NSMutableArray<NSString *> *_logRing;
+    NSUInteger _logRingHead;
+    NSTimer *_logFlushTimer;
+    NSLock *_logLock;
+    BOOL _logDirty;
 }
 
 @property (strong) NSWindow *mainWindow;
@@ -280,8 +293,27 @@ static const int EQ_HISTORY = 32; // number of vertical bars (time history)
 
 - (void)applicationDidFinishLaunching:(NSNotification *)notification {
     _checkRunning = false;
-    _prevIdleTicks = 0;
-    _prevTotalTicks = 0;
+    _prevProcCPU_ns = 0;
+    _prevWallClock_ns = 0;
+    _prevNeonTested = 0;
+    _prevNeonRejected = 0;
+    _sleepAssertionID = kIOPMNullAssertionID;
+    _preventSleepEnabled = NO;
+
+    // Init log ring buffer (fixed-size circular buffer, ~1000 lines max)
+    static const NSUInteger LOG_RING_CAPACITY = 1000;
+    _logRing = [NSMutableArray arrayWithCapacity:LOG_RING_CAPACITY];
+    for (NSUInteger i = 0; i < LOG_RING_CAPACITY; i++) [_logRing addObject:@""];
+    _logRingHead = 0;
+    _logLock = [[NSLock alloc] init];
+    _logDirty = NO;
+
+    // Flush log buffer to text view every 0.5 seconds (avoids per-message layout)
+    _logFlushTimer = [NSTimer scheduledTimerWithTimeInterval:0.5
+                                                     target:self
+                                                   selector:@selector(flushLogBuffer)
+                                                   userInfo:nil
+                                                    repeats:YES];
 
     // Init GPU backend (abstract -- auto-selects Metal, Vulkan, or CPU)
     _gpu = prime::create_best_backend();
@@ -294,20 +326,31 @@ static const int EQ_HISTORY = 32; // number of vertical bars (time history)
     // Wire callbacks
     __weak AppDelegate *weakSelf = self;
     _taskMgr->set_log_callback([weakSelf](const std::string& msg) {
-        NSString *s = [NSString stringWithFormat:@"%@\n",
-            [NSString stringWithUTF8String:msg.c_str()]];
-        dispatch_async(dispatch_get_main_queue(), ^{
-            [weakSelf appendText:s];
-        });
+        @autoreleasepool {
+            AppDelegate *s = weakSelf;
+            if (!s) return;
+            NSString *line = [NSString stringWithUTF8String:msg.c_str()];
+            [s->_logLock lock];
+            s->_logRing[s->_logRingHead % s->_logRing.count] = line;
+            s->_logRingHead++;
+            s->_logDirty = YES;
+            [s->_logLock unlock];
+        }
     });
     _taskMgr->set_discovery_callback([weakSelf](const prime::Discovery& d) {
-        NSString *s = [NSString stringWithFormat:@">>> DISCOVERY: %s %llu",
-            prime::task_name(d.type), d.value];
-        if (d.value2 > 0) s = [s stringByAppendingFormat:@", %llu", d.value2];
-        s = [s stringByAppendingString:@" <<<\n"];
-        dispatch_async(dispatch_get_main_queue(), ^{
-            [weakSelf appendText:s];
-        });
+        @autoreleasepool {
+            AppDelegate *ss = weakSelf;
+            if (!ss) return;
+            NSString *line = [NSString stringWithFormat:@">>> DISCOVERY: %s %llu",
+                prime::task_name(d.type), d.value];
+            if (d.value2 > 0) line = [line stringByAppendingFormat:@", %llu", d.value2];
+            line = [line stringByAppendingString:@" <<<"];
+            [ss->_logLock lock];
+            ss->_logRing[ss->_logRingHead % ss->_logRing.count] = line;
+            ss->_logRingHead++;
+            ss->_logDirty = YES;
+            [ss->_logLock unlock];
+        }
     });
 
     // Load saved state (restores positions from previous session)
@@ -493,6 +536,17 @@ static const int EQ_HISTORY = 32; // number of vertical bars (time history)
     infoBtn.toolTip = @"Log output glossary";
     infoBtn.autoresizingMask = NSViewMinYMargin;
     [cv addSubview:infoBtn];
+
+    NSButton *preventSleepBtn = [[NSButton alloc] initWithFrame:NSMakeRect(W - M - 200, y - 16, 120, 18)];
+    preventSleepBtn.buttonType = NSButtonTypeSwitch;
+    preventSleepBtn.title = @"Prevent Sleep";
+    preventSleepBtn.font = [NSFont systemFontOfSize:10];
+    preventSleepBtn.toolTip = @"Keep Mac awake (prevents display sleep and system idle sleep)";
+    preventSleepBtn.state = NSControlStateValueOff;
+    preventSleepBtn.target = self;
+    preventSleepBtn.action = @selector(togglePreventSleep:);
+    preventSleepBtn.autoresizingMask = NSViewMinYMargin | NSViewMinXMargin;
+    [cv addSubview:preventSleepBtn];
 
     NSButton *stopAllBtn = [self buttonAt:NSMakeRect(W - M - 70, y - 16, 70, 20)
         title:@"Stop All" action:@selector(stopAll:)];
@@ -785,6 +839,8 @@ static const int EQ_HISTORY = 32; // number of vertical bars (time history)
     scroll.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
     self.resultView = [[NSTextView alloc] initWithFrame:NSMakeRect(0, 0, CW - 4, logHeight)];
     self.resultView.editable = NO;
+    self.resultView.allowsUndo = NO;
+    [self.resultView.undoManager disableUndoRegistration];
     self.resultView.font = [NSFont monospacedSystemFontOfSize:10 weight:NSFontWeightRegular];
     self.resultView.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
     self.resultView.backgroundColor = [NSColor textBackgroundColor];
@@ -2604,7 +2660,7 @@ static const int EQ_HISTORY = 32; // number of vertical bars (time history)
 
 - (void)showHelpPanel:(id)sender {
     NSWindow *helpWin = [[NSWindow alloc]
-        initWithContentRect:NSMakeRect(200, 200, 600, 520)
+        initWithContentRect:NSMakeRect(200, 100, 640, 680)
         styleMask:(NSWindowStyleMaskTitled | NSWindowStyleMaskClosable | NSWindowStyleMaskResizable)
         backing:NSBackingStoreBuffered defer:NO];
     helpWin.title = @"PrimePath Help";
@@ -2613,7 +2669,7 @@ static const int EQ_HISTORY = 32; // number of vertical bars (time history)
     NSScrollView *sv = [[NSScrollView alloc] initWithFrame:helpWin.contentView.bounds];
     sv.hasVerticalScroller = YES;
     sv.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
-    NSTextView *tv = [[NSTextView alloc] initWithFrame:NSMakeRect(0, 0, 580, 800)];
+    NSTextView *tv = [[NSTextView alloc] initWithFrame:NSMakeRect(0, 0, 620, 1600)];
     tv.editable = NO;
     tv.font = [NSFont systemFontOfSize:12];
     tv.autoresizingMask = NSViewWidthSizable;
@@ -2626,7 +2682,8 @@ static const int EQ_HISTORY = 32; // number of vertical bars (time history)
         @"==============\n\n"
         @"PrimePath is a prime number search engine that runs on Apple Silicon GPUs\n"
         @"using Metal compute shaders. It is the first Metal implementation for\n"
-        @"Mersenne trial factoring and Fermat factor searching.\n\n"
+        @"Mersenne trial factoring and Fermat factor searching. Supports multi-device\n"
+        @"distributed computing over the local network.\n\n"
 
         @"SEARCH TASKS\n"
         @"------------\n"
@@ -2645,78 +2702,116 @@ static const int EQ_HISTORY = 32; // number of vertical bars (time history)
         @"  Mersenne TF    Trial factor Mersenne numbers 2^p-1 on GPU.\n"
         @"  Fermat Factor  Find factors of Fermat numbers F_m = 2^(2^m)+1 on GPU.\n\n"
 
+        @"DISTRIBUTED COMPUTING (MULTI-DEVICE)\n"
+        @"------------------------------------\n"
+        @"PrimePath can distribute prime search work across multiple Macs on your\n"
+        @"local network using Bonjour zero-configuration discovery.\n\n"
+
+        @"  Conductor (master):  Coordinates work across all connected machines.\n"
+        @"    - Click 'Start Conductor' to begin accepting worker connections.\n"
+        @"    - Listens on TCP port 9807. Publishes via Bonjour (_primepath._tcp).\n"
+        @"    - Automatically splits search ranges across connected workers.\n"
+        @"    - Aggregates progress and discoveries from all machines.\n"
+        @"    - Reassigns work if a worker disconnects.\n"
+        @"    - The Conductor also participates in computation.\n\n"
+
+        @"  Carriage (worker):  Connects to a Conductor and executes assigned work.\n"
+        @"    - Click 'Start Carriage' to discover and connect to a Conductor.\n"
+        @"    - Auto-discovers Conductors via Bonjour, or enter IP:port manually.\n"
+        @"    - Reports progress every second and discoveries immediately.\n"
+        @"    - Sends machine info (cores, GPU, memory) on connect.\n"
+        @"    - Auto-reconnects if the Conductor connection drops.\n\n"
+
+        @"  Network Status window shows connected machines with hostname, cores,\n"
+        @"  GPU, and status. Updated in real time.\n\n"
+
+        @"GIMPS / PRIMENET\n"
+        @"----------------\n"
+        @"Click 'GIMPS' to connect to the Great Internet Mersenne Prime Search.\n"
+        @"PrimePath submits trial factoring results to mersenne.org via PrimeNet v5.\n\n"
+
+        @"  1. Enter your mersenne.org username and click Register.\n"
+        @"  2. Click 'Get Assignment' to fetch a trial factoring range.\n"
+        @"  3. Click 'Start TF' to begin GPU trial factoring of 2^p-1.\n"
+        @"  4. When the assigned bit range is complete, click 'Submit'.\n\n"
+
+        @"  Factor-found results are submitted immediately.\n"
+        @"  No-factor results require the full range to be exhausted first.\n"
+        @"  Results are also saved to results.json.txt in the data directory.\n\n"
+
         @"EXPRESSION MODE\n"
         @"---------------\n"
-        @"Select 'Expression' from Check & Tools, or just type an expression in\n"
-        @"Check Single mode -- it auto-detects when input contains letters, ^, or ().\n\n"
+        @"Type an expression in the Expression field, or in Check Single mode\n"
+        @"(auto-detects when input contains letters, ^, or parentheses).\n\n"
 
-        @"  Math expressions\n"
-        @"    2^67-1              Evaluate and check primality\n"
-        @"    1e9+7               Scientific notation\n"
-        @"    20!                 Factorial (max 20)\n"
-        @"    1729 mod 13         Modular remainder\n\n"
-
-        @"  Primality & factoring\n"
-        @"    is_prime(997)       Primality test (or: is 997 prime?)\n"
-        @"    factor(1729)        Full prime factorization (or: factor 1729)\n"
-        @"    next prime 10000    Next prime after N\n"
-        @"    prev prime 100     Previous prime before N\n\n"
-
-        @"  Modular arithmetic\n"
-        @"    modpow(2,100,1e9+7) Modular exponentiation: a^b mod m\n"
-        @"    mulmod(a,b,m)       Overflow-safe (a*b) mod m\n\n"
-
-        @"  Number theory\n"
-        @"    pi(1000)            Prime counting function\n"
-        @"    phi(60)             Euler's totient (or: totient(60))\n"
-        @"    gcd(48,36)          Greatest common divisor\n"
-        @"    lcm(48,36)          Least common multiple\n"
-        @"    fibonacci(50)       Fibonacci number (max 93, checks primality)\n"
-        @"    C(10,3)             Binomial coefficient (or: binomial(10,3))\n\n"
-
-        @"  Range searches\n"
-        @"    primes 1000 to 2000    Find all primes in range\n"
-        @"    twin primes 100 200    Find twin prime pairs\n"
-        @"    sophie germain 2 1000  Sophie Germain primes in range\n\n"
-
-        @"  Special tests\n"
-        @"    wieferich 1093      Wieferich test: 2^(p-1) mod p^2 == 1?\n"
-        @"    wilson 563          Wilson test: (p-1)! mod p^2 == p^2-1?\n"
-        @"    mersenne 31         Test Mersenne number M31 = 2^31-1\n"
-        @"    fermat 4            Test Fermat number F4 = 2^16+1\n"
-        @"    convergence(97)     Shadow convergence score\n\n"
+        @"  Math:         2^67-1  1e9+7  20!  1729 mod 13\n"
+        @"  Primality:    is_prime(997)  is 997 prime?\n"
+        @"  Factoring:    factor(1729)  factor 1729\n"
+        @"  Navigation:   next prime 10000  prev prime 100\n"
+        @"  Modular:      modpow(2,100,1e9+7)  mulmod(a,b,m)\n"
+        @"  Counting:     pi(1000)  phi(60)  gcd(48,36)  lcm(48,36)\n"
+        @"  Sequences:    fibonacci(50)  C(10,3)  binomial(10,3)\n"
+        @"  Ranges:       primes 1000 to 2000  twin primes 100 200\n"
+        @"  Special:      wieferich 1093  wilson 563  mersenne 31\n"
+        @"                fermat 4  convergence(97)\n\n"
 
         @"PIPELINE BUILDER\n"
         @"----------------\n"
-        @"Click 'Pipeline' in Check & Tools to open the Search Pipeline Builder.\n"
-        @"Build custom search pipelines by combining stages:\n\n"
+        @"Click 'Pipeline' to build custom search pipelines by combining stages.\n"
+        @"Put cheap filters first to reduce work for expensive tests.\n\n"
 
-        @"  Sieve stages (fast, reduce candidates)\n"
-        @"    Wheel-210           Skip multiples of 2,3,5,7. ~77%% rejection.\n"
-        @"    MatrixSieve         NEON vectorized sieve (primes 3-31). ~77%% rejection.\n"
-        @"    CRT Filter          Chinese Remainder Theorem (primes 11-31). Fast reject.\n"
-        @"    PseudoprimeFilter   Remove known Carmichael/SPRP-2 numbers.\n\n"
+        @"  Sieve:    Wheel-210, MatrixSieve (NEON), CRT Filter, PseudoprimeFilter\n"
+        @"  Score:    Shadow/Convergence, EvenShadow (p+/-1 divisor structure)\n"
+        @"  Test:     Miller-Rabin (CPU), GPU Primality, Wieferich, Wilson, Pair\n"
+        @"  Post:     Factor (Pollard rho), PinchFactor, Lucky7s, DivisorWeb\n\n"
 
-        @"  Scoring stages (rank candidates by quality)\n"
-        @"    Shadow/Convergence  Score using shadow prime field (primes 7-67).\n"
-        @"    EvenShadow          Analyze p+/-1 divisor structure (0-255 score).\n\n"
+        @"  Each stage shows its cost estimate (candidates/sec) and rejection rate.\n\n"
 
-        @"  Test stages (confirm results -- most expensive)\n"
-        @"    Miller-Rabin (CPU)  Deterministic 12-witness primality test.\n"
-        @"    GPU Primality       Metal batch primality test.\n"
-        @"    Wieferich Test      2^(p-1) mod p^2 == 1? (CPU or GPU)\n"
-        @"    Wilson Test         (p-1)! mod p^2 == p^2-1? (CPU only)\n"
-        @"    Pair Test           Twin/Cousin/Sexy prime test (CPU or GPU).\n\n"
+        @"CHECK & TOOLS\n"
+        @"-------------\n"
+        @"  Check Single      Test if a single number is prime.\n"
+        @"  Check From Here   Find primes starting from a number.\n"
+        @"  Check Linear      Enumerate all primes in a range (From/To fields).\n"
+        @"  PrimeLocation     Predict prime locations using convergence algorithm.\n"
+        @"  Expression        Evaluate math expressions and number theory functions.\n\n"
 
-        @"  Post-processing stages\n"
-        @"    Factor (Pollard)    Full factorization via trial + Pollard rho.\n"
-        @"    PinchFactor         Digit-structural factoring heuristic.\n"
-        @"    Lucky7s             Round-number proximity factoring.\n"
-        @"    DivisorWeb          Hierarchical divisor search.\n\n"
+        @"  Benchmark         Run GPU and CPU performance benchmarks.\n"
+        @"  Run Tests         Run the full 108-test engine validation suite.\n"
+        @"  Test Catalog      Browse and run individual tests by category.\n"
+        @"  Pipeline          Build custom search pipelines (see above).\n"
+        @"  GIMPS             PrimeNet trial factoring (see above).\n\n"
 
-        @"  Each stage displays its cost estimate (candidates/sec) and rejection\n"
-        @"  rate so you can build efficient pipelines. Stages execute in order --\n"
-        @"  put cheap filters first to reduce work for expensive tests.\n\n"
+        @"  CheckAtDiscovery  Run Wieferich/WallSunSun/Wilson tests on each\n"
+        @"                    predicted prime as it is found.\n"
+        @"  Run PrimeFactor   Use predicted primes to factor composites\n"
+        @"                    (visible in PrimeLocation mode).\n\n"
+
+        @"PREVENT SLEEP\n"
+        @"-------------\n"
+        @"Check 'Prevent Sleep' (next to Stop All) to keep your Mac awake during\n"
+        @"long-running searches. Prevents both display sleep and system idle sleep.\n"
+        @"Automatically released when unchecked or on quit.\n\n"
+
+        @"SET TEST BOUNDS\n"
+        @"---------------\n"
+        @"Set the starting position for any search. Enter base ^ exponent + 1.\n"
+        @"Example: 2 ^ 64 + 1 starts searching from 2^64 + 1.\n\n"
+
+        @"SEARCH FRONTIER\n"
+        @"---------------\n"
+        @"On launch, PrimePath checks OEIS sequences to determine how far each\n"
+        @"search type has been verified by other projects. If your search position\n"
+        @"is below the known frontier, a warning is shown. Checked every 24 hours.\n\n"
+
+        @"RESOURCE MONITOR\n"
+        @"----------------\n"
+        @"Five EQ-style bars show real-time resource usage:\n"
+        @"  CPU        Process CPU usage across all cores.\n"
+        @"  GPU        Percentage of time GPU is actively computing.\n"
+        @"  NEON/SIMD  NEON vectorized sieve activity and rejection rate.\n"
+        @"  MEMORY     App memory usage (resident size in MB).\n"
+        @"  DISK I/O   Block read/write operations.\n"
+        @"Click 'Hide' to disable the visualizers.\n\n"
 
         @"LOG OUTPUT GLOSSARY\n"
         @"-------------------\n"
@@ -2724,42 +2819,21 @@ static const int EQ_HISTORY = 32; // number of vertical bars (time history)
         @"  WSS/Wief       Abbreviations for Wall-Sun-Sun / Wieferich.\n"
         @"  -> GPU         Candidates dispatched to Metal GPU.\n"
         @"  shadow         Even-shadow pre-filter score. Higher = better candidate.\n"
-        @"  avg/min/max    Shadow score statistics for the batch.\n"
-        @"  suspicious     Low-score candidates (poor p+/-1 divisor structure).\n"
-        @"  fully-factored Candidates whose p-1 is completely factored (best quality).\n"
         @"  pos:           Current search position.\n"
         @"  found:         Discoveries made so far.\n"
         @"  /s             Candidates tested per second.\n\n"
 
-        @"RESOURCE MONITOR\n"
-        @"----------------\n"
-        @"  CPU bar        System-wide CPU usage.\n"
-        @"  Mem bar        App memory usage (resident size).\n"
-        @"  GPU util       Percentage of time GPU is actively computing.\n"
-        @"  threads        Total GPU threads dispatched since launch.\n"
-        @"  batches        Number of GPU command buffers submitted.\n"
-        @"  ms/batch       Average GPU execution time per batch.\n"
-        @"  ALU/NEON       CPU SIMD sieve statistics.\n"
-        @"                 tested = candidates sieved, rejected = composites filtered.\n"
-        @"  Predictor      Pseudoprime predictor. Carm = Carmichael numbers,\n"
-        @"                 SPRP2 = strong probable primes base 2.\n\n"
+        @"DATA FILES\n"
+        @"----------\n"
+        @"All state is saved to: ~/Documents/primes/primelocations/\n\n"
 
-        @"SET TEST BOUNDS\n"
-        @"---------------\n"
-        @"Set the starting position for any search. Enter base ^ exponent + 1.\n"
-        @"Example: 2 ^ 64 + 1 starts searching from 2^64 + 1.\n\n"
+        @"  search_progress.txt   Task positions, status, counts. Auto-saved every 30s.\n"
+        @"  discoveries.txt       All prime discoveries with timestamps.\n"
+        @"  primenet_state.txt    PrimeNet registration, assignments, machine GUID.\n"
+        @"  results.json.txt     Trial factoring results (mfaktc-compatible format).\n"
+        @"  TestCatalog.txt       Custom test catalog (editable, reloadable from UI).\n\n"
 
-        @"CHECK & TOOLS\n"
-        @"-------------\n"
-        @"  Check Single   Test if a single number is prime.\n"
-        @"  Check From     Find primes starting from a number.\n"
-        @"  Check Linear   Enumerate all primes in a range.\n"
-        @"  PrimeLocation  Predict prime locations using the PrimeLocation algorithm.\n"
-        @"  Expression     Evaluate math expressions, number theory functions.\n"
-        @"  Pipeline       Build custom search pipelines (see Pipeline Builder above).\n"
-        @"  Benchmark      Run GPU and CPU performance benchmarks.\n"
-        @"  Run Tests      Run the full 108-test engine validation suite.\n"
-        @"  CheckAtDiscovery  Run special tests on each predicted prime as found.\n\n"
+        @"  Progress is restored automatically on relaunch.\n\n"
 
         @"KEYBOARD SHORTCUTS\n"
         @"------------------\n"
@@ -3029,26 +3103,46 @@ static const int EQ_HISTORY = 32; // number of vertical bars (time history)
 - (void)updateResourceMonitor {
     if (self.disableVisualizerBtn.state == NSControlStateValueOn) return;
 
-    // ── CPU ──
-    host_cpu_load_info_data_t cpuinfo;
-    mach_msg_type_number_t count = HOST_CPU_LOAD_INFO_COUNT;
-    if (host_statistics(mach_host_self(), HOST_CPU_LOAD_INFO,
-                        (host_info_t)&cpuinfo, &count) == KERN_SUCCESS) {
-        uint64_t totalTicks = 0;
-        for (int i = 0; i < CPU_STATE_MAX; i++)
-            totalTicks += cpuinfo.cpu_ticks[i];
-        uint64_t idleTicks = cpuinfo.cpu_ticks[CPU_STATE_IDLE];
-        if (_prevTotalTicks > 0) {
-            uint64_t totalDelta = totalTicks - _prevTotalTicks;
-            uint64_t idleDelta = idleTicks - _prevIdleTicks;
-            if (totalDelta > 0) {
-                double cpuPct = 100.0 * (1.0 - (double)idleDelta / (double)totalDelta);
-                [self.cpuEQ pushValue:cpuPct];
-                [self.cpuEQ setDetail:[NSString stringWithFormat:@"%.0f%%", cpuPct]];
+    // ── CPU (PrimePath process only) ──
+    // Sum CPU time across all threads, compare delta to wall clock.
+    {
+        thread_array_t threadList;
+        mach_msg_type_number_t threadCount;
+        if (task_threads(mach_task_self(), &threadList, &threadCount) == KERN_SUCCESS) {
+            uint64_t totalCPU_ns = 0;
+            for (mach_msg_type_number_t i = 0; i < threadCount; i++) {
+                thread_basic_info_data_t thinfo;
+                mach_msg_type_number_t thcount = THREAD_BASIC_INFO_COUNT;
+                if (thread_info(threadList[i], THREAD_BASIC_INFO,
+                                (thread_info_t)&thinfo, &thcount) == KERN_SUCCESS) {
+                    if (!(thinfo.flags & TH_FLAGS_IDLE)) {
+                        totalCPU_ns += (uint64_t)thinfo.user_time.seconds * 1000000000ULL +
+                                       (uint64_t)thinfo.user_time.microseconds * 1000ULL +
+                                       (uint64_t)thinfo.system_time.seconds * 1000000000ULL +
+                                       (uint64_t)thinfo.system_time.microseconds * 1000ULL;
+                    }
+                }
+                mach_port_deallocate(mach_task_self(), threadList[i]);
             }
+            vm_deallocate(mach_task_self(), (vm_address_t)threadList,
+                          threadCount * sizeof(thread_t));
+
+            uint64_t wallNow = clock_gettime_nsec_np(CLOCK_MONOTONIC);
+            if (_prevProcCPU_ns > 0 && _prevWallClock_ns > 0) {
+                uint64_t cpuDelta = totalCPU_ns - _prevProcCPU_ns;
+                uint64_t wallDelta = wallNow - _prevWallClock_ns;
+                if (wallDelta > 0) {
+                    unsigned nCores = std::thread::hardware_concurrency();
+                    if (nCores < 1) nCores = 1;
+                    double cpuPct = 100.0 * (double)cpuDelta / ((double)wallDelta * nCores);
+                    if (cpuPct > 100.0) cpuPct = 100.0;
+                    [self.cpuEQ pushValue:cpuPct];
+                    [self.cpuEQ setDetail:[NSString stringWithFormat:@"%.0f%%", cpuPct]];
+                }
+            }
+            _prevProcCPU_ns = totalCPU_ns;
+            _prevWallClock_ns = wallNow;
         }
-        _prevTotalTicks = totalTicks;
-        _prevIdleTicks = idleTicks;
     }
 
     // ── Memory ──
@@ -3091,15 +3185,20 @@ static const int EQ_HISTORY = 32; // number of vertical bars (time history)
         [self.gpuEQ setDetail:gpuTasks > 0 ? @"filling" : @"idle"];
     }
 
-    // ── NEON/SIMD ──
+    // ── NEON/SIMD (delta-based activity) ──
     auto* ms = _taskMgr->matrix_sieve();
     if (ms) {
         uint64_t tested = ms->total_tested();
         uint64_t rejected = ms->total_rejected();
-        double rejPct = tested > 0 ? (100.0 * rejected / tested) : 0.0;
-        // Use rejection rate as "activity" - higher rejection = more NEON work
-        double neonActivity = std::min(100.0, rejPct);
-        [self.neonEQ pushValue:tested > 0 ? neonActivity : 0];
+        uint64_t deltaTested = tested - _prevNeonTested;
+        uint64_t deltaRejected = rejected - _prevNeonRejected;
+        _prevNeonTested = tested;
+        _prevNeonRejected = rejected;
+        // Show activity based on throughput delta, not cumulative rate
+        // Scale: 1M tested/interval → 100%
+        double neonActivity = deltaTested > 0 ? std::min(100.0, (double)deltaTested / 1000000.0 * 100.0) : 0.0;
+        double rejPct = deltaTested > 0 ? (100.0 * deltaRejected / deltaTested) : 0.0;
+        [self.neonEQ pushValue:neonActivity];
         [self.neonEQ setDetail:[NSString stringWithFormat:@"%.1f%% rej", rejPct]];
     } else {
         [self.neonEQ pushValue:0];
@@ -3368,6 +3467,39 @@ static const int EQ_HISTORY = 32; // number of vertical bars (time history)
     [win makeKeyAndOrderFront:nil];
 }
 
+// ── Prevent Sleep ────────────────────────────────────────────────────
+
+- (void)togglePreventSleep:(NSButton *)sender {
+    _preventSleepEnabled = (sender.state == NSControlStateValueOn);
+    if (_preventSleepEnabled) {
+        [self acquireSleepAssertion];
+    } else {
+        [self releaseSleepAssertion];
+    }
+}
+
+- (void)acquireSleepAssertion {
+    if (_sleepAssertionID != kIOPMNullAssertionID) return; // already held
+    IOReturn ret = IOPMAssertionCreateWithName(
+        kIOPMAssertionTypePreventUserIdleSystemSleep,
+        kIOPMAssertionLevelOn,
+        CFSTR("PrimePath: prime search tasks running"),
+        &_sleepAssertionID);
+    if (ret == kIOReturnSuccess) {
+        [self appendText:@"Sleep prevention: ON — Mac will stay awake.\n"];
+    } else {
+        _sleepAssertionID = kIOPMNullAssertionID;
+        [self appendText:@"Sleep prevention: failed to acquire power assertion.\n"];
+    }
+}
+
+- (void)releaseSleepAssertion {
+    if (_sleepAssertionID == kIOPMNullAssertionID) return;
+    IOPMAssertionRelease(_sleepAssertionID);
+    _sleepAssertionID = kIOPMNullAssertionID;
+    [self appendText:@"Sleep prevention: OFF — normal power management resumed.\n"];
+}
+
 // ── GIMPS Actions ────────────────────────────────────────────────────
 
 - (void)gimpsRegister:(id)sender {
@@ -3509,6 +3641,23 @@ static const int EQ_HISTORY = 32; // number of vertical bars (time history)
 
     auto& assignment = _primenet->state().assignments.front();
 
+    // Validate range completion: current k must cover bit_hi
+    // q = 2kp + 1, so k_end = (2^bit_hi) / (2 * p)
+    double q_max = pow(2.0, assignment.bit_hi);
+    uint64_t k_end_needed = (uint64_t)(q_max / (2.0 * (double)assignment.exponent));
+    uint64_t k_current = it->second.current_pos;
+    bool range_done = (k_current >= k_end_needed);
+
+    if (!range_done && it->second.status != prime::TaskStatus::Running) {
+        double pct = (k_end_needed > 0) ? (100.0 * k_current / k_end_needed) : 0;
+        [self appendText:[NSString stringWithFormat:
+            @"GIMPS: range NOT complete — k=%llu of %llu needed (%.1f%%). "
+            @"Resume the assignment or submit partial result anyway? "
+            @"Submitting partial no-factor results wastes server resources.\n",
+            k_current, k_end_needed, pct]];
+        // Still allow submission (user may want to report a found factor)
+    }
+
     // Check discoveries for this exponent
     bool found_factor = false;
     std::string factor_str;
@@ -3520,6 +3669,13 @@ static const int EQ_HISTORY = 32; // number of vertical bars (time history)
         }
     }
 
+    if (!found_factor && !range_done) {
+        [self appendText:@"GIMPS: WARNING — no factor found and range incomplete. "
+            @"Submitting 'no factor' without completing the full range is invalid. "
+            @"Continue running the assignment first.\n"];
+        return;
+    }
+
     primenet::TFResult result;
     result.exponent = assignment.exponent;
     result.bit_lo = assignment.bit_lo;
@@ -3527,7 +3683,15 @@ static const int EQ_HISTORY = 32; // number of vertical bars (time history)
     result.factor_found = found_factor;
     result.factor = factor_str;
     result.assignment_key = assignment.key;
-    result.range_complete = (it->second.status != prime::TaskStatus::Running);
+    result.range_complete = range_done;
+
+    NSString *summaryMsg = [NSString stringWithFormat:
+        @"GIMPS: submitting M%llu %@ (bits %d-%d, k=%llu/%llu)\n",
+        assignment.exponent,
+        found_factor ? @"FACTOR FOUND" : @"no factor",
+        (int)assignment.bit_lo, (int)assignment.bit_hi,
+        k_current, k_end_needed];
+    [self appendText:summaryMsg];
 
     __weak AppDelegate *weakSelf = self;
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
@@ -3537,9 +3701,9 @@ static const int EQ_HISTORY = 32; // number of vertical bars (time history)
             bool ok = s->_primenet->submit_result(result);
             dispatch_async(dispatch_get_main_queue(), ^{
                 if (ok) {
-                    [s appendText:@"GIMPS: result submitted to mersenne.org.\n"];
+                    [s appendText:@"GIMPS: result submitted to mersenne.org successfully.\n"];
                 } else {
-                    [s appendText:@"GIMPS: failed to submit result. Check log.\n"];
+                    [s appendText:@"GIMPS: FAILED to submit result. Check PrimeNet log for details.\n"];
                 }
             });
         }
@@ -4274,16 +4438,48 @@ static const int kNumPipelineStages = sizeof(kPipelineStages) / sizeof(kPipeline
 }
 
 - (void)appendText:(NSString *)text {
-    NSAttributedString *attr = [[NSAttributedString alloc]
-        initWithString:text
-        attributes:@{
-            NSFontAttributeName: [NSFont monospacedSystemFontOfSize:11 weight:NSFontWeightRegular],
-            NSForegroundColorAttributeName: [NSColor labelColor]
-        }];
-    [self.resultView.textStorage appendAttributedString:attr];
-    [self.resultView scrollRangeToVisible:NSMakeRange(self.resultView.string.length, 0)];
-    // Prevent macOS from thinking the window has an unsaved document
-    [self.mainWindow setDocumentEdited:NO];
+    // For non-log-callback callers (UI commands, discoveries, etc.)
+    // Route through the ring buffer for consistency
+    [_logLock lock];
+    // Split by newlines so each line is a ring entry
+    NSArray *lines = [text componentsSeparatedByString:@"\n"];
+    for (NSString *line in lines) {
+        if (line.length == 0) continue;
+        _logRing[_logRingHead % _logRing.count] = line;
+        _logRingHead++;
+    }
+    _logDirty = YES;
+    [_logLock unlock];
+}
+
+- (void)flushLogBuffer {
+    if (!_logDirty) return;
+
+    [_logLock lock];
+    // Build the visible text from the ring buffer (most recent lines)
+    NSUInteger capacity = _logRing.count;
+    NSUInteger count = MIN(_logRingHead, capacity);
+    NSUInteger start = (_logRingHead > capacity) ? (_logRingHead - capacity) : 0;
+    NSMutableString *text = [NSMutableString stringWithCapacity:count * 80];
+    for (NSUInteger i = start; i < _logRingHead; i++) {
+        NSString *line = _logRing[i % capacity];
+        [text appendString:line];
+        [text appendString:@"\n"];
+    }
+    _logDirty = NO;
+    [_logLock unlock];
+
+    // Replace entire text content (no incremental append = no layout accumulation)
+    NSTextStorage *ts = self.resultView.textStorage;
+    NSDictionary *attrs = @{
+        NSFontAttributeName: [NSFont monospacedSystemFontOfSize:11 weight:NSFontWeightRegular],
+        NSForegroundColorAttributeName: [NSColor labelColor]
+    };
+    NSAttributedString *attr = [[NSAttributedString alloc] initWithString:text attributes:attrs];
+    [ts beginEditing];
+    [ts setAttributedString:attr];
+    [ts endEditing];
+    [self.resultView scrollRangeToVisible:NSMakeRange(ts.length, 0)];
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -4769,6 +4965,9 @@ static const int kNumPipelineStages = sizeof(kPipelineStages) / sizeof(kPipeline
     self.refreshTimer = nil;
     [self.frontierCheckTimer invalidate];
     self.frontierCheckTimer = nil;
+
+    // Release sleep prevention
+    [self releaseSleepAssertion];
 
     // Signal all background threads to stop
     _checkRunning.store(false);
