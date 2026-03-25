@@ -292,6 +292,14 @@ static const int EQ_HISTORY = 32; // number of vertical bars (time history)
 @implementation AppDelegate
 
 - (void)applicationDidFinishLaunching:(NSNotification *)notification {
+    // Set app icon explicitly for Dock
+    NSImage *appIcon = [NSImage imageNamed:@"AppIcon"];
+    if (!appIcon) {
+        NSString *iconPath = [[NSBundle mainBundle] pathForResource:@"AppIcon" ofType:@"icns"];
+        if (iconPath) appIcon = [[NSImage alloc] initWithContentsOfFile:iconPath];
+    }
+    if (appIcon) [NSApp setApplicationIconImage:appIcon];
+
     _checkRunning = false;
     _prevProcCPU_ns = 0;
     _prevWallClock_ns = 0;
