@@ -250,6 +250,10 @@ public:
     // Mersenne TF sets this to MersenneTrial. Other tasks check and go CPU-only.
     std::atomic<int> gpu_owner{-1}; // -1 = shared, else = (int)TaskType owner
 
+    // Carry-chain mulmod toggle: when true, use hardware carry-chain approach
+    // instead of binary shift-and-add for 128-bit modular multiplication
+    std::atomic<bool> use_carry_chain{false};
+
 private:
     std::string _data_dir;
     std::map<TaskType, SearchTask> _tasks;

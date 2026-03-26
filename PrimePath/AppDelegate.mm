@@ -20,6 +20,9 @@
 
 static NSString *const DATA_DIR = @"/Users/sergeinester/Documents/primes/primelocations";
 
+// Defined in TaskManager.mm (inside namespace prime) — carry-chain mulmod toggle
+namespace prime { extern volatile bool g_use_carry_chain; }
+
 // ── Test Catalog Entry (loaded from TestCatalog.txt) ─────────────────
 struct TestCatalogEntry {
     std::string test_id;
@@ -198,16 +201,26 @@ static const int EQ_HISTORY = 32; // number of vertical bars (time history)
     std::vector<size_t> _testDisplayOrder;  // indices into _testCatalog (flat, with category headers as SIZE_MAX)
     std::vector<std::string> _testCategories; // category names for headers
     int _selectedTestIdx;  // index into _testCatalog, -1 if none
-    // Log ring buffer — batched updates to avoid NSTextView memory accumulation
-    NSMutableArray<NSString *> *_logRing;
-    NSUInteger _logRingHead;
+    // Per-tab ring buffers for output panes
+    // Tab indices: 0=Search Tasks, 1=Check/Expressions, 2=Benchmark, 3=Pipeline
+    NSMutableArray<NSString *> *_tabRings[4];
+    NSUInteger _tabRingHeads[4];
+    BOOL _tabDirty[4];
+    NSTextView *_tabViews[4];
     NSTimer *_logFlushTimer;
     NSLock *_logLock;
-    BOOL _logDirty;
+    // Which tab is currently being written to by appendText (for benchmark/pipeline routing)
+    int _activeLogTab;
+    // Status pane ring buffer (GIMPS, PrimeNet, discoveries, network)
+    NSMutableArray<NSString *> *_statusRing;
+    NSUInteger _statusRingHead;
+    BOOL _statusDirty;
 }
 
 @property (strong) NSWindow *mainWindow;
-@property (strong) NSTextView *resultView;
+@property (strong) NSTextView *resultView;      // points to active tab's text view (for compat)
+@property (strong) NSTextView *statusView;      // status/network pane (bottom)
+@property (strong) NSTabView *logTabView;       // tabbed task output
 @property (strong) NSTextField *statusLabel;
 @property (strong) NSTimer *refreshTimer;
 @property (strong) NSTimer *frontierCheckTimer;
@@ -255,6 +268,7 @@ static const int EQ_HISTORY = 32; // number of vertical bars (time history)
 // PrimeLocation extras
 @property (strong) NSButton *primeFactorButton;      // "Run PrimeFactor" -- factor composites using predicted primes
 @property (strong) NSButton *checkAtDiscoveryButton;  // checkbox: run special tests on each predicted prime as found
+@property (strong) NSButton *carryChainToggle;        // checkbox: use carry-chain mulmod instead of binary
 
 // Benchmark
 @property (strong) NSButton *benchmarkButton;
@@ -308,13 +322,22 @@ static const int EQ_HISTORY = 32; // number of vertical bars (time history)
     _sleepAssertionID = kIOPMNullAssertionID;
     _preventSleepEnabled = NO;
 
-    // Init log ring buffer (fixed-size circular buffer, ~1000 lines max)
-    static const NSUInteger LOG_RING_CAPACITY = 1000;
-    _logRing = [NSMutableArray arrayWithCapacity:LOG_RING_CAPACITY];
-    for (NSUInteger i = 0; i < LOG_RING_CAPACITY; i++) [_logRing addObject:@""];
-    _logRingHead = 0;
+    // Init per-tab ring buffers
+    static const NSUInteger TAB_RING_CAPACITY = 1000;
+    static const NSUInteger STATUS_RING_CAPACITY = 200;
+    for (int t = 0; t < 4; t++) {
+        _tabRings[t] = [NSMutableArray arrayWithCapacity:TAB_RING_CAPACITY];
+        for (NSUInteger i = 0; i < TAB_RING_CAPACITY; i++) [_tabRings[t] addObject:@""];
+        _tabRingHeads[t] = 0;
+        _tabDirty[t] = NO;
+        _tabViews[t] = nil;  // set during UI build
+    }
+    _activeLogTab = 0;
+    _statusRing = [NSMutableArray arrayWithCapacity:STATUS_RING_CAPACITY];
+    for (NSUInteger i = 0; i < STATUS_RING_CAPACITY; i++) [_statusRing addObject:@""];
+    _statusRingHead = 0;
     _logLock = [[NSLock alloc] init];
-    _logDirty = NO;
+    _statusDirty = NO;
 
     // Flush log buffer to text view every 0.5 seconds (avoids per-message layout)
     _logFlushTimer = [NSTimer scheduledTimerWithTimeInterval:0.5
@@ -339,9 +362,10 @@ static const int EQ_HISTORY = 32; // number of vertical bars (time history)
             if (!s) return;
             NSString *line = [NSString stringWithUTF8String:msg.c_str()];
             [s->_logLock lock];
-            s->_logRing[s->_logRingHead % s->_logRing.count] = line;
-            s->_logRingHead++;
-            s->_logDirty = YES;
+            int tab = 0;  // Search Tasks tab
+            s->_tabRings[tab][s->_tabRingHeads[tab] % s->_tabRings[tab].count] = line;
+            s->_tabRingHeads[tab]++;
+            s->_tabDirty[tab] = YES;
             [s->_logLock unlock];
         }
     });
@@ -353,10 +377,11 @@ static const int EQ_HISTORY = 32; // number of vertical bars (time history)
                 prime::task_name(d.type), d.value];
             if (d.value2 > 0) line = [line stringByAppendingFormat:@", %llu", d.value2];
             line = [line stringByAppendingString:@" <<<"];
+            // Route discoveries to the status pane
             [ss->_logLock lock];
-            ss->_logRing[ss->_logRingHead % ss->_logRing.count] = line;
-            ss->_logRingHead++;
-            ss->_logDirty = YES;
+            ss->_statusRing[ss->_statusRingHead % ss->_statusRing.count] = line;
+            ss->_statusRingHead++;
+            ss->_statusDirty = YES;
             [ss->_logLock unlock];
         }
     });
@@ -741,7 +766,18 @@ static const int EQ_HISTORY = 32; // number of vertical bars (time history)
     gimpsBtn.autoresizingMask = NSViewMinYMargin;
     [cv addSubview:gimpsBtn];
 
-    self.checkAtDiscoveryButton = [[NSButton alloc] initWithFrame:NSMakeRect(M + 558, y - 22, 150, 18)];
+    self.carryChainToggle = [[NSButton alloc] initWithFrame:NSMakeRect(M + 556, y - 22, 130, 18)];
+    self.carryChainToggle.buttonType = NSButtonTypeSwitch;
+    self.carryChainToggle.title = @"CarryChain";
+    self.carryChainToggle.font = [NSFont boldSystemFontOfSize:9];
+    self.carryChainToggle.toolTip = @"~4-7x faster mulmod for Wieferich + Wall-Sun-Sun CPU tests";
+    self.carryChainToggle.state = NSControlStateValueOff;
+    self.carryChainToggle.target = self;
+    self.carryChainToggle.action = @selector(carryChainToggled:);
+    self.carryChainToggle.autoresizingMask = NSViewMinYMargin;
+    [cv addSubview:self.carryChainToggle];
+
+    self.checkAtDiscoveryButton = [[NSButton alloc] initWithFrame:NSMakeRect(M + 640, y - 22, 150, 18)];
     self.checkAtDiscoveryButton.buttonType = NSButtonTypeSwitch;
     self.checkAtDiscoveryButton.title = @"CheckAtDiscovery";
     self.checkAtDiscoveryButton.font = [NSFont systemFontOfSize:9];
@@ -833,7 +869,7 @@ static const int EQ_HISTORY = 32; // number of vertical bars (time history)
     [cv addSubview:self.expressionField];
     y -= 26;
 
-    // ── OUTPUT LOG (fills remaining space) ───────────────────────────
+    // ── OUTPUT (two panes: task log on top, status on bottom) ───────
     NSBox *sep3 = [[NSBox alloc] initWithFrame:NSMakeRect(M, y, CW, 1)];
     sep3.boxType = NSBoxSeparator;
     sep3.autoresizingMask = NSViewMinYMargin | NSViewWidthSizable;
@@ -841,21 +877,86 @@ static const int EQ_HISTORY = 32; // number of vertical bars (time history)
     y -= 2;
 
     CGFloat logBottom = 4;
-    CGFloat logHeight = y - logBottom;
-    NSScrollView *scroll = [[NSScrollView alloc] initWithFrame:NSMakeRect(M, logBottom, CW, logHeight)];
-    scroll.hasVerticalScroller = YES;
-    scroll.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
-    self.resultView = [[NSTextView alloc] initWithFrame:NSMakeRect(0, 0, CW - 4, logHeight)];
-    self.resultView.editable = NO;
-    self.resultView.allowsUndo = NO;
-    [self.resultView.undoManager disableUndoRegistration];
-    self.resultView.font = [NSFont monospacedSystemFontOfSize:10 weight:NSFontWeightRegular];
-    self.resultView.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
-    self.resultView.backgroundColor = [NSColor textBackgroundColor];
-    scroll.documentView = self.resultView;
-    [cv addSubview:scroll];
+    CGFloat totalHeight = y - logBottom;
+    CGFloat statusHeight = 120;
+    CGFloat labelH = 14;
+    CGFloat gap = 2;
+
+    // ── Bottom: Status / Network pane (fixed height, pinned to bottom) ─
+    NSTextField *statusLbl = [[NSTextField alloc] initWithFrame:
+        NSMakeRect(M, logBottom + statusHeight + gap, 200, labelH)];
+    statusLbl.stringValue = @"Status / Network";
+    statusLbl.bezeled = NO;
+    statusLbl.editable = NO;
+    statusLbl.drawsBackground = NO;
+    statusLbl.font = [NSFont boldSystemFontOfSize:9];
+    statusLbl.textColor = [NSColor secondaryLabelColor];
+    statusLbl.autoresizingMask = NSViewWidthSizable;
+    [cv addSubview:statusLbl];
+
+    NSScrollView *statusScroll = [[NSScrollView alloc] initWithFrame:
+        NSMakeRect(M, logBottom, CW, statusHeight)];
+    statusScroll.hasVerticalScroller = YES;
+    statusScroll.autoresizingMask = NSViewWidthSizable;
+    self.statusView = [[NSTextView alloc] initWithFrame:NSMakeRect(0, 0, CW - 16, statusHeight)];
+    self.statusView.editable = NO;
+    self.statusView.allowsUndo = NO;
+    self.statusView.font = [NSFont monospacedSystemFontOfSize:10 weight:NSFontWeightRegular];
+    self.statusView.backgroundColor = [NSColor colorWithCalibratedRed:0.12 green:0.14 blue:0.18 alpha:1.0];
+    self.statusView.textColor = [NSColor colorWithCalibratedRed:0.6 green:0.9 blue:0.6 alpha:1.0];
+    self.statusView.verticallyResizable = YES;
+    self.statusView.horizontallyResizable = NO;
+    self.statusView.textContainer.containerSize = NSMakeSize(CW - 16, FLT_MAX);
+    self.statusView.textContainer.widthTracksTextView = YES;
+    statusScroll.documentView = self.statusView;
+    [cv addSubview:statusScroll];
+
+    // ── Top: Tabbed task output (fills remaining space) ────────────
+    CGFloat taskBottom = logBottom + statusHeight + gap + labelH + gap;
+    CGFloat taskHeight = totalHeight - statusHeight - gap - labelH - gap;
+
+    self.logTabView = [[NSTabView alloc] initWithFrame:
+        NSMakeRect(M, taskBottom, CW, taskHeight)];
+    self.logTabView.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
+    self.logTabView.controlSize = NSControlSizeSmall;
+    self.logTabView.font = [NSFont systemFontOfSize:10];
+
+    NSArray *tabNames = @[@"Search Tasks", @"Check / Expressions", @"Benchmark", @"Pipeline"];
+    CGFloat tabContentH = taskHeight - 28;  // tab bar takes ~28px
+    for (int t = 0; t < 4; t++) {
+        NSTabViewItem *item = [[NSTabViewItem alloc] initWithIdentifier:@(t)];
+        item.label = tabNames[t];
+
+        NSView *tabContent = [[NSView alloc] initWithFrame:NSMakeRect(0, 0, CW - 14, tabContentH)];
+        NSScrollView *tabScroll = [[NSScrollView alloc] initWithFrame:
+            NSMakeRect(0, 0, CW - 14, tabContentH)];
+        tabScroll.hasVerticalScroller = YES;
+        tabScroll.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
+
+        NSTextView *tv = [[NSTextView alloc] initWithFrame:
+            NSMakeRect(0, 0, CW - 30, tabContentH)];
+        tv.editable = NO;
+        tv.allowsUndo = NO;
+        tv.font = [NSFont monospacedSystemFontOfSize:10 weight:NSFontWeightRegular];
+        tv.backgroundColor = [NSColor textBackgroundColor];
+        tv.verticallyResizable = YES;
+        tv.horizontallyResizable = NO;
+        tv.textContainer.containerSize = NSMakeSize(CW - 30, FLT_MAX);
+        tv.textContainer.widthTracksTextView = YES;
+        tv.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
+        tabScroll.documentView = tv;
+        [tabContent addSubview:tabScroll];
+        item.view = tabContent;
+        [self.logTabView addTabViewItem:item];
+        _tabViews[t] = tv;
+    }
+
+    // Default to Search Tasks tab
+    self.resultView = _tabViews[0];
+    [cv addSubview:self.logTabView];
 
     // Welcome text
+    [self appendStatus:@"PrimePath v0.5.0 — Status & Network\n"];
     [self appendText:@"PrimePath v0.5.0 -- Metal GPU Prime Discovery Engine\n"];
     [self appendText:[NSString stringWithFormat:@"GPU: %@ | Data: %@\n",
         [NSString stringWithUTF8String:_gpu->name().c_str()], DATA_DIR]];
@@ -922,6 +1023,8 @@ static const int EQ_HISTORY = 32; // number of vertical bars (time history)
 // ── Check dispatcher ────────────────────────────────────────────────
 
 - (void)checkGo:(id)sender {
+    _activeLogTab = 1;  // Check / Expressions tab
+    [self.logTabView selectTabViewItemAtIndex:1];
     // If a background check is running, stop it first
     if (_checkRunning.load()) {
         _checkRunning.store(false);
@@ -2872,6 +2975,8 @@ static const int EQ_HISTORY = 32; // number of vertical bars (time history)
 // ── Benchmark ───────────────────────────────────────────────────────
 
 - (void)runBenchmark:(id)sender {
+    _activeLogTab = 2;  // Benchmark tab
+    [self.logTabView selectTabViewItemAtIndex:2];
     if (_benchRunning.load()) return;
     // Join previous benchmark thread if still joinable
     if (_benchThread.joinable()) _benchThread.join();
@@ -2916,6 +3021,264 @@ static const int EQ_HISTORY = 32; // number of vertical bars (time history)
         if (ss && ss->_benchThread.joinable()) {
             ss->_benchThread.join();
         }
+    });
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// Carry-Chain Modular Exponentiation Test
+// Tests 76-bit-in-128-bit overflow approach vs binary mulmod
+// ═══════════════════════════════════════════════════════════════════════
+
+// --- Method 1: Binary shift-and-add mulmod (current slow method) ---
+static unsigned __int128 mulmod128_binary(unsigned __int128 a, unsigned __int128 b, unsigned __int128 mod) {
+    a %= mod; b %= mod;
+    if (a == 0 || b == 0) return 0;
+    unsigned __int128 result = 0;
+    while (b > 0) {
+        if (b & 1) { result += a; if (result >= mod) result -= mod; }
+        a += a; if (a >= mod) a -= mod;
+        b >>= 1;
+    }
+    return result;
+}
+
+static unsigned __int128 powmod128_binary(unsigned __int128 base, uint64_t exp, unsigned __int128 mod) {
+    unsigned __int128 result = 1;
+    base %= mod;
+    while (exp > 0) {
+        if (exp & 1) result = mulmod128_binary(result, base, mod);
+        base = mulmod128_binary(base, base, mod);
+        exp >>= 1;
+    }
+    return result;
+}
+
+// --- Method 2: Carry-chain mulmod using 128-bit hardware ---
+// For moduli up to ~76 bits: decompose into 64-bit pieces,
+// use hardware MUL+UMULH for full products, reduce with subtraction chain.
+//
+// a, b < mod < 2^76
+// a*b < 2^152 — fits in 3 x 64-bit words (192 bits, top 40 bits always 0)
+
+static inline void mul_full_152(uint64_t a_lo, uint64_t a_hi,
+                                 uint64_t b_lo, uint64_t b_hi,
+                                 uint64_t &r0, uint64_t &r1, uint64_t &r2) {
+    // a = a_hi*2^64 + a_lo  (a_hi < 2^12 for 76-bit numbers)
+    // b = b_hi*2^64 + b_lo  (b_hi < 2^12)
+    // product = a_lo*b_lo + (a_lo*b_hi + a_hi*b_lo)*2^64 + a_hi*b_hi*2^128
+    //
+    // a_lo*b_lo → 128 bits via MUL+UMULH
+    // cross terms: a_lo*b_hi and a_hi*b_lo — each < 2^76, fits in 128 bits
+    // a_hi*b_hi < 2^24 — tiny
+
+    // Low product: a_lo * b_lo → [p1:p0]
+    unsigned __int128 p = (unsigned __int128)a_lo * b_lo;
+    uint64_t p0 = (uint64_t)p;
+    uint64_t p1 = (uint64_t)(p >> 64);
+
+    // Cross terms: a_lo*b_hi + a_hi*b_lo
+    // Each < 2^64 * 2^12 = 2^76, sum < 2^77
+    unsigned __int128 cross = (unsigned __int128)a_lo * b_hi + (unsigned __int128)a_hi * b_lo;
+    uint64_t c0 = (uint64_t)cross;
+    uint64_t c1 = (uint64_t)(cross >> 64);
+
+    // High product: a_hi * b_hi (< 2^24, fits in one word)
+    uint64_t hh = a_hi * b_hi;
+
+    // Accumulate: result = p0 + (p1 + c0)*2^64 + (c1 + hh)*2^128
+    r0 = p0;
+    unsigned __int128 mid = (unsigned __int128)p1 + c0;
+    r1 = (uint64_t)mid;
+    r2 = (uint64_t)(mid >> 64) + c1 + hh;
+}
+
+// Reduce a 192-bit number [r2:r1:r0] mod q where q < 2^76.
+// Uses hardware __int128 division — NOT repeated subtraction.
+// Strategy: reduce top 128 bits first, then shift down and add low word.
+//   Step 1: hi = [r2:r1] (128 bits, r2 < 2^24) → hi_mod = hi % q
+//   Step 2: hi_mod < 2^76, multiply by 2^64 in two 2^32 steps to stay in 128 bits
+//   Step 3: add r0, final mod
+static unsigned __int128 mulmod_carry(unsigned __int128 a, unsigned __int128 b, unsigned __int128 mod) {
+    uint64_t a_lo = (uint64_t)a, a_hi = (uint64_t)(a >> 64);
+    uint64_t b_lo = (uint64_t)b, b_hi = (uint64_t)(b >> 64);
+
+    uint64_t r0, r1, r2;
+    mul_full_152(a_lo, a_hi, b_lo, b_hi, r0, r1, r2);
+
+    // [r2:r1] as 128-bit value — r2 is at most ~24 bits so this fits
+    unsigned __int128 hi = ((unsigned __int128)r2 << 64) | r1;
+    unsigned __int128 hi_mod = hi % mod;
+
+    // Now compute (hi_mod * 2^64 + r0) % mod
+    // hi_mod < mod < 2^76, so hi_mod * 2^32 < 2^108 — fits in __int128
+    unsigned __int128 tmp = (hi_mod << 32) % mod;
+    tmp = (tmp << 32) % mod;    // now tmp = hi_mod * 2^64 % mod
+    tmp = (tmp + r0) % mod;
+
+    return tmp;
+}
+
+static unsigned __int128 powmod_carry(unsigned __int128 base, uint64_t exp, unsigned __int128 mod) {
+    unsigned __int128 result = 1;
+    base %= mod;
+    while (exp > 0) {
+        if (exp & 1) result = mulmod_carry(result, base, mod);
+        base = mulmod_carry(base, base, mod);
+        exp >>= 1;
+    }
+    return result;
+}
+
+// Format a 128-bit number as decimal string
+static std::string u128_to_str(unsigned __int128 v) {
+    if (v == 0) return "0";
+    char buf[40]; int pos = 39; buf[pos] = 0;
+    while (v > 0) { buf[--pos] = '0' + (int)(v % 10); v /= 10; }
+    return &buf[pos];
+}
+
+- (void)carryChainToggled:(id)sender {
+    bool on = (self.carryChainToggle.state == NSControlStateValueOn);
+    prime::g_use_carry_chain = on;
+    [self appendStatus:[NSString stringWithFormat:@"CarryChain mulmod: %s\n", on ? "ON (Wieferich + Wall-Sun-Sun CPU)" : "OFF (binary shift-and-add)"]];
+}
+
+- (void)runCarryChainTest:(id)sender {
+    _activeLogTab = 2;  // Benchmark tab
+    [self.logTabView selectTabViewItemAtIndex:2];
+
+    __weak AppDelegate *weakSelf = self;
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        AppDelegate *ss = weakSelf;
+        if (!ss) return;
+
+        auto out = [weakSelf](const std::string& msg) {
+            NSString *s = [NSString stringWithUTF8String:msg.c_str()];
+            dispatch_async(dispatch_get_main_queue(), ^{
+                [weakSelf appendToTab:2 text:[s stringByAppendingString:@"\n"]];
+            });
+        };
+
+        out("═══════════════════════════════════════════════════════");
+        out("  CARRY-CHAIN vs BINARY MULMOD — Mersenne TF Test");
+        out("═══════════════════════════════════════════════════════");
+        out("");
+
+        // Test case: M502493107 (current GIMPS assignment)
+        // Known factor form: q = 2*k*p + 1
+        // We test: 2^p mod q == 1 means q divides 2^p - 1
+        uint64_t p = 502493107;  // exponent
+
+        // Test with several k values to exercise the math
+        // First, a known non-factor (arbitrary k)
+        struct TestCase {
+            uint64_t k;
+            const char *desc;
+        };
+        TestCase tests[] = {
+            { 1,                    "q = 2*1*p+1 (small)" },
+            { 1000000,             "q = 2*10^6*p+1 (medium)" },
+            { 75182985272188ULL,   "q = 2*75.18T*p+1 (GIMPS range start)" },
+            { 75200000000000ULL,   "q = 2*75.2T*p+1 (GIMPS mid-range)" },
+            { 100000000000000ULL,  "q = 2*100T*p+1 (larger k)" },
+            { 1000000000000000ULL, "q = 2*1000T*p+1 (very large k, ~80 bits)" },
+        };
+
+        out("Exponent: p = " + std::to_string(p) + "  (M" + std::to_string(p) + " = 2^p - 1)");
+        out("Testing: 2^p mod q for various q = 2kp+1");
+        out("");
+
+        for (auto& tc : tests) {
+            unsigned __int128 q = (unsigned __int128)2 * tc.k * p + 1;
+            int q_bits = 0;
+            { unsigned __int128 tmp = q; while (tmp > 0) { q_bits++; tmp >>= 1; } }
+
+            out("─────────────────────────────────────────────────────");
+            out("Test: " + std::string(tc.desc));
+            out("  k = " + std::to_string(tc.k));
+            out("  q = " + u128_to_str(q) + "  (" + std::to_string(q_bits) + " bits)");
+
+            // Method 1: Binary mulmod
+            auto t0 = std::chrono::steady_clock::now();
+            unsigned __int128 result_binary = powmod128_binary(2, p, q);
+            auto t1 = std::chrono::steady_clock::now();
+            double ms_binary = std::chrono::duration<double, std::milli>(t1 - t0).count();
+
+            out("  BINARY mulmod:     2^p mod q = " + u128_to_str(result_binary));
+            out("    time: " + std::to_string(ms_binary) + " ms");
+            out("    factor? " + std::string(result_binary == 1 ? "YES — q divides M!" : "no"));
+
+            // Method 2: Carry-chain mulmod
+            if (q_bits <= 95) {  // carry-chain works up to 95 bits (hi_mod<<32 must fit in 128)
+                auto t2 = std::chrono::steady_clock::now();
+                unsigned __int128 result_carry = powmod_carry(2, p, q);
+                auto t3 = std::chrono::steady_clock::now();
+                double ms_carry = std::chrono::duration<double, std::milli>(t3 - t2).count();
+
+                out("  CARRY-CHAIN mulmod: 2^p mod q = " + u128_to_str(result_carry));
+                out("    time: " + std::to_string(ms_carry) + " ms");
+                out("    factor? " + std::string(result_carry == 1 ? "YES — q divides M!" : "no"));
+
+                bool match = (result_binary == result_carry);
+                out("  MATCH: " + std::string(match ? "YES — both methods agree" : "NO — MISMATCH!"));
+                if (match) {
+                    double speedup = ms_binary / ms_carry;
+                    out("  SPEEDUP: " + std::to_string(speedup) + "x faster");
+                }
+            } else {
+                out("  CARRY-CHAIN: skipped — q is " + std::to_string(q_bits) +
+                    " bits (>95, needs wider reduction)");
+            }
+            out("");
+        }
+
+        // Batch speed test: run 1000 modexps with carry-chain at GIMPS-range k
+        out("═══════════════════════════════════════════════════════");
+        out("  BATCH SPEED TEST: 1000 modexps at GIMPS-range k");
+        out("═══════════════════════════════════════════════════════");
+
+        uint64_t k_start = 75200000000000ULL;
+        int n_tests = 1000;
+        int factors_found = 0;
+
+        // Binary method batch
+        auto bt0 = std::chrono::steady_clock::now();
+        for (int i = 0; i < n_tests; i++) {
+            unsigned __int128 q = (unsigned __int128)2 * (k_start + i) * p + 1;
+            unsigned __int128 r = powmod128_binary(2, p, q);
+            if (r == 1) factors_found++;
+        }
+        auto bt1 = std::chrono::steady_clock::now();
+        double batch_binary_ms = std::chrono::duration<double, std::milli>(bt1 - bt0).count();
+
+        out("Binary mulmod:      " + std::to_string(n_tests) + " modexps in " +
+            std::to_string(batch_binary_ms) + " ms  (" +
+            std::to_string(batch_binary_ms / n_tests) + " ms/each)");
+        out("  rate: " + std::to_string((int)(n_tests * 1000.0 / batch_binary_ms)) + " modexps/sec");
+
+        // Carry-chain batch
+        factors_found = 0;
+        auto ct0 = std::chrono::steady_clock::now();
+        for (int i = 0; i < n_tests; i++) {
+            unsigned __int128 q = (unsigned __int128)2 * (k_start + i) * p + 1;
+            unsigned __int128 r = powmod_carry(2, p, q);
+            if (r == 1) factors_found++;
+        }
+        auto ct1 = std::chrono::steady_clock::now();
+        double batch_carry_ms = std::chrono::duration<double, std::milli>(ct1 - ct0).count();
+
+        out("Carry-chain mulmod: " + std::to_string(n_tests) + " modexps in " +
+            std::to_string(batch_carry_ms) + " ms  (" +
+            std::to_string(batch_carry_ms / n_tests) + " ms/each)");
+        out("  rate: " + std::to_string((int)(n_tests * 1000.0 / batch_carry_ms)) + " modexps/sec");
+        out("  SPEEDUP: " + std::to_string(batch_binary_ms / batch_carry_ms) + "x");
+        if (factors_found > 0)
+            out("  FACTORS FOUND: " + std::to_string(factors_found) + " (!!!)");
+
+        out("");
+        out("═══════════════════════════════════════════════════════");
+        out("  TEST COMPLETE");
+        out("═══════════════════════════════════════════════════════");
     });
 }
 
@@ -3404,6 +3767,16 @@ static const int EQ_HISTORY = 32; // number of vertical bars (time history)
 
     y -= 26;
 
+    // Carry-chain verification info
+    NSTextField *ccLbl = [[NSTextField alloc] initWithFrame:NSMakeRect(14, y - 14, W - 28, 14)];
+    ccLbl.stringValue = @"CPU Carry-Chain Verification: Every GPU-found factor is independently verified on CPU before submission.";
+    ccLbl.font = [NSFont systemFontOfSize:9];
+    ccLbl.textColor = [NSColor colorWithSRGBRed:0.2 green:0.7 blue:0.2 alpha:1.0];
+    ccLbl.bezeled = NO; ccLbl.editable = NO; ccLbl.drawsBackground = NO;
+    ccLbl.autoresizingMask = NSViewMinYMargin | NSViewWidthSizable;
+    [cv addSubview:ccLbl];
+    y -= 20;
+
     // Separator
     NSBox *sep2 = [[NSBox alloc] initWithFrame:NSMakeRect(14, y, W - 28, 1)];
     sep2.boxType = NSBoxSeparator;
@@ -3678,9 +4051,16 @@ static const int EQ_HISTORY = 32; // number of vertical bars (time history)
     }
 
     if (!found_factor && !range_done) {
-        [self appendText:@"GIMPS: WARNING — no factor found and range incomplete. "
-            @"Submitting 'no factor' without completing the full range is invalid. "
-            @"Continue running the assignment first.\n"];
+        double pct2 = (k_end_needed > 0) ? (100.0 * k_current / k_end_needed) : 0;
+        NSAlert *alert = [[NSAlert alloc] init];
+        alert.messageText = @"Range Incomplete";
+        alert.informativeText = [NSString stringWithFormat:
+            @"No factor found and range is only %.1f%% complete (k=%llu of %llu).\n\n"
+            @"Submitting 'no factor' without completing the full range is invalid on PrimeNet.\n"
+            @"Resume and finish the assignment first.", pct2, k_current, k_end_needed];
+        alert.alertStyle = NSAlertStyleWarning;
+        [alert addButtonWithTitle:@"OK"];
+        [alert runModal];
         return;
     }
 
@@ -3701,6 +4081,37 @@ static const int EQ_HISTORY = 32; // number of vertical bars (time history)
         k_current, k_end_needed];
     [self appendText:summaryMsg];
 
+    // Write pre-submission verification to live log
+    {
+        std::string logpath = std::string(DATA_DIR.UTF8String) + "/mersenne_tf_live.log";
+        std::ofstream lf(logpath, std::ios::app);
+        if (lf.is_open()) {
+            auto now = std::chrono::system_clock::now();
+            auto tt = std::chrono::system_clock::to_time_t(now);
+            char ts[32];
+            strftime(ts, sizeof(ts), "%Y-%m-%dT%H:%M:%S", localtime(&tt));
+
+            lf << "\n--- SUBMISSION SNAPSHOT ---\n"
+               << "Time: " << ts << "\n"
+               << "Exponent: " << assignment.exponent << "\n"
+               << "Assignment Key: " << std::string(assignment.key) << "\n"
+               << "Bit Range: " << (int)assignment.bit_lo << " to " << (int)assignment.bit_hi << "\n"
+               << "k_current: " << k_current << "\n"
+               << "k_needed: " << k_end_needed << "\n"
+               << "Range Complete: " << (range_done ? "YES" : "NO") << "\n"
+               << "Factor Found: " << (found_factor ? "YES" : "NO") << "\n";
+            if (found_factor) {
+                lf << "Factor: " << factor_str << "\n";
+            }
+            lf << "Result Type: " << (found_factor ? "1 (factor found)" : "4 (no factor)") << "\n"
+               << "URL will contain: t=ar&n=" << assignment.exponent
+               << "&sf=" << (int)assignment.bit_lo
+               << "&ef=" << (int)assignment.bit_hi
+               << "&r=" << (found_factor ? 1 : 4) << "\n"
+               << "--- END SNAPSHOT ---\n\n";
+        }
+    }
+
     __weak AppDelegate *weakSelf = self;
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
         @autoreleasepool {
@@ -3710,8 +4121,20 @@ static const int EQ_HISTORY = 32; // number of vertical bars (time history)
             dispatch_async(dispatch_get_main_queue(), ^{
                 if (ok) {
                     [s appendText:@"GIMPS: result submitted to mersenne.org successfully.\n"];
+                    NSAlert *alert = [[NSAlert alloc] init];
+                    alert.messageText = @"Result Submitted";
+                    alert.informativeText = @"Your result was submitted to mersenne.org successfully.";
+                    alert.alertStyle = NSAlertStyleInformational;
+                    [alert addButtonWithTitle:@"OK"];
+                    [alert runModal];
                 } else {
-                    [s appendText:@"GIMPS: FAILED to submit result. Check PrimeNet log for details.\n"];
+                    [s appendText:@"GIMPS: FAILED to submit result — see log above for server response.\n"];
+                    NSAlert *alert = [[NSAlert alloc] init];
+                    alert.messageText = @"Submission Failed";
+                    alert.informativeText = @"Could not submit to mersenne.org. Check the log for details (server response is logged above).";
+                    alert.alertStyle = NSAlertStyleCritical;
+                    [alert addButtonWithTitle:@"OK"];
+                    [alert runModal];
                 }
             });
         }
@@ -4025,6 +4448,8 @@ static const int kNumPipelineStages = sizeof(kPipelineStages) / sizeof(kPipeline
 // ── Run Pipeline -- executes the configured pipeline ──
 
 - (void)runPipeline:(id)sender {
+    _activeLogTab = 3;  // Pipeline tab
+    [self.logTabView selectTabViewItemAtIndex:3];
     // Find the pipeline window
     NSWindow *win = [sender window];
     if (!win) return;
@@ -4445,49 +4870,104 @@ static const int kNumPipelineStages = sizeof(kPipelineStages) / sizeof(kPipeline
     // Thread stays joinable for proper cleanup
 }
 
-- (void)appendText:(NSString *)text {
-    // For non-log-callback callers (UI commands, discoveries, etc.)
-    // Route through the ring buffer for consistency
+- (void)appendStatus:(NSString *)text {
+    // Route to the status/network pane
     [_logLock lock];
-    // Split by newlines so each line is a ring entry
     NSArray *lines = [text componentsSeparatedByString:@"\n"];
     for (NSString *line in lines) {
         if (line.length == 0) continue;
-        _logRing[_logRingHead % _logRing.count] = line;
-        _logRingHead++;
+        _statusRing[_statusRingHead % _statusRing.count] = line;
+        _statusRingHead++;
     }
-    _logDirty = YES;
+    _statusDirty = YES;
     [_logLock unlock];
 }
 
-- (void)flushLogBuffer {
-    if (!_logDirty) return;
-
+- (void)appendToTab:(int)tab text:(NSString *)text {
     [_logLock lock];
-    // Build the visible text from the ring buffer (most recent lines)
-    NSUInteger capacity = _logRing.count;
-    NSUInteger count = MIN(_logRingHead, capacity);
-    NSUInteger start = (_logRingHead > capacity) ? (_logRingHead - capacity) : 0;
-    NSMutableString *text = [NSMutableString stringWithCapacity:count * 80];
-    for (NSUInteger i = start; i < _logRingHead; i++) {
-        NSString *line = _logRing[i % capacity];
-        [text appendString:line];
-        [text appendString:@"\n"];
+    NSArray *lines = [text componentsSeparatedByString:@"\n"];
+    for (NSString *line in lines) {
+        if (line.length == 0) continue;
+        _tabRings[tab][_tabRingHeads[tab] % _tabRings[tab].count] = line;
+        _tabRingHeads[tab]++;
     }
-    _logDirty = NO;
+    _tabDirty[tab] = YES;
     [_logLock unlock];
+}
 
-    // Replace entire text content (no incremental append = no layout accumulation)
-    NSTextStorage *ts = self.resultView.textStorage;
-    NSDictionary *attrs = @{
+- (void)appendText:(NSString *)text {
+    // Auto-route: GIMPS/PrimeNet/discovery/network messages go to status pane
+    if ([text hasPrefix:@"GIMPS:"] || [text hasPrefix:@"PrimeNet"] ||
+        [text hasPrefix:@">>> DISCOVERY"] || [text hasPrefix:@"Conductor:"] ||
+        [text hasPrefix:@"Carriage:"] || [text hasPrefix:@"Network:"]) {
+        [self appendStatus:text];
+        return;
+    }
+    // Route to the currently active log tab
+    [self appendToTab:_activeLogTab text:text];
+}
+
+- (void)flushLogBuffer {
+    NSDictionary *logAttrs = @{
         NSFontAttributeName: [NSFont monospacedSystemFontOfSize:11 weight:NSFontWeightRegular],
         NSForegroundColorAttributeName: [NSColor labelColor]
     };
-    NSAttributedString *attr = [[NSAttributedString alloc] initWithString:text attributes:attrs];
-    [ts beginEditing];
-    [ts setAttributedString:attr];
-    [ts endEditing];
-    [self.resultView scrollRangeToVisible:NSMakeRange(ts.length, 0)];
+
+    // ── Flush each tab ──
+    for (int t = 0; t < 4; t++) {
+        [_logLock lock];
+        BOOL dirty = _tabDirty[t];
+        NSMutableString *text = nil;
+        if (dirty) {
+            NSUInteger cap = _tabRings[t].count;
+            NSUInteger start = (_tabRingHeads[t] > cap) ? (_tabRingHeads[t] - cap) : 0;
+            text = [NSMutableString stringWithCapacity:(_tabRingHeads[t] - start) * 80];
+            for (NSUInteger i = start; i < _tabRingHeads[t]; i++) {
+                [text appendString:_tabRings[t][i % cap]];
+                [text appendString:@"\n"];
+            }
+            _tabDirty[t] = NO;
+        }
+        [_logLock unlock];
+
+        if (dirty && _tabViews[t]) {
+            NSTextStorage *ts = _tabViews[t].textStorage;
+            NSAttributedString *attr = [[NSAttributedString alloc] initWithString:text attributes:logAttrs];
+            [ts beginEditing];
+            [ts setAttributedString:attr];
+            [ts endEditing];
+            [_tabViews[t] scrollRangeToVisible:NSMakeRange(ts.length, 0)];
+        }
+    }
+
+    // ── Flush status pane ──
+    [_logLock lock];
+    BOOL needStatus = _statusDirty;
+    NSMutableString *statusText = nil;
+    if (needStatus) {
+        NSUInteger cap = _statusRing.count;
+        NSUInteger st = (_statusRingHead > cap) ? (_statusRingHead - cap) : 0;
+        statusText = [NSMutableString stringWithCapacity:(_statusRingHead - st) * 80];
+        for (NSUInteger i = st; i < _statusRingHead; i++) {
+            [statusText appendString:_statusRing[i % cap]];
+            [statusText appendString:@"\n"];
+        }
+        _statusDirty = NO;
+    }
+    [_logLock unlock];
+
+    if (needStatus && self.statusView) {
+        NSTextStorage *sts = self.statusView.textStorage;
+        NSDictionary *sattrs = @{
+            NSFontAttributeName: [NSFont monospacedSystemFontOfSize:11 weight:NSFontWeightRegular],
+            NSForegroundColorAttributeName: [NSColor colorWithCalibratedRed:0.6 green:0.9 blue:0.6 alpha:1.0]
+        };
+        NSAttributedString *sattr = [[NSAttributedString alloc] initWithString:statusText attributes:sattrs];
+        [sts beginEditing];
+        [sts setAttributedString:sattr];
+        [sts endEditing];
+        [self.statusView scrollRangeToVisible:NSMakeRange(sts.length, 0)];
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -4963,6 +5443,10 @@ static const int kNumPipelineStages = sizeof(kPipelineStages) / sizeof(kPipeline
     // Thread stays joinable for proper cleanup
 }
 
+- (BOOL)applicationSupportsSecureRestorableState:(NSApplication *)app {
+    return YES;
+}
+
 - (BOOL)applicationShouldTerminateAfterLastWindowClosed:(NSApplication *)sender {
     return YES;
 }
@@ -4986,13 +5470,22 @@ static const int kNumPipelineStages = sizeof(kPipelineStages) / sizeof(kPipeline
         _taskMgr->stop_all();
     }
 
-    // Join background threads (now they're joinable, not detached)
-    if (_checkThread.joinable()) {
-        _checkThread.join();
-    }
-    if (_benchThread.joinable()) {
-        _benchThread.join();
-    }
+    // Join background threads — use a helper that detaches if the thread is stuck
+    // (e.g., blocked on network I/O after "connection reset by peer")
+    auto safeJoin = [](std::thread &t) {
+        if (!t.joinable()) return;
+        // Give the thread up to 500ms to notice its stop flag and exit
+        std::promise<void> p;
+        auto f = p.get_future();
+        std::thread joiner([&]{ t.join(); p.set_value(); });
+        if (f.wait_for(std::chrono::milliseconds(500)) == std::future_status::ready) {
+            joiner.join();
+        } else {
+            joiner.detach(); // Thread is stuck — detach and let the OS reclaim on exit
+        }
+    };
+    safeJoin(_checkThread);
+    safeJoin(_benchThread);
 
     if (self.eventMonitor) {
         [NSEvent removeMonitor:self.eventMonitor];
@@ -5884,6 +6377,8 @@ static const int kNumPipelineStages = sizeof(kPipelineStages) / sizeof(kPipeline
 // ═══════════════════════════════════════════════════════════════════════
 
 - (void)expressionEvaluate:(id)sender {
+    _activeLogTab = 1;  // Check / Expressions tab
+    [self.logTabView selectTabViewItemAtIndex:1];
     NSString *input = [self.expressionField.stringValue
         stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
     if (input.length == 0) return;

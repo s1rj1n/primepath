@@ -64,13 +64,20 @@ bool PrimeNetClient::register_machine() {
         ncpu = (int)[[NSProcessInfo processInfo] processorCount];
     }
 
+    // Dynamic system info for registration
+    std::string mdesc = machine_description();
+    char chip_buf[256] = {};
+    size_t chip_len = sizeof(chip_buf);
+    sysctlbyname("machdep.cpu.brand_string", chip_buf, &chip_len, NULL, 0);
+    std::string chip_name = chip_buf[0] ? chip_buf : "Apple Silicon";
+
     std::string url = "https://v5.mersenne.org/v5server/"
         "?px=GIMPS&v=0.95&t=uc"
         "&g=" + _state.guid +
         "&hg=" + hw_guid +
         "&wg="
-        "&a=" + url_encode("macOS,PrimePath,1.0") +
-        "&c=" + url_encode("Apple Silicon (Metal GPU)") +
+        "&a=" + url_encode("macOS,PrimePath,1.0 (github.com/s1rj1n/primepath)") +
+        "&c=" + url_encode(chip_name + " (Metal GPU)") +
         "&f=" + url_encode("Metal,NEON,AES") +
         "&L1=192&L2=4096&L3=0"
         "&np=" + std::to_string(ncpu) +
@@ -219,12 +226,15 @@ bool PrimeNetClient::submit_result(const TFResult& result) {
     // r=1: factor found, r=4: no factor
     int result_type = result.factor_found ? 1 : 4;
 
+    std::string mdesc = machine_description();
     std::string msg;
     if (result.factor_found) {
-        msg = "M" + std::to_string(result.exponent) + " has a factor: " + result.factor;
+        msg = "M" + std::to_string(result.exponent) + " has a factor: " + result.factor +
+              " [" + mdesc + " | github.com/s1rj1n/primepath]";
     } else {
         msg = "M" + std::to_string(result.exponent) + " no factor from 2^" +
-              std::to_string((int)result.bit_lo) + " to 2^" + std::to_string((int)result.bit_hi);
+              std::to_string((int)result.bit_lo) + " to 2^" + std::to_string((int)result.bit_hi) +
+              " [" + mdesc + " | github.com/s1rj1n/primepath]";
     }
 
     std::string akey = result.assignment_key.empty() ? "0" : result.assignment_key;
@@ -246,9 +256,11 @@ bool PrimeNetClient::submit_result(const TFResult& result) {
     url += "&m=" + url_encode(msg) + "&ss=19191919&sh=ABCDABCDABCDABCDABCDABCDABCDABCD";
 
     _log("PrimeNet: submitting result -- " + msg);
+    _log("PrimeNet: URL=" + url);
     std::string response = http_get(url);
+    _log("PrimeNet: raw response: [" + response + "]");
     if (response.empty()) {
-        _log("PrimeNet: no response from server.");
+        _log("PrimeNet: no response from server — check network connectivity.");
         return false;
     }
 
@@ -320,7 +332,8 @@ void PrimeNetClient::write_result_json(const TFResult& result) {
         js << ",\"factors\":[\"" << result.factor << "\"]";
     }
 
-    js << ",\"program\":{\"name\":\"PrimePath\",\"version\":\"1.0\",\"kernel\":\"Metal96bit\"}"
+    js << ",\"program\":{\"name\":\"PrimePath\",\"version\":\"1.0\",\"kernel\":\"Metal96bit\",\"source\":\"github.com/s1rj1n/primepath\"}"
+       << ",\"machine\":\"" << machine_description() << "\""
        << ",\"timestamp\":\"" << ts << "\""
        << ",\"user\":\"" << _state.username << "\""
        << ",\"computer\":\"" << _state.computer_name << "\"";
@@ -441,49 +454,59 @@ std::string PrimeNetClient::http_get(const std::string& url) {
     @autoreleasepool {
         NSString *nsURL = [NSString stringWithUTF8String:url.c_str()];
         NSURL *reqURL = [NSURL URLWithString:nsURL];
-        if (!reqURL) return "";
+        if (!reqURL) {
+            _log("PrimeNet: invalid URL.");
+            return "";
+        }
 
         NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:reqURL];
         req.HTTPMethod = @"GET";
-        req.timeoutInterval = 30.0;
+        req.timeoutInterval = 45.0;  // Longer than semaphore so NSURLSession always finishes first
         [req setValue:@"PrimePath/1.0" forHTTPHeaderField:@"User-Agent"];
 
-        __block NSData *responseData = nil;
-        __block NSError *responseError = nil;
-        __block NSHTTPURLResponse *httpResponse = nil;
+        // Use heap-allocated storage so the completion handler is safe even if
+        // the semaphore times out (shouldn't happen since request timeout < sem timeout)
+        __block NSData * __strong capturedData = nil;
+        __block NSError * __strong capturedError = nil;
+        __block NSInteger capturedStatus = 0;
 
         dispatch_semaphore_t sem = dispatch_semaphore_create(0);
         NSURLSessionDataTask *task = [[NSURLSession sharedSession]
             dataTaskWithRequest:req
             completionHandler:^(NSData *data, NSURLResponse *response, NSError *error) {
-                responseData = data;
-                responseError = error;
+                capturedData = data;
+                capturedError = error;
                 if ([response isKindOfClass:[NSHTTPURLResponse class]])
-                    httpResponse = (NSHTTPURLResponse *)response;
+                    capturedStatus = ((NSHTTPURLResponse *)response).statusCode;
                 dispatch_semaphore_signal(sem);
             }];
         [task resume];
-        dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, 30 * NSEC_PER_SEC));
 
-        if (responseError) {
+        long waitResult = dispatch_semaphore_wait(sem,
+            dispatch_time(DISPATCH_TIME_NOW, 60 * NSEC_PER_SEC));
+
+        if (waitResult != 0) {
+            [task cancel];
+            _log("PrimeNet: request timed out (60s).");
+            return "";
+        }
+
+        if (capturedError) {
             _log("PrimeNet HTTP error: " +
-                 std::string(responseError.localizedDescription.UTF8String));
+                 std::string(capturedError.localizedDescription.UTF8String));
             return "";
         }
 
-        if (httpResponse) {
-            long status = (long)httpResponse.statusCode;
-            if (status != 200) {
-                _log("PrimeNet HTTP status: " + std::to_string(status));
-            }
+        if (capturedStatus != 0 && capturedStatus != 200) {
+            _log("PrimeNet HTTP status: " + std::to_string((long)capturedStatus));
         }
 
-        if (!responseData) {
-            _log("PrimeNet: timeout — no response received within 30 seconds.");
+        if (!capturedData) {
+            _log("PrimeNet: no data received from server.");
             return "";
         }
 
-        return std::string((const char *)responseData.bytes, responseData.length);
+        return std::string((const char *)capturedData.bytes, capturedData.length);
     }
 }
 
@@ -504,11 +527,43 @@ std::map<std::string, std::string> PrimeNetClient::parse_response(const std::str
 std::string PrimeNetClient::machine_description() {
     struct utsname un;
     uname(&un);
-    std::string desc = "PrimePath/1.0 Metal GPU ";
-    desc += un.machine;  // e.g. "arm64"
-    desc += " macOS ";
-    desc += un.release;
-    return desc;
+
+    // Get chip name (e.g. "Apple M5")
+    char chip[256] = {};
+    size_t chip_len = sizeof(chip);
+    sysctlbyname("machdep.cpu.brand_string", chip, &chip_len, NULL, 0);
+    std::string chip_str = chip[0] ? chip : un.machine;
+
+    // CPU cores (performance + efficiency)
+    int ncpu = (int)[[NSProcessInfo processInfo] processorCount];
+    int perf_cores = 0, eff_cores = 0;
+    size_t sz = sizeof(int);
+    sysctlbyname("hw.perflevel0.logicalcpu", &perf_cores, &sz, NULL, 0);
+    sz = sizeof(int);
+    sysctlbyname("hw.perflevel1.logicalcpu", &eff_cores, &sz, NULL, 0);
+
+    // RAM
+    uint64_t memsize = 0;
+    sz = sizeof(memsize);
+    sysctlbyname("hw.memsize", &memsize, &sz, NULL, 0);
+    int ram_gb = (int)(memsize / (1024ULL * 1024 * 1024));
+
+    // GPU cores (Metal)
+    int gpu_cores = 0;
+    sz = sizeof(gpu_cores);
+    sysctlbyname("gpu.core_count", &gpu_cores, &sz, NULL, 0);
+
+    std::ostringstream desc;
+    desc << "PrimePath/1.0 | " << chip_str
+         << " | " << ncpu << " CPU";
+    if (perf_cores > 0)
+        desc << " (" << perf_cores << "P+" << eff_cores << "E)";
+    if (gpu_cores > 0)
+        desc << " " << gpu_cores << " GPU cores";
+    desc << " | " << ram_gb << "GB RAM"
+         << " | Metal fused sieve+modexp"
+         << " | macOS " << un.release;
+    return desc.str();
 }
 
 } // namespace primenet

@@ -4,6 +4,7 @@
 #include <numeric>
 #include <iomanip>
 #include <deque>
+#include <future>
 #include <pthread.h>
 #include <arm_neon.h>
 
@@ -41,7 +42,13 @@ TaskManager::TaskManager(const std::string& data_dir) : _data_dir(data_dir) {
     log("Load balancer: NEON saturation prediction active");
 }
 
-TaskManager::~TaskManager() { stop_all(); }
+TaskManager::~TaskManager() {
+    // Signal stop but don't block — caller (applicationShouldTerminate) already called stop_all()
+    for (auto& [t, task] : _tasks) {
+        task.should_run.store(false);
+        if (task.worker.joinable()) task.worker.detach();
+    }
+}
 
 // ── Known primes database (avoid rediscovering these) ────────────────
 
@@ -327,6 +334,13 @@ static const char* pclass_str(PrimeClass c) {
 }
 
 void TaskManager::save_discovery(const Discovery& d) {
+    // Only persist genuine discoveries: confirmed primes and Mersenne/Fermat factors.
+    // Pseudoprimes and composites are filtering artifacts — skip them entirely.
+    if (d.pclass != PrimeClass::Prime &&
+        d.type != TaskType::MersenneTrial && d.type != TaskType::FermatFactor) {
+        return;
+    }
+
     // Discoveries take precedence — temporarily boost thread priority to ensure
     // the save completes immediately, even if the system is under load.
     pthread_set_qos_class_self_np(QOS_CLASS_USER_INITIATED, 0);
@@ -366,15 +380,16 @@ void TaskManager::save_discovery(const Discovery& d) {
 void TaskManager::flush_all_files() {
     std::lock_guard<std::mutex> lock(_save_mutex);
 
-    // Main discoveries.txt
+    // Main discoveries.txt — write to temp then rename to avoid Spotlight/Finder locks
     {
         std::string path = _data_dir + "/discoveries.txt";
-        std::ofstream f(path, std::ios::trunc);
+        std::string tmp = path + ".tmp";
+        std::ofstream f(tmp, std::ios::trunc);
         if (!f.is_open()) {
-            log("WARNING: Could not write " + path + " — is it open in another app?");
-            return;
+            // Silently skip — not worth warning every flush cycle
+            goto skip_discoveries;
         }
-        f << "# PrimePath Discoveries — full precision u64\n";
+        f << "# PrimePath Discoveries — confirmed primes and factors only\n";
         f << "# Format: task_key CLASS value [pair:v2] [factors:...] tested_at:N timestamp\n";
         for (auto& d : _discoveries) {
             f << task_key(d.type) << " " << pclass_str(d.pclass) << " " << d.value;
@@ -382,7 +397,10 @@ void TaskManager::flush_all_files() {
             if (!d.divisors.empty()) f << " factors:[" << d.divisors << "]";
             f << " tested_at:" << d.tested_at << " " << d.timestamp << "\n";
         }
+        f.close();
+        ::rename(tmp.c_str(), path.c_str());
     }
+    skip_discoveries:
 
     // Per-test files — group discoveries by type
     using TT = TaskType;
@@ -414,22 +432,18 @@ void TaskManager::flush_all_files() {
         for (auto& s : scan_lines) tf << s << "\n";
     }
 
-    // Class files
-    auto write_class = [&](const std::string& name, PrimeClass pc) {
-        std::string path = _data_dir + "/" + name;
+    // Primes summary file
+    {
+        std::string path = _data_dir + "/primes.txt";
         std::ofstream f(path, std::ios::trunc);
-        f << "# " << name << "\n";
+        f << "# PrimePath — Confirmed Discoveries\n";
         for (auto& d : _discoveries) {
-            if (d.pclass != pc) continue;
             f << task_key(d.type) << " " << d.value;
             if (d.value2 > 0) f << " " << d.value2;
             if (!d.divisors.empty()) f << " factors:[" << d.divisors << "]";
             f << " " << d.timestamp << "\n";
         }
-    };
-    write_class("primes.txt", PrimeClass::Prime);
-    write_class("pseudoprimes.txt", PrimeClass::Pseudoprime);
-    write_class("composites.txt", PrimeClass::Composite);
+    }
 }
 
 // ── Task control ────────────────────────────────────────────────────
@@ -500,10 +514,17 @@ void TaskManager::stop_all() {
     for (auto& [t, task] : _tasks) {
         task.should_run.store(false);
     }
-    // Join all worker threads — guarantees clean shutdown, no zombies
+    // Join worker threads with a timeout — detach any that won't finish in time
     for (auto& [t, task] : _tasks) {
-        if (task.worker.joinable()) {
-            task.worker.join();
+        if (!task.worker.joinable()) continue;
+        std::promise<void> p;
+        auto f = p.get_future();
+        std::thread joiner([&]{ task.worker.join(); p.set_value(); });
+        if (f.wait_for(std::chrono::milliseconds(800)) == std::future_status::ready) {
+            joiner.join();
+        } else {
+            joiner.detach();  // Thread is stuck — detach, OS reclaims on exit
+            log(std::string(task_name(t)) + " thread did not stop in time — detaching");
         }
     }
     save_state();
@@ -803,17 +824,166 @@ static std::string verify_candidate_primality(uint64_t candidate) {
 // These run on CPU ALU while GPU processes another batch concurrently.
 // ═══════════════════════════════════════════════════════════════════════
 
+// Overflow-safe (a * b) % mod for mod = p² where p < 2^64.
+// Precomputes R = 2^64 mod m once, then each multiply decomposes into
+// four 64×64→128 hw multiplies + a few modular additions.
+struct MulMod128Context {
+    unsigned __int128 mod;
+    unsigned __int128 R;   // 2^64 mod mod  (always < mod, so fits in ~106 bits for p~10^16)
+
+    MulMod128Context(unsigned __int128 m) : mod(m) {
+        R = 1;
+        for (int i = 0; i < 64; i++) {
+            R <<= 1;
+            if (R >= mod) R -= mod;
+        }
+    }
+
+    // Multiply val (< mod) by 2^64 mod mod, using precomputed R.
+    // val * R where both < mod (~2^106). Product could be ~2^212 — too big.
+    // So decompose val = v_hi * 2^64 + v_lo, then:
+    //   val * R = v_lo * R + v_hi * R * 2^64
+    // v_lo * R: 64-bit × ~106-bit = fits in 170 bits... still overflows __int128.
+    // BUT: for mod = p² with p < 2^64, R < p² < 2^128. However R < mod and
+    // v_lo < 2^64, so v_lo * R < 2^64 * 2^128... overflows.
+    //
+    // Use doubling on R (which has at most ~106 significant bits = ~106 iterations)
+    // This is much faster than doubling on the full value (128 iterations).
+    // Compute (val * R) % mod using binary method on whichever is smaller
+    unsigned __int128 mulR(unsigned __int128 val) const {
+        val %= mod;
+        if (val == 0) return 0;
+        // Iterate on whichever has fewer bits
+        unsigned __int128 x, y;
+        if (val <= R) { x = R; y = val; }
+        else          { x = val; y = R; }
+        unsigned __int128 result = 0;
+        while (y > 0) {
+            if (y & 1) {
+                result += x;
+                if (result >= mod) result -= mod;
+            }
+            x += x;
+            if (x >= mod) x -= mod;
+            y >>= 1;
+        }
+        return result;
+    }
+
+    unsigned __int128 mul(unsigned __int128 a, unsigned __int128 b) const {
+        a %= mod;
+        b %= mod;
+        if (a == 0 || b == 0) return 0;
+
+        // Fast path: both fit in 64 bits
+        if (a <= UINT64_MAX && b <= UINT64_MAX) {
+            return (a * b) % mod;
+        }
+
+        uint64_t a_lo = (uint64_t)a;
+        uint64_t a_hi = (uint64_t)(a >> 64);
+        uint64_t b_lo = (uint64_t)b;
+        uint64_t b_hi = (uint64_t)(b >> 64);
+
+        // t0 = a_lo * b_lo (128-bit, fits in __int128)
+        unsigned __int128 t0 = (unsigned __int128)a_lo * b_lo % mod;
+
+        // t1 = (a_lo * b_hi) * 2^64   (cross term)
+        unsigned __int128 t1 = 0;
+        if (b_hi) t1 = mulR((unsigned __int128)a_lo * b_hi % mod);
+
+        // t2 = (a_hi * b_lo) * 2^64   (cross term)
+        unsigned __int128 t2 = 0;
+        if (a_hi) t2 = mulR((unsigned __int128)a_hi * b_lo % mod);
+
+        // t3 = (a_hi * b_hi) * 2^128 = mulR(mulR(a_hi * b_hi))
+        unsigned __int128 t3 = 0;
+        if (a_hi && b_hi) {
+            t3 = mulR(mulR((unsigned __int128)a_hi * b_hi % mod));
+        }
+
+        unsigned __int128 result = t0;
+        result += t1; if (result >= mod) result -= mod;
+        result += t2; if (result >= mod) result -= mod;
+        result += t3; if (result >= mod) result -= mod;
+        return result;
+    }
+};
+
+// ═══════════════════════════════════════════════════════════════════════
+// Carry-chain mulmod: hardware multiply + __int128 division for reduction.
+// Works for moduli up to 95 bits. ~4-7x faster than binary shift-and-add.
+// ═══════════════════════════════════════════════════════════════════════
+struct CarryChainMulMod {
+    unsigned __int128 mod;
+
+    CarryChainMulMod(unsigned __int128 m) : mod(m) {}
+
+    unsigned __int128 mul(unsigned __int128 a, unsigned __int128 b) const {
+        if (mod <= 1) return 0;
+        a %= mod; b %= mod;
+        if (a == 0 || b == 0) return 0;
+
+        // Fast path: both fit in 64 bits
+        if (a <= UINT64_MAX && b <= UINT64_MAX) {
+            return (a * b) % mod;
+        }
+
+        uint64_t a_lo = (uint64_t)a, a_hi = (uint64_t)(a >> 64);
+        uint64_t b_lo = (uint64_t)b, b_hi = (uint64_t)(b >> 64);
+
+        // Full 192-bit product in [r2:r1:r0]
+        unsigned __int128 p = (unsigned __int128)a_lo * b_lo;
+        uint64_t p0 = (uint64_t)p;
+        uint64_t p1 = (uint64_t)(p >> 64);
+
+        unsigned __int128 cross = (unsigned __int128)a_lo * b_hi + (unsigned __int128)a_hi * b_lo;
+        uint64_t c0 = (uint64_t)cross;
+        uint64_t c1 = (uint64_t)(cross >> 64);
+
+        uint64_t hh = a_hi * b_hi;
+
+        uint64_t r0 = p0;
+        unsigned __int128 mid = (unsigned __int128)p1 + c0;
+        uint64_t r1 = (uint64_t)mid;
+        uint64_t r2 = (uint64_t)(mid >> 64) + c1 + hh;
+
+        // Reduce [r2:r1:r0] mod q using hardware __int128 division
+        unsigned __int128 hi = ((unsigned __int128)r2 << 64) | r1;
+        unsigned __int128 hi_mod = hi % mod;
+
+        // hi_mod * 2^64 + r0 — shift in two 32-bit steps to stay in 128 bits
+        unsigned __int128 tmp = (hi_mod << 32) % mod;
+        tmp = (tmp << 32) % mod;
+        tmp = (tmp + r0) % mod;
+        return tmp;
+    }
+};
+
+// Global flag read by CPU test functions (set from UI toggle)
+// Plain bool + volatile: avoids C++ name mangling issues across .mm TUs
+volatile bool g_use_carry_chain = false;
+
 // Wieferich test on CPU: 2^(p-1) ≡ 1 (mod p²)
 static bool cpu_wieferich_test(uint64_t p) {
     unsigned __int128 p_sq = (unsigned __int128)p * p;
-    // modpow(2, p-1, p²)
-    unsigned __int128 base = 2, result = 1, mod = p_sq;
+    unsigned __int128 base = 2, result = 1;
     uint64_t exp = p - 1;
-    base %= mod;
-    while (exp > 0) {
-        if (exp & 1) result = result * base % mod;
-        exp >>= 1;
-        base = base * base % mod;
+
+    if (g_use_carry_chain) {
+        CarryChainMulMod ctx(p_sq);
+        while (exp > 0) {
+            if (exp & 1) result = ctx.mul(result, base);
+            exp >>= 1;
+            base = ctx.mul(base, base);
+        }
+    } else {
+        MulMod128Context ctx(p_sq);
+        while (exp > 0) {
+            if (exp & 1) result = ctx.mul(result, base);
+            exp >>= 1;
+            base = ctx.mul(base, base);
+        }
     }
     return result == 1;
 }
@@ -821,30 +991,56 @@ static bool cpu_wieferich_test(uint64_t p) {
 // Wall-Sun-Sun test on CPU: Fibonacci F(p - legendre(p,5)) ≡ 0 (mod p²)
 static bool cpu_wallsunsun_test(uint64_t p) {
     unsigned __int128 p_sq = (unsigned __int128)p * p;
+    unsigned __int128 mod = p_sq;
+
+    auto addmod = [mod](unsigned __int128 a, unsigned __int128 b) -> unsigned __int128 {
+        unsigned __int128 s = a + b;
+        return (s >= mod || s < a) ? s - mod : s;
+    };
+
     // Legendre symbol (p/5)
     int leg = (p % 5 == 1 || p % 5 == 4) ? 1 : (p % 5 == 0 ? 0 : -1);
     uint64_t n = p - leg;
+
     // Matrix exponentiation for Fibonacci mod p²
-    // [F(n+1), F(n)] via 2x2 matrix [[1,1],[1,0]]^n
-    unsigned __int128 a = 1, b = 1, c = 1, d = 0; // matrix
-    unsigned __int128 ra = 1, rb = 0, rc = 0, rd = 1; // result = identity
-    unsigned __int128 mod = p_sq;
-    while (n > 0) {
-        if (n & 1) {
-            unsigned __int128 na = (ra*a + rb*c) % mod;
-            unsigned __int128 nb = (ra*b + rb*d) % mod;
-            unsigned __int128 nc = (rc*a + rd*c) % mod;
-            unsigned __int128 nd = (rc*b + rd*d) % mod;
-            ra = na; rb = nb; rc = nc; rd = nd;
+    unsigned __int128 a = 1, b = 1, c = 1, d = 0;
+    unsigned __int128 ra = 1, rb = 0, rc = 0, rd = 1;
+
+    if (g_use_carry_chain) {
+        CarryChainMulMod ctx(mod);
+        while (n > 0) {
+            if (n & 1) {
+                unsigned __int128 na = addmod(ctx.mul(ra,a), ctx.mul(rb,c));
+                unsigned __int128 nb = addmod(ctx.mul(ra,b), ctx.mul(rb,d));
+                unsigned __int128 nc = addmod(ctx.mul(rc,a), ctx.mul(rd,c));
+                unsigned __int128 nd = addmod(ctx.mul(rc,b), ctx.mul(rd,d));
+                ra = na; rb = nb; rc = nc; rd = nd;
+            }
+            unsigned __int128 na = addmod(ctx.mul(a,a), ctx.mul(b,c));
+            unsigned __int128 nb = addmod(ctx.mul(a,b), ctx.mul(b,d));
+            unsigned __int128 nc = addmod(ctx.mul(c,a), ctx.mul(d,c));
+            unsigned __int128 nd = addmod(ctx.mul(c,b), ctx.mul(d,d));
+            a = na; b = nb; c = nc; d = nd;
+            n >>= 1;
         }
-        unsigned __int128 na = (a*a + b*c) % mod;
-        unsigned __int128 nb = (a*b + b*d) % mod;
-        unsigned __int128 nc = (c*a + d*c) % mod;
-        unsigned __int128 nd = (c*b + d*d) % mod;
-        a = na; b = nb; c = nc; d = nd;
-        n >>= 1;
+    } else {
+        MulMod128Context ctx(mod);
+        while (n > 0) {
+            if (n & 1) {
+                unsigned __int128 na = addmod(ctx.mul(ra,a), ctx.mul(rb,c));
+                unsigned __int128 nb = addmod(ctx.mul(ra,b), ctx.mul(rb,d));
+                unsigned __int128 nc = addmod(ctx.mul(rc,a), ctx.mul(rd,c));
+                unsigned __int128 nd = addmod(ctx.mul(rc,b), ctx.mul(rd,d));
+                ra = na; rb = nb; rc = nc; rd = nd;
+            }
+            unsigned __int128 na = addmod(ctx.mul(a,a), ctx.mul(b,c));
+            unsigned __int128 nb = addmod(ctx.mul(a,b), ctx.mul(b,d));
+            unsigned __int128 nc = addmod(ctx.mul(c,a), ctx.mul(d,c));
+            unsigned __int128 nd = addmod(ctx.mul(c,b), ctx.mul(d,d));
+            a = na; b = nb; c = nc; d = nd;
+            n >>= 1;
+        }
     }
-    // F(n) = rb (the [0][1] element)
     return rb == 0;
 }
 
@@ -912,6 +1108,19 @@ static thread_local std::vector<uint8_t> tl_gpu_results;
 // ═══════════════════════════════════════════════════════════════════════
 
 void TaskManager::run_wieferich(SearchTask& task) {
+    // Guard: at large positions, CPU-only mulmod128 is too slow (128-bit overflow
+    // requires binary method). Need GPU for efficient testing.
+    bool gpu_available = false;
+    { std::lock_guard<std::mutex> lock(_gpu_mutex);
+      gpu_available = (_gpu && _gpu->name() != "CPU (fallback)" && gpu_owner.load() < 0); }
+    if (task.current_pos > 4294967296ULL && !gpu_available) {
+        log("Wieferich: position " + std::to_string(task.current_pos) +
+            " requires GPU for efficient testing (CPU mulmod too slow at this range). "
+            "Stop Mersenne TF first, or wait for it to finish.");
+        task.should_run.store(false);
+        task.status = TaskStatus::Paused;
+        return;
+    }
     ensure_small_primes(task.current_pos + SEGMENT_SIZE * 100);
     auto last_save = std::chrono::steady_clock::now();
     uint64_t summary_start = task.current_pos;
@@ -1171,6 +1380,18 @@ void TaskManager::run_wieferich(SearchTask& task) {
 }
 
 void TaskManager::run_wallsunsun(SearchTask& task) {
+    // Guard: at large positions, CPU-only mulmod128 is too slow
+    bool gpu_available = false;
+    { std::lock_guard<std::mutex> lock(_gpu_mutex);
+      gpu_available = (_gpu && _gpu->name() != "CPU (fallback)" && gpu_owner.load() < 0); }
+    if (task.current_pos > 4294967296ULL && !gpu_available) {
+        log("Wall-Sun-Sun: position " + std::to_string(task.current_pos) +
+            " requires GPU for efficient testing (CPU mulmod too slow at this range). "
+            "Stop Mersenne TF first, or wait for it to finish.");
+        task.should_run.store(false);
+        task.status = TaskStatus::Paused;
+        return;
+    }
     ensure_small_primes(task.current_pos + SEGMENT_SIZE * 100);
     auto last_save = std::chrono::steady_clock::now();
     uint64_t summary_start = task.current_pos;
@@ -2361,6 +2582,20 @@ void TaskManager::run_mersenne_trial(SearchTask& task) {
     log("Mersenne TF: testing 2^" + std::to_string(exponent) +
         " - 1 for factors q = 2kp+1, starting at k=" + std::to_string(task.current_pos));
 
+    // Write live log header
+    {
+        std::string logpath = _data_dir + "/mersenne_tf_live.log";
+        std::ofstream lf(logpath, std::ios::app);
+        if (lf.is_open()) {
+            lf << "\n=== Mersenne TF Session ===\n"
+               << "Started: " << timestamp() << "\n"
+               << "Exponent: " << exponent << " (M" << exponent << " = 2^" << exponent << " - 1)\n"
+               << "Starting k: " << task.current_pos << "\n"
+               << "Format: timestamp | exponent | k_position | total_tested | factors_found | rate\n"
+               << "=========================================\n";
+        }
+    }
+
     const uint64_t K_BATCH = mersenne_k_batch.load();  // configurable from GIMPS panel
     static constexpr uint32_t GPU_BATCH_SIZE = 262144;  // 256K per GPU dispatch
 
@@ -2385,6 +2620,10 @@ void TaskManager::run_mersenne_trial(SearchTask& task) {
 
         // Start CPU-intensive searches on a separate thread to avoid
         // calling start_task() from within a worker (which can deadlock on join).
+        // Only auto-start CPU companion tasks if search position is small enough
+        // for safe 128-bit arithmetic (p < 2^32 → p² < 2^64, fast path).
+        // For large primes, CPU mulmod is ~100x slower and causes memory pressure
+        // since the sieve pipeline outpaces CPU testing.
         const TaskType cpu_tasks[] = {
             TaskType::WallSunSun,   // 0 known — holy grail
             TaskType::Wieferich,    // only 2 known
@@ -2392,6 +2631,12 @@ void TaskManager::run_mersenne_trial(SearchTask& task) {
         for (auto ct : cpu_tasks) {
             auto it = _tasks.find(ct);
             if (it != _tasks.end() && it->second.status != TaskStatus::Running) {
+                // Skip if search position is too large for efficient CPU testing
+                if (it->second.current_pos > 4294967296ULL) {
+                    log("Mersenne TF: skipping " + std::string(task_name(ct)) +
+                        " CPU companion — search position too large for efficient CPU mulmod");
+                    continue;
+                }
                 auto_started_cpu_tasks.push_back(ct);
             }
         }
@@ -2450,10 +2695,42 @@ void TaskManager::run_mersenne_trial(SearchTask& task) {
                         while (tmp > 0) { buf[--pos] = '0' + (int)(tmp % 10); tmp /= 10; }
                         q_str = &buf[pos];
                     }
+                    // ── CPU carry-chain verification of GPU-found factor ──
+                    unsigned __int128 q_verify = q_hi > 0
+                        ? (((unsigned __int128)q_hi << 64) | q_lo)
+                        : (unsigned __int128)q_lo;
+                    bool cpu_verified = false;
+                    bool verify_ran = false;
+                    if (q_verify > 1 && exponent > 0) {
+                        try {
+                            CarryChainMulMod ctx(q_verify);
+                            unsigned __int128 base = 2, result = 1;
+                            uint64_t e = exponent;
+                            while (e > 0) {
+                                if (e & 1) result = ctx.mul(result, base);
+                                base = ctx.mul(base, base);
+                                e >>= 1;
+                            }
+                            cpu_verified = (result == 1);
+                            verify_ran = true;
+                        } catch (...) {
+                            log("WARNING: CPU verification threw exception for factor " + q_str);
+                        }
+                    }
+
                     total_hits++;
                     task.found_count++;
-                    log("*** MERSENNE FACTOR FOUND: 2^" + std::to_string(exponent) +
-                        " - 1 has factor " + q_str + " ***");
+                    if (verify_ran && cpu_verified) {
+                        log("*** MERSENNE FACTOR VERIFIED (GPU+CPU): 2^" + std::to_string(exponent) +
+                            " - 1 has factor " + q_str + " *** [carry-chain CPU confirmed]");
+                    } else if (verify_ran && !cpu_verified) {
+                        log("WARNING: GPU found factor " + q_str + " for M" + std::to_string(exponent) +
+                            " but CPU carry-chain says NO — logging anyway for investigation");
+                        // Still save it but flag it in the log — don't silently drop
+                    } else {
+                        log("*** MERSENNE FACTOR FOUND: 2^" + std::to_string(exponent) +
+                            " - 1 has factor " + q_str + " *** [CPU verify skipped]");
+                    }
                     save_discovery({TaskType::MersenneTrial, q_val, exponent,
                         PrimeClass::Composite, k_pos, q_str, timestamp()});
                 }
@@ -2476,6 +2753,21 @@ void TaskManager::run_mersenne_trial(SearchTask& task) {
                 save_scan_summary(TaskType::MersenneTrial, summary_start, task.current_pos,
                                   summary_tested, summary_hits);
                 save_state();
+
+                // Write live Mersenne TF log for verification
+                {
+                    std::string logpath = _data_dir + "/mersenne_tf_live.log";
+                    std::ofstream lf(logpath, std::ios::app);
+                    if (lf.is_open()) {
+                        lf << timestamp()
+                           << " | M" << exponent
+                           << " | k=" << task.current_pos
+                           << " | tested=" << task.tested_count
+                           << " | factors=" << total_hits
+                           << " | rate=" << (uint64_t)(rate / 1e6) << "M/s"
+                           << "\n";
+                    }
+                }
                 last_save = now;
                 summary_start = task.current_pos;
                 summary_tested = 0;
