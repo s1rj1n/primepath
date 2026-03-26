@@ -8,7 +8,7 @@ Every other GPU prime tool (mfaktc, mfakto, GpuOwl, Genefer) is CUDA or OpenCL. 
 
 ## Download
 
-Grab the DMG from [Releases](https://github.com/s1rj1n/primepath/releases). macOS 13+, Apple Silicon only.
+Grab the latest build from [Releases](https://github.com/s1rj1n/primepath/releases). macOS 13+, Apple Silicon only. Extract the zip and run `PrimePath.app`.
 
 ## Searches
 
@@ -27,7 +27,7 @@ Grab the DMG from [Releases](https://github.com/s1rj1n/primepath/releases). macO
 | Sexy primes | p, p+6 both prime | Infinite (conjectured) |
 | Emirps | p and reverse(p) both prime | ~10% of primes |
 
-CPU sieve keeps all cores busy generating candidates while GPU crunches the current batch.
+CPU sieve keeps all cores busy generating candidates while GPU crunches the current batch. CPU tests use carry-chain hardware mulmod for 4-7x faster 128-bit modular arithmetic (toggle via CarryChain checkbox).
 
 ## Test Catalog
 
@@ -49,7 +49,7 @@ Build custom search pipelines by picking stages from five categories -- Sieve (W
 
 ## GIMPS
 
-Talks directly to [mersenne.org](https://www.mersenne.org) over the PrimeNet v5 API. Register your machine, pull trial factoring assignments, run them on Metal GPU, and submit results back. Also writes `results.json.txt` compatible with mfaktc. First Metal GPU client for GIMPS.
+Talks directly to [mersenne.org](https://www.mersenne.org) over the PrimeNet v5 API. Register your machine, pull trial factoring assignments, run them on Metal GPU, and submit results back. GPU-found factors are independently verified on CPU using carry-chain modular exponentiation before submission. Reports system specs (chip, CPU/GPU cores, RAM) in results. Also writes `results.json.txt` compatible with mfaktc. First Metal GPU client for GIMPS.
 
 ## Distributed Search
 
@@ -82,6 +82,8 @@ CPU sieve pipeline          Metal GPU
 ```
 
 Three uint32 limbs with hardware `mulhi` for the multiply-and-reduce step. Each GPU thread does a complete modular exponentiation independently -- no shared memory, no sync. Unified memory means zero copy between CPU sieve output and GPU input.
+
+CPU-side 128-bit modular arithmetic uses a carry-chain approach: ARM64 `MUL`+`UMULH` for full 64×64→128-bit products, decomposed into a 192-bit intermediate, reduced via hardware `__int128` division in two 32-bit shifts. 4-7x faster than the binary shift-and-add method for moduli up to 95 bits.
 
 | Layer | File | What it does |
 |-------|------|-------------|
@@ -137,7 +139,7 @@ Where help is needed most:
 
 - **Distributed search testing** -- multi-machine coordination, result merging
 - **Fermat sieve tuning** -- better candidate generation
-- **128-bit / 192-bit Barrett** -- bigger factors
+- **128-bit / 192-bit Barrett on GPU** -- bigger factors via Metal shaders
 - **GFN primality** -- NTT big integer multiplication on Metal
 - **ECM on Metal** -- elliptic curve method with Montgomery arithmetic
 - **Factor seed research** -- does seed classification actually predict anything?
