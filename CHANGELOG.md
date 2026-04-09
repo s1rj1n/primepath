@@ -1,5 +1,16 @@
 # Changelog
 
+## v1.2.1 – AutoPrimeNet Interop & GPU Core Fix (2026-04-10)
+
+### New
+- **`worktodo.txt` reader** – PrimePath now reads the standard GIMPS `worktodo.txt` file used by AutoPrimeNet and mfaktc/mfakto. Supported line format: `Factor=<AID>,<exponent>,<bitlo>,<bithi>` (AID optional). Blank lines, `#`, `;`, and `//` comments are ignored.
+- **AutoPrimeNet integration mode** – when `worktodo.txt` is present, PrimePath reads assignments from there instead of calling the PrimeNet v5 server. After a TF run finishes, the JSON result is appended to `results.json.txt` and the matching line is atomically removed from `worktodo.txt`. This lets users run PrimePath through [AutoPrimeNet](https://github.com/tdulcet/AutoPrimeNet) for full assignment management, email notifications, log rotation, proxy support, and stall monitoring, without needing to register PrimePath with PrimeNet directly. Hybrid mode (registered and using `worktodo.txt`) also works and cleans up both state locations on successful submit.
+
+### Fixed
+- **GPU core count detection** – `sysctlbyname("gpu.core_count", ...)` does not exist on macOS, so the `gpu_cores` field was silently dropped from the JSON output. Replaced with an IORegistry lookup on `AGXAccelerator` for the `gpu-core-count` property. M5 now correctly reports 10 GPU cores.
+- **Stale version string** – JSON editor and `PrimeNetClient` now emit `version":"1.2.0"` consistently. Previous builds could produce output showing `1.0.0` if a cached binary was run.
+- **All-zero AID handling** – JSON output no longer emits `"aid":"00000000000000000000000000000000"` for simulated or manual runs; the field is omitted entirely unless a real assignment key is present.
+
 ## v1.2 – JSON Result Editor & PrimeNet JSON Format (2026-04-10)
 
 ### New

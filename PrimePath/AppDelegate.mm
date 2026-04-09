@@ -4017,7 +4017,7 @@ static std::string u128_to_str(unsigned __int128 v) {
     y -= 8;
 
     addRow(@"Program:", 9010, @"PrimePath", @"PrimePath");
-    addRow(@"Version:", 9011, @"1.2.0", @"1.2.0");
+    addRow(@"Version:", 9011, @"1.2.1", @"1.2.1");
     addRow(@"Kernel:", 9012, @"Metal96bit (optional)", @"Metal96bit");
 
     // ── PrimeNet connection ──
@@ -4456,7 +4456,7 @@ static std::string u128_to_str(unsigned __int128 v) {
     }
 
     ((NSTextField *)[cv viewWithTag:9010]).stringValue = @"PrimePath";
-    ((NSTextField *)[cv viewWithTag:9011]).stringValue = @"1.2.0";
+    ((NSTextField *)[cv viewWithTag:9011]).stringValue = @"1.2.1";
     ((NSTextField *)[cv viewWithTag:9012]).stringValue = @"Metal96bit";
 
     [self jsonEditorLog:win message:@"Auto-filled from system and current assignment."];
@@ -4490,7 +4490,7 @@ static std::string u128_to_str(unsigned __int128 v) {
         ((NSTextField *)[cv viewWithTag:9007]).stringValue =
             [NSString stringWithUTF8String:_primenet->username().c_str()];
     ((NSTextField *)[cv viewWithTag:9010]).stringValue = @"PrimePath";
-    ((NSTextField *)[cv viewWithTag:9011]).stringValue = @"1.2.0";
+    ((NSTextField *)[cv viewWithTag:9011]).stringValue = @"1.2.1";
     ((NSTextField *)[cv viewWithTag:9012]).stringValue = @"Metal96bit";
 
     // Generate the JSON
@@ -4708,7 +4708,7 @@ static std::string u128_to_str(unsigned __int128 v) {
             NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:reqURL];
             req.HTTPMethod = @"GET";
             req.timeoutInterval = 45.0;
-            [req setValue:@"PrimePath/1.2.0" forHTTPHeaderField:@"User-Agent"];
+            [req setValue:@"PrimePath/1.2.1" forHTTPHeaderField:@"User-Agent"];
 
             dispatch_semaphore_t sem = dispatch_semaphore_create(0);
             __block NSData *respData = nil;
