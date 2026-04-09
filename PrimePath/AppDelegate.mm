@@ -17,6 +17,7 @@
 #include "Network/PrimeNetClient.hpp"
 #include "DataTools.hpp"
 #import <IOKit/pwr_mgt/IOPMLib.h>
+#import <IOKit/IOKitLib.h>
 #include <sys/utsname.h>
 #include <sys/sysctl.h>
 
@@ -4182,8 +4183,11 @@ static std::string u128_to_str(unsigned __int128 v) {
         [js appendFormat:@",\"user\":\"%@\"", user];
     if (computer.length > 0)
         [js appendFormat:@",\"computer\":\"%@\"", computer];
-    if (aid.length > 0)
+    if (aid.length > 0 && ![aid isEqualToString:@"0"] &&
+        [aid rangeOfCharacterFromSet:
+            [[NSCharacterSet characterSetWithCharactersInString:@"0"] invertedSet]].location != NSNotFound) {
         [js appendFormat:@",\"aid\":\"%@\"", aid];
+    }
 
     // Hardware (auto-detect)
     {
@@ -4205,8 +4209,24 @@ static std::string u128_to_str(unsigned __int128 v) {
         int ram_gb = (int)(memsize / (1024ULL * 1024 * 1024));
 
         int gpu_cores = 0;
-        sz = sizeof(gpu_cores);
-        sysctlbyname("gpu.core_count", &gpu_cores, &sz, NULL, 0);
+        io_iterator_t iter;
+        if (IOServiceGetMatchingServices(kIOMainPortDefault,
+                IOServiceMatching("AGXAccelerator"), &iter) == KERN_SUCCESS) {
+            io_object_t svc;
+            while ((svc = IOIteratorNext(iter))) {
+                CFTypeRef prop = IORegistryEntrySearchCFProperty(svc, kIOServicePlane,
+                    CFSTR("gpu-core-count"), kCFAllocatorDefault,
+                    kIORegistryIterateRecursively | kIORegistryIterateParents);
+                if (prop) {
+                    if (CFGetTypeID(prop) == CFNumberGetTypeID())
+                        CFNumberGetValue((CFNumberRef)prop, kCFNumberIntType, &gpu_cores);
+                    CFRelease(prop);
+                }
+                IOObjectRelease(svc);
+                if (gpu_cores > 0) break;
+            }
+            IOObjectRelease(iter);
+        }
 
         [js appendFormat:@",\"hardware\":{\"chip\":\"%@\",\"cpu_cores\":%d", chipStr, ncpu];
         if (perf > 0)

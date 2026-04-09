@@ -111,6 +111,29 @@ public:
     // Remove a completed assignment
     void remove_assignment(const std::string& key);
 
+    // ── worktodo.txt (AutoPrimeNet / mfaktc interop) ────────────────
+    //
+    // AutoPrimeNet (https://github.com/tdulcet/AutoPrimeNet) is the
+    // recommended assignment handler for GIMPS third-party clients.
+    // It populates worktodo.txt with TF assignments in the form:
+    //   Factor=<AID>,<exponent>,<bitlo>,<bithi>
+    // PrimePath reads these, runs them, appends to results.json.txt,
+    // and removes the completed line. AutoPrimeNet then submits the
+    // results to mersenne.org.
+
+    // Read all pending assignments from <data_dir>/worktodo.txt
+    std::vector<Assignment> read_worktodo();
+
+    // Pop the next TF assignment from worktodo.txt (returns invalid if empty)
+    Assignment next_worktodo();
+
+    // Remove a completed assignment from worktodo.txt by AID or by
+    // matching exponent+bitlo+bithi if AID is empty
+    void remove_worktodo(const Assignment& done);
+
+    // True if <data_dir>/worktodo.txt exists and has at least one entry
+    bool has_worktodo();
+
 private:
     std::string _data_dir;
     ClientState _state;

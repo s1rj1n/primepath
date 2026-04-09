@@ -1,4 +1,5 @@
 #import <Foundation/Foundation.h>
+#import <IOKit/IOKitLib.h>
 #include "PrimeNetClient.hpp"
 #include <fstream>
 #include <sstream>
@@ -10,6 +11,33 @@
 #include <sys/sysctl.h>
 
 namespace primenet {
+
+// Forward declaration — defined near the worktodo.txt section
+static bool parse_worktodo_line(const std::string& raw, Assignment& out);
+
+// Returns Apple Silicon GPU core count from IORegistry, or 0 if unavailable.
+static int detect_gpu_core_count() {
+    int cores = 0;
+    io_iterator_t iter;
+    if (IOServiceGetMatchingServices(kIOMainPortDefault,
+            IOServiceMatching("AGXAccelerator"), &iter) != KERN_SUCCESS)
+        return 0;
+    io_object_t svc;
+    while ((svc = IOIteratorNext(iter))) {
+        CFTypeRef prop = IORegistryEntrySearchCFProperty(svc, kIOServicePlane,
+            CFSTR("gpu-core-count"), kCFAllocatorDefault,
+            kIORegistryIterateRecursively | kIORegistryIterateParents);
+        if (prop) {
+            if (CFGetTypeID(prop) == CFNumberGetTypeID())
+                CFNumberGetValue((CFNumberRef)prop, kCFNumberIntType, &cores);
+            CFRelease(prop);
+        }
+        IOObjectRelease(svc);
+        if (cores > 0) break;
+    }
+    IOObjectRelease(iter);
+    return cores;
+}
 
 // ═══════════════════════════════════════════════════════════════════════
 // Construction
@@ -167,8 +195,33 @@ bool PrimeNetClient::set_work_preference() {
 Assignment PrimeNetClient::get_assignment() {
     std::lock_guard<std::mutex> lock(_mutex);
 
+    // Prefer worktodo.txt (AutoPrimeNet) if it has entries.
+    // This lets users run PrimePath through AutoPrimeNet without
+    // needing to register the machine directly with PrimeNet.
+    {
+        std::string wt_path = _data_dir + "/worktodo.txt";
+        std::ifstream probe(wt_path);
+        if (probe.is_open()) {
+            probe.close();
+            // Reuse private logic by re-reading (mutex already held,
+            // don't call the public next_worktodo which may re-lock).
+            std::ifstream f(wt_path);
+            std::string line;
+            while (std::getline(f, line)) {
+                Assignment a;
+                if (parse_worktodo_line(line, a)) {
+                    _log("PrimeNet: using worktodo.txt assignment -- M" +
+                         std::to_string(a.exponent) + " TF [" +
+                         std::to_string((int)a.bit_lo) + "," +
+                         std::to_string((int)a.bit_hi) + "]");
+                    return a;
+                }
+            }
+        }
+    }
+
     if (!_state.registered) {
-        _log("PrimeNet: not registered.");
+        _log("PrimeNet: not registered and no worktodo.txt entries.");
         return {};
     }
 
@@ -218,13 +271,56 @@ Assignment PrimeNetClient::get_assignment() {
 bool PrimeNetClient::submit_result(const TFResult& result) {
     std::lock_guard<std::mutex> lock(_mutex);
 
-    if (!_state.registered) {
-        _log("PrimeNet: not registered.");
-        return false;
-    }
-
     // Build JSON result line (used for both &m= and results.json.txt)
     std::string json = build_result_json(result);
+
+    // AutoPrimeNet mode: if not registered, just append to results.json.txt
+    // and remove the completed line from worktodo.txt. AutoPrimeNet will
+    // pick it up and submit to mersenne.org on its next cycle.
+    if (!_state.registered) {
+        _log("PrimeNet: not registered — writing result for AutoPrimeNet to submit.");
+        write_result_json(result, json);
+
+        Assignment done;
+        done.key = result.assignment_key;
+        done.exponent = result.exponent;
+        done.bit_lo = result.bit_lo;
+        done.bit_hi = result.bit_hi;
+
+        // remove_worktodo takes the mutex via the public API; we already
+        // hold it, so do the work inline.
+        std::string wt_path = _data_dir + "/worktodo.txt";
+        std::ifstream in(wt_path);
+        if (in.is_open()) {
+            std::vector<std::string> keep;
+            std::string line;
+            bool removed = false;
+            while (std::getline(in, line)) {
+                Assignment a;
+                if (!removed && parse_worktodo_line(line, a)) {
+                    bool match =
+                        (!done.key.empty() && a.key == done.key) ||
+                        (done.key.empty() &&
+                         a.exponent == done.exponent &&
+                         (int)a.bit_lo == (int)done.bit_lo &&
+                         (int)a.bit_hi == (int)done.bit_hi);
+                    if (match) { removed = true; continue; }
+                }
+                keep.push_back(line);
+            }
+            in.close();
+            std::string tmp = wt_path + ".tmp";
+            std::ofstream out(tmp, std::ios::trunc);
+            if (out.is_open()) {
+                for (const auto& l : keep) out << l << "\n";
+                out.close();
+                std::rename(tmp.c_str(), wt_path.c_str());
+                if (removed)
+                    _log("PrimeNet: removed completed assignment from worktodo.txt");
+            }
+        }
+        return true;
+    }
 
     // r=1: factor found, r=4: no factor
     int result_type = result.factor_found ? 1 : 4;
@@ -267,9 +363,44 @@ bool PrimeNetClient::submit_result(const TFResult& result) {
     // Also write same JSON to local file
     write_result_json(result, json);
 
-    // Remove completed assignment
+    // Remove completed assignment from in-memory state
     if (!result.assignment_key.empty()) {
         remove_assignment(result.assignment_key);
+    }
+
+    // Also remove it from worktodo.txt if the assignment came from there
+    {
+        std::string wt_path = _data_dir + "/worktodo.txt";
+        std::ifstream in(wt_path);
+        if (in.is_open()) {
+            std::vector<std::string> keep;
+            std::string line;
+            bool removed = false;
+            while (std::getline(in, line)) {
+                Assignment a;
+                if (!removed && parse_worktodo_line(line, a)) {
+                    bool match =
+                        (!result.assignment_key.empty() && a.key == result.assignment_key) ||
+                        (result.assignment_key.empty() &&
+                         a.exponent == result.exponent &&
+                         (int)a.bit_lo == (int)result.bit_lo &&
+                         (int)a.bit_hi == (int)result.bit_hi);
+                    if (match) { removed = true; continue; }
+                }
+                keep.push_back(line);
+            }
+            in.close();
+            if (removed) {
+                std::string tmp = wt_path + ".tmp";
+                std::ofstream out(tmp, std::ios::trunc);
+                if (out.is_open()) {
+                    for (const auto& l : keep) out << l << "\n";
+                    out.close();
+                    std::rename(tmp.c_str(), wt_path.c_str());
+                    _log("PrimeNet: removed completed assignment from worktodo.txt");
+                }
+            }
+        }
     }
 
     return true;
@@ -331,9 +462,7 @@ std::string PrimeNetClient::build_result_json(const TFResult& result) {
     sysctlbyname("hw.memsize", &memsize, &sz, NULL, 0);
     int ram_gb = (int)(memsize / (1024ULL * 1024 * 1024));
 
-    int gpu_cores = 0;
-    sz = sizeof(gpu_cores);
-    sysctlbyname("gpu.core_count", &gpu_cores, &sz, NULL, 0);
+    int gpu_cores = detect_gpu_core_count();
 
     std::ostringstream js;
     js << "{\"timestamp\":\"" << ts << "\""
@@ -353,7 +482,13 @@ std::string PrimeNetClient::build_result_json(const TFResult& result) {
        << ",\"user\":\"" << _state.username << "\""
        << ",\"computer\":\"" << _state.computer_name << "\"";
 
-    if (!result.assignment_key.empty() && result.assignment_key != "0") {
+    // Include AID only if non-empty, non-"0", and not all zeros
+    auto aid_is_meaningful = [](const std::string& s) {
+        if (s.empty() || s == "0") return false;
+        for (char c : s) if (c != '0') return true;
+        return false;
+    };
+    if (aid_is_meaningful(result.assignment_key)) {
         js << ",\"aid\":\"" << result.assignment_key << "\"";
     }
 
@@ -454,6 +589,146 @@ void PrimeNetClient::remove_assignment(const std::string& key) {
     as.erase(std::remove_if(as.begin(), as.end(),
         [&key](const Assignment& a) { return a.key == key; }), as.end());
     save_state();
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// worktodo.txt reader (AutoPrimeNet / mfaktc interop)
+// ═══════════════════════════════════════════════════════════════════════
+//
+// Lines accepted:
+//   Factor=<AID>,<exponent>,<bitlo>,<bithi>      (mfaktc/mfakto, AutoPrimeNet)
+//   Factor=<exponent>,<bitlo>,<bithi>            (AID omitted)
+// Blank lines and lines starting with '#', ';', or "//" are ignored.
+
+static std::string trim(const std::string& s) {
+    size_t a = s.find_first_not_of(" \t\r\n");
+    if (a == std::string::npos) return "";
+    size_t b = s.find_last_not_of(" \t\r\n");
+    return s.substr(a, b - a + 1);
+}
+
+static bool parse_worktodo_line(const std::string& raw, Assignment& out) {
+    std::string line = trim(raw);
+    if (line.empty()) return false;
+    if (line[0] == '#' || line[0] == ';') return false;
+    if (line.size() >= 2 && line[0] == '/' && line[1] == '/') return false;
+
+    // Must start with "Factor="
+    const std::string prefix = "Factor=";
+    if (line.compare(0, prefix.size(), prefix) != 0) return false;
+    std::string rest = line.substr(prefix.size());
+
+    // Split on commas
+    std::vector<std::string> parts;
+    std::string tok;
+    std::istringstream ss(rest);
+    while (std::getline(ss, tok, ',')) parts.push_back(trim(tok));
+
+    if (parts.size() < 3) return false;
+
+    // Detect AID: 32 hex chars, not all digits
+    bool has_aid = false;
+    if (parts.size() >= 4) {
+        const std::string& p0 = parts[0];
+        if (p0.size() == 32) {
+            bool all_hex = true;
+            for (char c : p0) {
+                if (!isxdigit((unsigned char)c)) { all_hex = false; break; }
+            }
+            if (all_hex) has_aid = true;
+        }
+    }
+
+    size_t idx = 0;
+    if (has_aid) {
+        out.key = parts[idx++];
+    } else {
+        out.key = "";
+    }
+
+    if (idx + 2 >= parts.size()) return false;
+    try {
+        out.exponent = std::stoull(parts[idx]);
+        out.bit_lo = std::stod(parts[idx + 1]);
+        out.bit_hi = std::stod(parts[idx + 2]);
+    } catch (...) {
+        return false;
+    }
+    out.valid = true;
+    return true;
+}
+
+std::vector<Assignment> PrimeNetClient::read_worktodo() {
+    std::vector<Assignment> out;
+    std::string path = _data_dir + "/worktodo.txt";
+    std::ifstream f(path);
+    if (!f.is_open()) return out;
+    std::string line;
+    while (std::getline(f, line)) {
+        Assignment a;
+        if (parse_worktodo_line(line, a)) out.push_back(a);
+    }
+    return out;
+}
+
+bool PrimeNetClient::has_worktodo() {
+    return !read_worktodo().empty();
+}
+
+Assignment PrimeNetClient::next_worktodo() {
+    auto entries = read_worktodo();
+    if (entries.empty()) {
+        Assignment a;
+        a.valid = false;
+        return a;
+    }
+    _log("PrimeNet: loaded assignment from worktodo.txt: exp=" +
+         std::to_string(entries.front().exponent) +
+         " [" + std::to_string((int)entries.front().bit_lo) +
+         "," + std::to_string((int)entries.front().bit_hi) + "]");
+    return entries.front();
+}
+
+void PrimeNetClient::remove_worktodo(const Assignment& done) {
+    std::string path = _data_dir + "/worktodo.txt";
+    std::ifstream f(path);
+    if (!f.is_open()) return;
+
+    std::vector<std::string> keep;
+    std::string line;
+    bool removed = false;
+    while (std::getline(f, line)) {
+        Assignment a;
+        if (!removed && parse_worktodo_line(line, a)) {
+            bool match = false;
+            if (!done.key.empty() && a.key == done.key) {
+                match = true;
+            } else if (done.key.empty() &&
+                       a.exponent == done.exponent &&
+                       (int)a.bit_lo == (int)done.bit_lo &&
+                       (int)a.bit_hi == (int)done.bit_hi) {
+                match = true;
+            }
+            if (match) {
+                removed = true;
+                continue; // drop this line
+            }
+        }
+        keep.push_back(line);
+    }
+    f.close();
+
+    // Atomic rewrite via temp file
+    std::string tmp = path + ".tmp";
+    std::ofstream out(tmp, std::ios::trunc);
+    if (!out.is_open()) return;
+    for (const auto& l : keep) out << l << "\n";
+    out.close();
+    std::rename(tmp.c_str(), path.c_str());
+
+    if (removed) {
+        _log("PrimeNet: removed completed assignment from worktodo.txt");
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -582,10 +857,8 @@ std::string PrimeNetClient::machine_description() {
     sysctlbyname("hw.memsize", &memsize, &sz, NULL, 0);
     int ram_gb = (int)(memsize / (1024ULL * 1024 * 1024));
 
-    // GPU cores (Metal)
-    int gpu_cores = 0;
-    sz = sizeof(gpu_cores);
-    sysctlbyname("gpu.core_count", &gpu_cores, &sz, NULL, 0);
+    // GPU cores (Metal) via IORegistry
+    int gpu_cores = detect_gpu_core_count();
 
     std::ostringstream desc;
     desc << "PrimePath/1.2.0 | " << chip_str
