@@ -1,6 +1,26 @@
 # Changelog
 
-## v1.1 — Carry-Chain Mulmod (2026-03-26)
+## v1.2 – JSON Result Editor & PrimeNet JSON Format (2026-04-10)
+
+### New
+- **JSON Result Editor panel** – full GUI editor for PrimeNet JSON results with:
+  - Editable fields for every result field (exponent, status, bit range, factors, user, computer, AID, program, kernel)
+  - Status and range-complete popups with inline validation hints
+  - Auto-detected hardware and OS info (chip, CPU P/E cores, GPU cores, RAM, Darwin version)
+  - **Validate** – checks JSON syntax, required fields, status/factor consistency, timestamp format, 2000-char limit
+  - **Load Template / Save Template** – reusable JSON configurations (`.json` files)
+  - **Simulate Test** – loads a known result (M67 has factor 193707721) for format verification
+  - **Auto-Fill** – populates fields from system info, current assignment, and discoveries
+  - **Send to Server** – builds the full `t=ar` URL with credentials and JSON as `&m=`, with confirmation dialog
+  - Dual-pane output: editable JSON text view + validation/server log
+- **PrimeNet JSON result format** – result submissions now send a single-line JSON in the `&m=` parameter instead of the old human-readable string. Local `results.json.txt` writes the same JSON as submitted. Matches the mersenne.org expected format with fields: `timestamp` (UTC), `exponent`, `worktype`, `status`, `bitlo`, `bithi`, `rangecomplete`, `factors` (if F), `program` (name/version/kernel), `os` (os/version/architecture), `user`, `computer`, `aid`, `hardware` (chip/cores/RAM).
+
+### Changed
+- Version bumped to 1.2.0 across User-Agent header, PrimeNet registration, machine description, and JSON output
+- `CFBundleShortVersionString` / `CFBundleVersion` updated to 1.2.0 in Info.plist
+- PrimeNet result submission no longer writes the old `"M<exp> has a factor..."` string format
+
+## v1.1 – Carry-Chain Mulmod (2026-03-26)
 
 ### New
 - **Carry-chain hardware mulmod** — 4-7x faster 128-bit modular multiplication for CPU tests (Wieferich, Wall-Sun-Sun). Uses ARM64 MUL+UMULH with __int128 reduction instead of binary shift-and-add. Works for moduli up to 95 bits. Toggle via CarryChain checkbox in main window.

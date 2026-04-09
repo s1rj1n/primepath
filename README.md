@@ -49,7 +49,21 @@ Build custom search pipelines by picking stages from five categories -- Sieve (W
 
 ## GIMPS
 
-Talks directly to [mersenne.org](https://www.mersenne.org) over the PrimeNet v5 API. Register your machine, pull trial factoring assignments, run them on Metal GPU, and submit results back. GPU-found factors are independently verified on CPU using carry-chain modular exponentiation before submission. Reports system specs (chip, CPU/GPU cores, RAM) in results. Also writes `results.json.txt` compatible with mfaktc. First Metal GPU client for GIMPS.
+Talks directly to [mersenne.org](https://www.mersenne.org) over the PrimeNet v5 API. Register your machine, pull trial factoring assignments, run them on Metal GPU, and submit results back. GPU-found factors are independently verified on CPU using carry-chain modular exponentiation before submission. Reports system specs (chip, CPU/GPU cores, RAM) in results.
+
+Result submissions use the PrimeNet JSON format (single-line JSON in the `&m=` parameter) with fields for timestamp (UTC), exponent, worktype, status, bit range, factors, program info, OS info, user, computer, AID, and hardware details. Local `results.json.txt` matches the submitted JSON exactly. First Metal GPU client for GIMPS.
+
+### JSON Result Editor
+
+Built-in GUI editor for building, validating, and testing PrimeNet JSON results. Accessible from the GIMPS panel.
+
+- Editable fields for every JSON result field (exponent, status, bit range, factors, user, computer, AID, program, kernel)
+- **Validate** – checks JSON syntax, required fields, status/factor consistency, timestamp format, 2000-char limit
+- **Load / Save Template** – reusable JSON configurations for different assignment types
+- **Simulate Test** – loads a known result (M67 has factor 193707721) to verify format without a real assignment
+- **Auto-Fill** – populates fields from system info, current assignment, and discoveries
+- **Send to Server** – configurable server URL and credentials string, sends the JSON in the `&m=` parameter with full confirmation before submission
+- Dual-pane output with editable JSON text and validation/server log
 
 ## Distributed Search
 

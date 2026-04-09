@@ -76,7 +76,7 @@ bool PrimeNetClient::register_machine() {
         "&g=" + _state.guid +
         "&hg=" + hw_guid +
         "&wg="
-        "&a=" + url_encode("macOS,PrimePath,1.0.0 (github.com/s1rj1n/primepath)") +
+        "&a=" + url_encode("macOS,PrimePath,1.2.0 (github.com/s1rj1n/primepath)") +
         "&c=" + url_encode(chip_name + " (Metal GPU)") +
         "&f=" + url_encode("Metal,NEON,AES") +
         "&L1=192&L2=4096&L3=0"
@@ -348,7 +348,7 @@ std::string PrimeNetClient::build_result_json(const TFResult& result) {
         js << ",\"factors\":[\"" << result.factor << "\"]";
     }
 
-    js << ",\"program\":{\"name\":\"PrimePath\",\"version\":\"1.0.0\",\"kernel\":\"Metal96bit\"}"
+    js << ",\"program\":{\"name\":\"PrimePath\",\"version\":\"1.2.0\",\"kernel\":\"Metal96bit\"}"
        << ",\"os\":{\"os\":\"macOS\",\"version\":\"" << un.release << "\",\"architecture\":\"ARM_64\"}"
        << ",\"user\":\"" << _state.username << "\""
        << ",\"computer\":\"" << _state.computer_name << "\"";
@@ -496,7 +496,7 @@ std::string PrimeNetClient::http_get(const std::string& url) {
         NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:reqURL];
         req.HTTPMethod = @"GET";
         req.timeoutInterval = 45.0;  // Longer than semaphore so NSURLSession always finishes first
-        [req setValue:@"PrimePath/1.0.0" forHTTPHeaderField:@"User-Agent"];
+        [req setValue:@"PrimePath/1.2.0" forHTTPHeaderField:@"User-Agent"];
 
         // Use heap-allocated storage so the completion handler is safe even if
         // the semaphore times out (shouldn't happen since request timeout < sem timeout)
@@ -588,7 +588,7 @@ std::string PrimeNetClient::machine_description() {
     sysctlbyname("gpu.core_count", &gpu_cores, &sz, NULL, 0);
 
     std::ostringstream desc;
-    desc << "PrimePath/1.0.0 | " << chip_str
+    desc << "PrimePath/1.2.0 | " << chip_str
          << " | " << ncpu << " CPU";
     if (perf_cores > 0)
         desc << " (" << perf_cores << "P+" << eff_cores << "E)";
