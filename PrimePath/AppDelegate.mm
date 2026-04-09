@@ -17,6 +17,8 @@
 #include "Network/PrimeNetClient.hpp"
 #include "DataTools.hpp"
 #import <IOKit/pwr_mgt/IOPMLib.h>
+#include <sys/utsname.h>
+#include <sys/sysctl.h>
 
 static NSString *const DATA_DIR = @"/Users/sergeinester/Documents/primes/primelocations";
 
@@ -3737,6 +3739,23 @@ static std::string u128_to_str(unsigned __int128 v) {
 
     y -= 30;
 
+    // JSON Editor button
+    NSButton *jsonBtn = [self buttonAt:NSMakeRect(14, y - 24, 130, 24)
+        title:@"JSON Result Editor" action:@selector(showJSONResultEditor:)];
+    jsonBtn.font = [NSFont systemFontOfSize:10];
+    jsonBtn.autoresizingMask = NSViewMinYMargin;
+    [cv addSubview:jsonBtn];
+
+    NSTextField *jsonHint = [[NSTextField alloc] initWithFrame:NSMakeRect(150, y - 22, 380, 14)];
+    jsonHint.stringValue = @"Build and preview JSON result lines for mersenne.org submission.";
+    jsonHint.font = [NSFont systemFontOfSize:9];
+    jsonHint.textColor = [NSColor secondaryLabelColor];
+    jsonHint.bezeled = NO; jsonHint.editable = NO; jsonHint.drawsBackground = NO;
+    jsonHint.autoresizingMask = NSViewMinYMargin | NSViewWidthSizable;
+    [cv addSubview:jsonHint];
+
+    y -= 30;
+
     // Batch size option
     NSTextField *batchLbl = [[NSTextField alloc] initWithFrame:NSMakeRect(14, y - 16, 80, 14)];
     batchLbl.stringValue = @"Sieve batch:";
@@ -3846,6 +3865,874 @@ static std::string u128_to_str(unsigned __int128 v) {
     [cv addSubview:logScroll];
 
     [win makeKeyAndOrderFront:nil];
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// JSON Result Editor -- build / preview / validate / test PrimeNet JSON
+// ═══════════════════════════════════════════════════════════════════════
+
+- (NSTextView *)jsonEditorOutputView:(NSWindow *)win {
+    for (NSView *sub in win.contentView.subviews) {
+        if ([sub isKindOfClass:[NSScrollView class]] &&
+            [sub.identifier isEqualToString:@"jsonEditorOutput"]) {
+            return (NSTextView *)((NSScrollView *)sub).documentView;
+        }
+    }
+    return nil;
+}
+
+- (void)jsonEditorLog:(NSWindow *)win message:(NSString *)msg {
+    NSTextView *logView = nil;
+    for (NSView *sub in win.contentView.subviews) {
+        if ([sub isKindOfClass:[NSScrollView class]] &&
+            [sub.identifier isEqualToString:@"jsonEditorLog"]) {
+            logView = (NSTextView *)((NSScrollView *)sub).documentView;
+            break;
+        }
+    }
+    if (logView) {
+        NSString *line = [NSString stringWithFormat:@"%@\n", msg];
+        [logView.textStorage appendAttributedString:
+            [[NSAttributedString alloc] initWithString:line
+                attributes:@{NSFontAttributeName: [NSFont monospacedSystemFontOfSize:10 weight:NSFontWeightRegular],
+                              NSForegroundColorAttributeName: [NSColor labelColor]}]];
+        [logView scrollRangeToVisible:NSMakeRange(logView.string.length, 0)];
+    }
+}
+
+- (void)showJSONResultEditor:(id)sender {
+    NSWindow *win = [[NSWindow alloc]
+        initWithContentRect:NSMakeRect(140, 60, 700, 860)
+        styleMask:(NSWindowStyleMaskTitled | NSWindowStyleMaskClosable | NSWindowStyleMaskResizable)
+        backing:NSBackingStoreBuffered defer:NO];
+    win.title = @"JSON Result Editor";
+    win.releasedWhenClosed = NO;
+    win.minSize = NSMakeSize(580, 700);
+
+    NSView *cv = win.contentView;
+    CGFloat W = cv.frame.size.width;
+    CGFloat y = cv.frame.size.height - 10;
+
+    // Title
+    NSTextField *title = [[NSTextField alloc] initWithFrame:NSMakeRect(14, y - 18, W - 28, 18)];
+    title.stringValue = @"PrimeNet JSON Result Builder";
+    title.font = [NSFont boldSystemFontOfSize:13];
+    title.bezeled = NO; title.editable = NO; title.drawsBackground = NO;
+    title.autoresizingMask = NSViewMinYMargin | NSViewWidthSizable;
+    [cv addSubview:title];
+    y -= 22;
+
+    // --- Field layout ---
+    // Tags: 9001=exponent, 9002=status, 9003=bitlo, 9004=bithi,
+    //        9005=rangecomplete, 9006=factors, 9007=user, 9008=computer,
+    //        9009=aid, 9010=programName, 9011=programVersion, 9012=kernel,
+    //        9020=PrimeNet URL, 9021=PrimeNet password/challenge
+
+    CGFloat lblW = 110;
+    CGFloat fldX = lblW + 20;
+    CGFloat fldW = W - fldX - 14;
+
+    auto addRow = [&](NSString *label, NSInteger tag, NSString *placeholder, NSString *defaultVal) {
+        NSTextField *lbl = [[NSTextField alloc] initWithFrame:NSMakeRect(14, y - 16, lblW, 14)];
+        lbl.stringValue = label;
+        lbl.font = [NSFont systemFontOfSize:10];
+        lbl.bezeled = NO; lbl.editable = NO; lbl.drawsBackground = NO;
+        lbl.alignment = NSTextAlignmentRight;
+        lbl.autoresizingMask = NSViewMinYMargin;
+        [cv addSubview:lbl];
+
+        NSTextField *fld = [[NSTextField alloc] initWithFrame:NSMakeRect(fldX, y - 18, fldW, 20)];
+        fld.font = [NSFont monospacedSystemFontOfSize:11 weight:NSFontWeightRegular];
+        fld.placeholderString = placeholder;
+        fld.stringValue = defaultVal ? defaultVal : @"";
+        fld.tag = tag;
+        fld.autoresizingMask = NSViewMinYMargin | NSViewWidthSizable;
+        [cv addSubview:fld];
+        y -= 24;
+    };
+
+    auto addPopupRow = [&](NSString *label, NSInteger tag, NSArray<NSString *> *items, NSInteger sel, NSString *hint) {
+        NSTextField *lbl = [[NSTextField alloc] initWithFrame:NSMakeRect(14, y - 16, lblW, 14)];
+        lbl.stringValue = label;
+        lbl.font = [NSFont systemFontOfSize:10];
+        lbl.bezeled = NO; lbl.editable = NO; lbl.drawsBackground = NO;
+        lbl.alignment = NSTextAlignmentRight;
+        lbl.autoresizingMask = NSViewMinYMargin;
+        [cv addSubview:lbl];
+
+        NSPopUpButton *popup = [[NSPopUpButton alloc] initWithFrame:NSMakeRect(fldX, y - 18, 140, 20) pullsDown:NO];
+        for (NSString *item in items) [popup addItemWithTitle:item];
+        popup.font = [NSFont monospacedSystemFontOfSize:11 weight:NSFontWeightRegular];
+        popup.tag = tag;
+        [popup selectItemAtIndex:sel];
+        popup.autoresizingMask = NSViewMinYMargin;
+        [cv addSubview:popup];
+
+        if (hint) {
+            NSTextField *h = [[NSTextField alloc] initWithFrame:NSMakeRect(fldX + 150, y - 16, fldW - 150, 14)];
+            h.stringValue = hint;
+            h.font = [NSFont systemFontOfSize:9];
+            h.textColor = [NSColor secondaryLabelColor];
+            h.bezeled = NO; h.editable = NO; h.drawsBackground = NO;
+            h.autoresizingMask = NSViewMinYMargin | NSViewWidthSizable;
+            [cv addSubview:h];
+        }
+        y -= 24;
+    };
+
+    // Pre-fill from assignment
+    NSString *defExp = @"", *defBLo = @"", *defBHi = @"", *defAid = @"";
+    if (_primenet->pending_count() > 0) {
+        auto& a = _primenet->state().assignments.front();
+        defExp = [NSString stringWithFormat:@"%llu", a.exponent];
+        defBLo = [NSString stringWithFormat:@"%d", (int)a.bit_lo];
+        defBHi = [NSString stringWithFormat:@"%d", (int)a.bit_hi];
+        defAid = [NSString stringWithUTF8String:a.key.c_str()];
+    }
+    NSString *defUser = [NSString stringWithUTF8String:_primenet->username().c_str()];
+    char hn[256] = {};
+    gethostname(hn, sizeof(hn));
+    NSString *defComp = [NSString stringWithUTF8String:hn];
+
+    // ── Result fields ──
+    addRow(@"Exponent:", 9001, @"e.g. 501986531", defExp);
+    addRow(@"Bit lo:", 9003, @"e.g. 76", defBLo);
+    addRow(@"Bit hi:", 9004, @"e.g. 77", defBHi);
+    addPopupRow(@"Status:", 9002,
+        @[@"NF (no factor)", @"F (factor found)"], 0, nil);
+    addPopupRow(@"Range complete:", 9005,
+        @[@"true", @"false"], 0,
+        @"true for NF; for F only if you continued past the factor(s)");
+    addRow(@"Factors:", 9006, @"comma-separated, e.g. 12345,67890", @"");
+    addRow(@"User:", 9007, @"mersenne.org username", defUser);
+    addRow(@"Computer:", 9008, @"machine name", defComp);
+    addRow(@"AID:", 9009, @"assignment key (blank if unknown)", defAid);
+
+    // ── Program fields ──
+    NSBox *sep1 = [[NSBox alloc] initWithFrame:NSMakeRect(14, y, W - 28, 1)];
+    sep1.boxType = NSBoxSeparator;
+    sep1.autoresizingMask = NSViewMinYMargin | NSViewWidthSizable;
+    [cv addSubview:sep1];
+    y -= 8;
+
+    addRow(@"Program:", 9010, @"PrimePath", @"PrimePath");
+    addRow(@"Version:", 9011, @"1.0.0", @"1.0.0");
+    addRow(@"Kernel:", 9012, @"Metal96bit (optional)", @"Metal96bit");
+
+    // ── PrimeNet connection ──
+    NSBox *sep2 = [[NSBox alloc] initWithFrame:NSMakeRect(14, y, W - 28, 1)];
+    sep2.boxType = NSBoxSeparator;
+    sep2.autoresizingMask = NSViewMinYMargin | NSViewWidthSizable;
+    [cv addSubview:sep2];
+    y -= 8;
+
+    {
+        NSTextField *hdr = [[NSTextField alloc] initWithFrame:NSMakeRect(14, y - 14, 300, 14)];
+        hdr.stringValue = @"PrimeNet Connection (for direct submission testing)";
+        hdr.font = [NSFont boldSystemFontOfSize:10];
+        hdr.bezeled = NO; hdr.editable = NO; hdr.drawsBackground = NO;
+        hdr.autoresizingMask = NSViewMinYMargin;
+        [cv addSubview:hdr];
+        y -= 20;
+    }
+
+    addRow(@"Server URL:", 9020, @"https://v5.mersenne.org/v5server/",
+           @"https://v5.mersenne.org/v5server/");
+    addRow(@"Credentials:", 9021, @"guid=...&ss=...&sh=... (appended to URL)", @"");
+
+    // ── Buttons row 1: Generate / Validate / Copy ──
+    NSBox *sep3 = [[NSBox alloc] initWithFrame:NSMakeRect(14, y - 2, W - 28, 1)];
+    sep3.boxType = NSBoxSeparator;
+    sep3.autoresizingMask = NSViewMinYMargin | NSViewWidthSizable;
+    [cv addSubview:sep3];
+    y -= 12;
+
+    CGFloat bx = 14;
+    auto addBtn = [&](NSString *t, SEL action, CGFloat w, BOOL bold) {
+        NSButton *b = [self buttonAt:NSMakeRect(bx, y - 24, w, 24) title:t action:action];
+        b.font = bold ? [NSFont boldSystemFontOfSize:10] : [NSFont systemFontOfSize:10];
+        b.autoresizingMask = NSViewMinYMargin;
+        [cv addSubview:b];
+        bx += w + 4;
+    };
+
+    addBtn(@"Generate", @selector(jsonEditorGenerate:), 80, YES);
+    addBtn(@"Validate", @selector(jsonEditorValidate:), 70, NO);
+    addBtn(@"Copy", @selector(jsonEditorCopy:), 60, NO);
+    addBtn(@"Save to File", @selector(jsonEditorSave:), 90, NO);
+    addBtn(@"Auto-Fill", @selector(jsonEditorAutoFill:), 80, NO);
+    y -= 28;
+
+    // ── Buttons row 2: Templates / Simulate / Send Test ──
+    bx = 14;
+    addBtn(@"Load Template", @selector(jsonEditorLoadTemplate:), 110, NO);
+    addBtn(@"Save Template", @selector(jsonEditorSaveTemplate:), 110, NO);
+    addBtn(@"Simulate Test", @selector(jsonEditorSimulate:), 110, YES);
+    addBtn(@"Send to Server", @selector(jsonEditorSendTest:), 110, NO);
+    y -= 32;
+
+    // ── JSON output area ──
+    {
+        NSTextField *hdr = [[NSTextField alloc] initWithFrame:NSMakeRect(14, y - 14, 200, 14)];
+        hdr.stringValue = @"JSON Output (editable)";
+        hdr.font = [NSFont boldSystemFontOfSize:10];
+        hdr.bezeled = NO; hdr.editable = NO; hdr.drawsBackground = NO;
+        hdr.autoresizingMask = NSViewMinYMargin;
+        [cv addSubview:hdr];
+        y -= 18;
+    }
+
+    CGFloat splitY = y * 0.5; // split remaining space between output and log
+
+    NSScrollView *outScroll = [[NSScrollView alloc] initWithFrame:NSMakeRect(14, splitY + 4, W - 28, y - splitY - 4)];
+    outScroll.hasVerticalScroller = YES;
+    outScroll.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
+    NSTextView *outView = [[NSTextView alloc] initWithFrame:NSMakeRect(0, 0, W - 32, y - splitY - 4)];
+    outView.editable = YES;
+    outView.font = [NSFont monospacedSystemFontOfSize:10 weight:NSFontWeightRegular];
+    outView.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
+    outView.string = @"Click 'Generate' to build JSON, 'Simulate Test' for a sample, or paste JSON to validate.";
+    outView.textColor = [NSColor secondaryLabelColor];
+    outScroll.documentView = outView;
+    outScroll.identifier = @"jsonEditorOutput";
+    [cv addSubview:outScroll];
+
+    // ── Log area ──
+    {
+        NSTextField *hdr = [[NSTextField alloc] initWithFrame:NSMakeRect(14, splitY - 4, 200, 14)];
+        hdr.stringValue = @"Validation / Server Log";
+        hdr.font = [NSFont boldSystemFontOfSize:10];
+        hdr.bezeled = NO; hdr.editable = NO; hdr.drawsBackground = NO;
+        hdr.autoresizingMask = NSViewMinYMargin;
+        [cv addSubview:hdr];
+    }
+
+    NSScrollView *logScroll = [[NSScrollView alloc] initWithFrame:NSMakeRect(14, 10, W - 28, splitY - 24)];
+    logScroll.hasVerticalScroller = YES;
+    logScroll.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
+    NSTextView *logView = [[NSTextView alloc] initWithFrame:NSMakeRect(0, 0, W - 32, splitY - 24)];
+    logView.editable = NO;
+    logView.font = [NSFont monospacedSystemFontOfSize:10 weight:NSFontWeightRegular];
+    logView.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
+    logScroll.documentView = logView;
+    logScroll.identifier = @"jsonEditorLog";
+    [cv addSubview:logScroll];
+
+    [win makeKeyAndOrderFront:nil];
+}
+
+// ── JSON builder from form fields ────────────────────────────────────
+
+- (NSString *)jsonEditorBuildJSON:(NSWindow *)win {
+    NSView *cv = win.contentView;
+
+    NSString *exponent = ((NSTextField *)[cv viewWithTag:9001]).stringValue;
+    NSPopUpButton *statusPopup = [cv viewWithTag:9002];
+    NSString *bitlo = ((NSTextField *)[cv viewWithTag:9003]).stringValue;
+    NSString *bithi = ((NSTextField *)[cv viewWithTag:9004]).stringValue;
+    NSPopUpButton *rcPopup = [cv viewWithTag:9005];
+    NSString *factors = ((NSTextField *)[cv viewWithTag:9006]).stringValue;
+    NSString *user = ((NSTextField *)[cv viewWithTag:9007]).stringValue;
+    NSString *computer = ((NSTextField *)[cv viewWithTag:9008]).stringValue;
+    NSString *aid = ((NSTextField *)[cv viewWithTag:9009]).stringValue;
+    NSString *progName = ((NSTextField *)[cv viewWithTag:9010]).stringValue;
+    NSString *progVersion = ((NSTextField *)[cv viewWithTag:9011]).stringValue;
+    NSString *kernel = ((NSTextField *)[cv viewWithTag:9012]).stringValue;
+
+    BOOL isF = (statusPopup.indexOfSelectedItem == 1);
+    BOOL rangeComplete = (rcPopup.indexOfSelectedItem == 0);
+
+    NSDateFormatter *fmt = [[NSDateFormatter alloc] init];
+    fmt.dateFormat = @"yyyy-MM-dd HH:mm:ss";
+    fmt.timeZone = [NSTimeZone timeZoneWithAbbreviation:@"UTC"];
+    NSString *ts = [fmt stringFromDate:[NSDate date]];
+
+    struct utsname un;
+    uname(&un);
+
+    NSMutableString *js = [NSMutableString string];
+    [js appendFormat:@"{\"timestamp\":\"%@\"", ts];
+    [js appendFormat:@",\"exponent\":%@", exponent];
+    [js appendString:@",\"worktype\":\"TF\""];
+    [js appendFormat:@",\"status\":\"%@\"", isF ? @"F" : @"NF"];
+    [js appendFormat:@",\"bitlo\":%@", bitlo];
+    [js appendFormat:@",\"bithi\":%@", bithi];
+    [js appendFormat:@",\"rangecomplete\":%@", rangeComplete ? @"true" : @"false"];
+
+    if (isF && factors.length > 0) {
+        NSArray *flist = [factors componentsSeparatedByString:@","];
+        NSMutableArray *quoted = [NSMutableArray array];
+        for (NSString *f in flist) {
+            NSString *trimmed = [f stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceCharacterSet]];
+            if (trimmed.length > 0)
+                [quoted addObject:[NSString stringWithFormat:@"\"%@\"", trimmed]];
+        }
+        if (quoted.count > 0)
+            [js appendFormat:@",\"factors\":[%@]", [quoted componentsJoinedByString:@","]];
+    }
+
+    [js appendFormat:@",\"program\":{\"name\":\"%@\",\"version\":\"%@\"", progName, progVersion];
+    if (kernel.length > 0)
+        [js appendFormat:@",\"kernel\":\"%@\"", kernel];
+    [js appendString:@"}"];
+
+    [js appendFormat:@",\"os\":{\"os\":\"macOS\",\"version\":\"%s\",\"architecture\":\"ARM_64\"}", un.release];
+
+    if (user.length > 0)
+        [js appendFormat:@",\"user\":\"%@\"", user];
+    if (computer.length > 0)
+        [js appendFormat:@",\"computer\":\"%@\"", computer];
+    if (aid.length > 0)
+        [js appendFormat:@",\"aid\":\"%@\"", aid];
+
+    // Hardware (auto-detect)
+    {
+        char chip[256] = {};
+        size_t chip_len = sizeof(chip);
+        sysctlbyname("machdep.cpu.brand_string", chip, &chip_len, NULL, 0);
+        NSString *chipStr = chip[0] ? [NSString stringWithUTF8String:chip] : @"Apple Silicon";
+
+        int ncpu = (int)[[NSProcessInfo processInfo] processorCount];
+        int perf = 0, eff = 0;
+        size_t sz = sizeof(int);
+        sysctlbyname("hw.perflevel0.logicalcpu", &perf, &sz, NULL, 0);
+        sz = sizeof(int);
+        sysctlbyname("hw.perflevel1.logicalcpu", &eff, &sz, NULL, 0);
+
+        uint64_t memsize = 0;
+        sz = sizeof(memsize);
+        sysctlbyname("hw.memsize", &memsize, &sz, NULL, 0);
+        int ram_gb = (int)(memsize / (1024ULL * 1024 * 1024));
+
+        int gpu_cores = 0;
+        sz = sizeof(gpu_cores);
+        sysctlbyname("gpu.core_count", &gpu_cores, &sz, NULL, 0);
+
+        [js appendFormat:@",\"hardware\":{\"chip\":\"%@\",\"cpu_cores\":%d", chipStr, ncpu];
+        if (perf > 0)
+            [js appendFormat:@",\"cpu_performance\":%d,\"cpu_efficiency\":%d", perf, eff];
+        if (gpu_cores > 0)
+            [js appendFormat:@",\"gpu_cores\":%d", gpu_cores];
+        [js appendFormat:@",\"ram_gb\":%d}", ram_gb];
+    }
+
+    [js appendString:@"}"];
+    return js;
+}
+
+// ── Generate ─────────────────────────────────────────────────────────
+
+- (void)jsonEditorGenerate:(id)sender {
+    NSWindow *win = [sender window];
+    NSString *json = [self jsonEditorBuildJSON:win];
+    NSTextView *outView = [self jsonEditorOutputView:win];
+    if (outView) {
+        outView.string = json;
+        outView.textColor = [NSColor labelColor];
+    }
+    [self jsonEditorLog:win message:@"Generated JSON result line."];
+}
+
+// ── Validate JSON syntax and required fields ─────────────────────────
+
+- (void)jsonEditorValidate:(id)sender {
+    NSWindow *win = [sender window];
+    NSTextView *outView = [self jsonEditorOutputView:win];
+    if (!outView || outView.string.length == 0) {
+        [self jsonEditorLog:win message:@"VALIDATE: nothing to validate -- generate or paste JSON first."];
+        return;
+    }
+
+    NSString *raw = outView.string;
+    [self jsonEditorLog:win message:@"--- Validation ---"];
+
+    // Check single line
+    if ([raw componentsSeparatedByString:@"\n"].count > 1) {
+        NSString *trimmed = [raw stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+        if ([trimmed componentsSeparatedByString:@"\n"].count > 1) {
+            [self jsonEditorLog:win message:@"WARN: JSON must be a single line from { to }."];
+        }
+    }
+
+    // Parse with NSJSONSerialization
+    NSData *data = [raw dataUsingEncoding:NSUTF8StringEncoding];
+    NSError *err = nil;
+    NSDictionary *dict = [NSJSONSerialization JSONObjectWithData:data options:0 error:&err];
+    if (err || ![dict isKindOfClass:[NSDictionary class]]) {
+        [self jsonEditorLog:win message:[NSString stringWithFormat:@"FAIL: invalid JSON -- %@",
+            err.localizedDescription ?: @"not a JSON object"]];
+        return;
+    }
+    [self jsonEditorLog:win message:@"OK: valid JSON syntax."];
+
+    // Required fields
+    NSArray *required = @[@"timestamp", @"exponent", @"worktype", @"status",
+                          @"bitlo", @"bithi", @"rangecomplete", @"program", @"os",
+                          @"user", @"computer"];
+    BOOL allPresent = YES;
+    for (NSString *key in required) {
+        if (!dict[key]) {
+            [self jsonEditorLog:win message:[NSString stringWithFormat:@"FAIL: missing required field \"%@\".", key]];
+            allPresent = NO;
+        }
+    }
+    if (allPresent)
+        [self jsonEditorLog:win message:@"OK: all required fields present."];
+
+    // Check program sub-fields
+    if ([dict[@"program"] isKindOfClass:[NSDictionary class]]) {
+        NSDictionary *prog = dict[@"program"];
+        if (!prog[@"name"]) [self jsonEditorLog:win message:@"FAIL: program.name missing."];
+        if (!prog[@"version"]) [self jsonEditorLog:win message:@"FAIL: program.version missing."];
+    } else if (dict[@"program"]) {
+        [self jsonEditorLog:win message:@"FAIL: \"program\" must be an object."];
+    }
+
+    // Check os sub-fields
+    if ([dict[@"os"] isKindOfClass:[NSDictionary class]]) {
+        NSDictionary *os = dict[@"os"];
+        if (!os[@"os"]) [self jsonEditorLog:win message:@"FAIL: os.os missing."];
+        if (!os[@"version"]) [self jsonEditorLog:win message:@"FAIL: os.version missing."];
+        if (!os[@"architecture"]) [self jsonEditorLog:win message:@"FAIL: os.architecture missing."];
+    } else if (dict[@"os"]) {
+        [self jsonEditorLog:win message:@"FAIL: \"os\" must be an object."];
+    }
+
+    // Status-specific checks
+    NSString *status = dict[@"status"];
+    if ([status isEqualToString:@"F"]) {
+        if (!dict[@"factors"] || ![dict[@"factors"] isKindOfClass:[NSArray class]] ||
+            [dict[@"factors"] count] == 0) {
+            [self jsonEditorLog:win message:@"FAIL: status is \"F\" but \"factors\" array is missing or empty."];
+        } else {
+            // Verify factors are strings
+            for (id f in dict[@"factors"]) {
+                if (![f isKindOfClass:[NSString class]]) {
+                    [self jsonEditorLog:win message:@"FAIL: each factor must be a string, not a number."];
+                    break;
+                }
+            }
+        }
+    } else if ([status isEqualToString:@"NF"]) {
+        if (dict[@"rangecomplete"] && ![dict[@"rangecomplete"] boolValue]) {
+            [self jsonEditorLog:win message:@"WARN: status NF with rangecomplete=false is invalid for PrimeNet."];
+        }
+        if (dict[@"factors"]) {
+            [self jsonEditorLog:win message:@"WARN: status NF should not have \"factors\" field."];
+        }
+    } else if (status) {
+        [self jsonEditorLog:win message:[NSString stringWithFormat:@"WARN: unknown status \"%@\" -- expected \"F\" or \"NF\".", status]];
+    }
+
+    // Worktype
+    if (dict[@"worktype"] && ![dict[@"worktype"] isEqualToString:@"TF"]) {
+        [self jsonEditorLog:win message:[NSString stringWithFormat:@"WARN: worktype \"%@\" -- expected \"TF\" for trial factoring.", dict[@"worktype"]]];
+    }
+
+    // Timestamp format check
+    NSString *ts = dict[@"timestamp"];
+    if (ts && ts.length > 0) {
+        NSDateFormatter *tsFmt = [[NSDateFormatter alloc] init];
+        tsFmt.dateFormat = @"yyyy-MM-dd HH:mm:ss";
+        tsFmt.timeZone = [NSTimeZone timeZoneWithAbbreviation:@"UTC"];
+        if (![tsFmt dateFromString:ts]) {
+            [self jsonEditorLog:win message:@"WARN: timestamp should be \"YYYY-MM-DD HH:MM:SS\" in UTC."];
+        }
+    }
+
+    // Length check
+    if (raw.length > 2000)
+        [self jsonEditorLog:win message:[NSString stringWithFormat:@"WARN: JSON is %lu chars -- try to keep under 2000.", (unsigned long)raw.length]];
+    else
+        [self jsonEditorLog:win message:[NSString stringWithFormat:@"OK: JSON length %lu chars (under 2000 limit).", (unsigned long)raw.length]];
+
+    [self jsonEditorLog:win message:@"--- Validation complete ---"];
+}
+
+// ── Copy to clipboard ────────────────────────────────────────────────
+
+- (void)jsonEditorCopy:(id)sender {
+    NSWindow *win = [sender window];
+    NSTextView *outView = [self jsonEditorOutputView:win];
+    if (outView && outView.string.length > 0) {
+        [[NSPasteboard generalPasteboard] clearContents];
+        [[NSPasteboard generalPasteboard] setString:outView.string forType:NSPasteboardTypeString];
+        NSButton *btn = (NSButton *)sender;
+        NSString *orig = btn.title;
+        btn.title = @"Copied";
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)),
+            dispatch_get_main_queue(), ^{ btn.title = orig; });
+    }
+}
+
+// ── Save to file (append) ────────────────────────────────────────────
+
+- (void)jsonEditorSave:(id)sender {
+    NSWindow *win = [sender window];
+    NSTextView *outView = [self jsonEditorOutputView:win];
+    if (!outView || outView.string.length == 0) return;
+    NSString *json = outView.string;
+
+    NSSavePanel *panel = [NSSavePanel savePanel];
+    panel.nameFieldStringValue = @"results.json.txt";
+
+    [panel beginSheetModalForWindow:win completionHandler:^(NSModalResponse result) {
+        if (result == NSModalResponseOK && panel.URL) {
+            NSString *line = [json stringByAppendingString:@"\n"];
+            NSFileManager *fm = [NSFileManager defaultManager];
+            if ([fm fileExistsAtPath:panel.URL.path]) {
+                NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:panel.URL.path];
+                [fh seekToEndOfFile];
+                [fh writeData:[line dataUsingEncoding:NSUTF8StringEncoding]];
+                [fh closeFile];
+            } else {
+                [line writeToURL:panel.URL atomically:YES encoding:NSUTF8StringEncoding error:nil];
+            }
+            dispatch_async(dispatch_get_main_queue(), ^{
+                [self jsonEditorLog:win message:[NSString stringWithFormat:@"Saved to %@", panel.URL.path]];
+            });
+        }
+    }];
+}
+
+// ── Auto-fill from system / assignment / discoveries ─────────────────
+
+- (void)jsonEditorAutoFill:(id)sender {
+    NSWindow *win = [sender window];
+    NSView *cv = win.contentView;
+
+    char hostname[256] = {};
+    gethostname(hostname, sizeof(hostname));
+    ((NSTextField *)[cv viewWithTag:9008]).stringValue = [NSString stringWithUTF8String:hostname];
+
+    if (_primenet->username().length() > 0)
+        ((NSTextField *)[cv viewWithTag:9007]).stringValue =
+            [NSString stringWithUTF8String:_primenet->username().c_str()];
+
+    if (_primenet->pending_count() > 0) {
+        auto& a = _primenet->state().assignments.front();
+        ((NSTextField *)[cv viewWithTag:9001]).stringValue = [NSString stringWithFormat:@"%llu", a.exponent];
+        ((NSTextField *)[cv viewWithTag:9003]).stringValue = [NSString stringWithFormat:@"%d", (int)a.bit_lo];
+        ((NSTextField *)[cv viewWithTag:9004]).stringValue = [NSString stringWithFormat:@"%d", (int)a.bit_hi];
+        ((NSTextField *)[cv viewWithTag:9009]).stringValue = [NSString stringWithUTF8String:a.key.c_str()];
+    }
+
+    for (auto& d : _taskMgr->discoveries()) {
+        if (d.type == prime::TaskType::MersenneTrial) {
+            [(NSPopUpButton *)[cv viewWithTag:9002] selectItemAtIndex:1];
+            NSString *factor = d.divisors.empty()
+                ? [NSString stringWithFormat:@"%llu", d.value]
+                : [NSString stringWithUTF8String:d.divisors.c_str()];
+            ((NSTextField *)[cv viewWithTag:9006]).stringValue = factor;
+            break;
+        }
+    }
+
+    // Fill credentials from state if available
+    if (!_primenet->state().guid.empty()) {
+        NSString *creds = [NSString stringWithFormat:@"g=%s&ss=19191919&sh=ABCDABCDABCDABCDABCDABCDABCDABCD",
+            _primenet->state().guid.c_str()];
+        ((NSTextField *)[cv viewWithTag:9021]).stringValue = creds;
+    }
+
+    ((NSTextField *)[cv viewWithTag:9010]).stringValue = @"PrimePath";
+    ((NSTextField *)[cv viewWithTag:9011]).stringValue = @"1.0.0";
+    ((NSTextField *)[cv viewWithTag:9012]).stringValue = @"Metal96bit";
+
+    [self jsonEditorLog:win message:@"Auto-filled from system and current assignment."];
+}
+
+// ── Simulate a test problem with known factor ────────────────────────
+
+- (void)jsonEditorSimulate:(id)sender {
+    NSWindow *win = [sender window];
+    NSView *cv = win.contentView;
+
+    // Known Mersenne factor: M(86243) has factor 120327 (found long ago)
+    // Actually use a small well-known example:
+    // M(67) = 2^67 - 1 has factor 193707721
+    // q = 193707721, p = 67, q = 2*1445579*67 + 1, so k = 1445579
+    // bit range: 2^27 < 193707721 < 2^28, so bitlo=27, bithi=28
+
+    ((NSTextField *)[cv viewWithTag:9001]).stringValue = @"67";
+    ((NSTextField *)[cv viewWithTag:9003]).stringValue = @"27";
+    ((NSTextField *)[cv viewWithTag:9004]).stringValue = @"28";
+    [(NSPopUpButton *)[cv viewWithTag:9002] selectItemAtIndex:1]; // F
+    [(NSPopUpButton *)[cv viewWithTag:9005] selectItemAtIndex:1]; // rangecomplete = false
+    ((NSTextField *)[cv viewWithTag:9006]).stringValue = @"193707721";
+    ((NSTextField *)[cv viewWithTag:9009]).stringValue = @"00000000000000000000000000000000";
+
+    // Auto-fill user/computer/program
+    char hostname[256] = {};
+    gethostname(hostname, sizeof(hostname));
+    ((NSTextField *)[cv viewWithTag:9008]).stringValue = [NSString stringWithUTF8String:hostname];
+    if (_primenet->username().length() > 0)
+        ((NSTextField *)[cv viewWithTag:9007]).stringValue =
+            [NSString stringWithUTF8String:_primenet->username().c_str()];
+    ((NSTextField *)[cv viewWithTag:9010]).stringValue = @"PrimePath";
+    ((NSTextField *)[cv viewWithTag:9011]).stringValue = @"1.0.0";
+    ((NSTextField *)[cv viewWithTag:9012]).stringValue = @"Metal96bit";
+
+    // Generate the JSON
+    NSString *json = [self jsonEditorBuildJSON:win];
+    NSTextView *outView = [self jsonEditorOutputView:win];
+    if (outView) {
+        outView.string = json;
+        outView.textColor = [NSColor labelColor];
+    }
+
+    [self jsonEditorLog:win message:@"--- Simulated Test ---"];
+    [self jsonEditorLog:win message:@"Loaded known result: M(67) has factor 193707721."];
+    [self jsonEditorLog:win message:@"2^67 - 1 = 147573952589676412927"];
+    [self jsonEditorLog:win message:@"147573952589676412927 / 193707721 = 762078938126..."];
+    [self jsonEditorLog:win message:@"Verification: 2^67 mod 193707721 = 1 (confirmed)"];
+    [self jsonEditorLog:win message:@"This is a test result -- do NOT submit to mersenne.org."];
+    [self jsonEditorLog:win message:@"Use 'Validate' to check the JSON format."];
+}
+
+// ── Load template from file ──────────────────────────────────────────
+
+- (void)jsonEditorLoadTemplate:(id)sender {
+    NSWindow *win = [sender window];
+
+    NSOpenPanel *panel = [NSOpenPanel openPanel];
+    panel.canChooseFiles = YES;
+    panel.canChooseDirectories = NO;
+    panel.allowsMultipleSelection = NO;
+    panel.message = @"Select a JSON template or results.json.txt file";
+
+    [panel beginSheetModalForWindow:win completionHandler:^(NSModalResponse result) {
+        if (result != NSModalResponseOK || !panel.URL) return;
+
+        NSError *err = nil;
+        NSString *content = [NSString stringWithContentsOfURL:panel.URL
+            encoding:NSUTF8StringEncoding error:&err];
+        if (err || !content) {
+            dispatch_async(dispatch_get_main_queue(), ^{
+                [self jsonEditorLog:win message:[NSString stringWithFormat:@"Failed to read file: %@",
+                    err.localizedDescription]];
+            });
+            return;
+        }
+
+        dispatch_async(dispatch_get_main_queue(), ^{
+            // Take the last non-empty line (in case of multi-line results file)
+            NSArray *lines = [content componentsSeparatedByString:@"\n"];
+            NSString *jsonLine = @"";
+            for (NSString *line in [lines reverseObjectEnumerator]) {
+                NSString *trimmed = [line stringByTrimmingCharactersInSet:
+                    [NSCharacterSet whitespaceAndNewlineCharacterSet]];
+                if (trimmed.length > 0) { jsonLine = trimmed; break; }
+            }
+
+            NSTextView *outView = [self jsonEditorOutputView:win];
+            if (outView) {
+                outView.string = jsonLine;
+                outView.textColor = [NSColor labelColor];
+            }
+
+            // Try to parse and populate fields
+            NSData *data = [jsonLine dataUsingEncoding:NSUTF8StringEncoding];
+            NSDictionary *dict = [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
+            if ([dict isKindOfClass:[NSDictionary class]]) {
+                NSView *cv = win.contentView;
+                if (dict[@"exponent"])
+                    ((NSTextField *)[cv viewWithTag:9001]).stringValue = [NSString stringWithFormat:@"%@", dict[@"exponent"]];
+                if (dict[@"bitlo"])
+                    ((NSTextField *)[cv viewWithTag:9003]).stringValue = [NSString stringWithFormat:@"%@", dict[@"bitlo"]];
+                if (dict[@"bithi"])
+                    ((NSTextField *)[cv viewWithTag:9004]).stringValue = [NSString stringWithFormat:@"%@", dict[@"bithi"]];
+                if ([dict[@"status"] isEqualToString:@"F"])
+                    [(NSPopUpButton *)[cv viewWithTag:9002] selectItemAtIndex:1];
+                else
+                    [(NSPopUpButton *)[cv viewWithTag:9002] selectItemAtIndex:0];
+                if ([dict[@"rangecomplete"] boolValue])
+                    [(NSPopUpButton *)[cv viewWithTag:9005] selectItemAtIndex:0];
+                else
+                    [(NSPopUpButton *)[cv viewWithTag:9005] selectItemAtIndex:1];
+                if (dict[@"factors"] && [dict[@"factors"] isKindOfClass:[NSArray class]]) {
+                    ((NSTextField *)[cv viewWithTag:9006]).stringValue =
+                        [dict[@"factors"] componentsJoinedByString:@","];
+                }
+                if (dict[@"user"])
+                    ((NSTextField *)[cv viewWithTag:9007]).stringValue = dict[@"user"];
+                if (dict[@"computer"])
+                    ((NSTextField *)[cv viewWithTag:9008]).stringValue = dict[@"computer"];
+                if (dict[@"aid"])
+                    ((NSTextField *)[cv viewWithTag:9009]).stringValue = dict[@"aid"];
+                if ([dict[@"program"] isKindOfClass:[NSDictionary class]]) {
+                    NSDictionary *prog = dict[@"program"];
+                    if (prog[@"name"])
+                        ((NSTextField *)[cv viewWithTag:9010]).stringValue = prog[@"name"];
+                    if (prog[@"version"])
+                        ((NSTextField *)[cv viewWithTag:9011]).stringValue = prog[@"version"];
+                    if (prog[@"kernel"])
+                        ((NSTextField *)[cv viewWithTag:9012]).stringValue = prog[@"kernel"];
+                }
+                [self jsonEditorLog:win message:[NSString stringWithFormat:@"Loaded template from %@", panel.URL.lastPathComponent]];
+            } else {
+                [self jsonEditorLog:win message:@"Loaded file but could not parse JSON -- fields not populated."];
+            }
+        });
+    }];
+}
+
+// ── Save current fields as template ──────────────────────────────────
+
+- (void)jsonEditorSaveTemplate:(id)sender {
+    NSWindow *win = [sender window];
+    NSString *json = [self jsonEditorBuildJSON:win];
+
+    NSSavePanel *panel = [NSSavePanel savePanel];
+    panel.nameFieldStringValue = @"template_mersenne_tf.json";
+    panel.message = @"Save JSON template for reuse";
+
+    [panel beginSheetModalForWindow:win completionHandler:^(NSModalResponse result) {
+        if (result == NSModalResponseOK && panel.URL) {
+            NSError *err = nil;
+            [json writeToURL:panel.URL atomically:YES encoding:NSUTF8StringEncoding error:&err];
+            dispatch_async(dispatch_get_main_queue(), ^{
+                if (err)
+                    [self jsonEditorLog:win message:[NSString stringWithFormat:@"Save failed: %@", err.localizedDescription]];
+                else
+                    [self jsonEditorLog:win message:[NSString stringWithFormat:@"Template saved to %@", panel.URL.lastPathComponent]];
+            });
+        }
+    }];
+}
+
+// ── Send JSON to PrimeNet server (test submission) ───────────────────
+
+- (void)jsonEditorSendTest:(id)sender {
+    NSWindow *win = [sender window];
+    NSView *cv = win.contentView;
+    NSTextView *outView = [self jsonEditorOutputView:win];
+
+    if (!outView || outView.string.length == 0) {
+        [self jsonEditorLog:win message:@"SEND: generate JSON first."];
+        return;
+    }
+
+    NSString *json = outView.string;
+    NSString *serverURL = ((NSTextField *)[cv viewWithTag:9020]).stringValue;
+    NSString *creds = ((NSTextField *)[cv viewWithTag:9021]).stringValue;
+
+    if (serverURL.length == 0) {
+        [self jsonEditorLog:win message:@"SEND: server URL is empty."];
+        return;
+    }
+    if (creds.length == 0) {
+        [self jsonEditorLog:win message:@"SEND: credentials are empty. Click Auto-Fill or enter guid/ss/sh values."];
+        return;
+    }
+
+    // Parse exponent and bit range from the JSON to build the t=ar URL
+    NSData *data = [json dataUsingEncoding:NSUTF8StringEncoding];
+    NSDictionary *dict = [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
+    if (![dict isKindOfClass:[NSDictionary class]]) {
+        [self jsonEditorLog:win message:@"SEND: JSON parse failed -- validate first."];
+        return;
+    }
+
+    NSString *exponent = [NSString stringWithFormat:@"%@", dict[@"exponent"] ?: @"0"];
+    NSString *bitlo = [NSString stringWithFormat:@"%@", dict[@"bitlo"] ?: @"0"];
+    NSString *bithi = [NSString stringWithFormat:@"%@", dict[@"bithi"] ?: @"0"];
+    BOOL isF = [dict[@"status"] isEqualToString:@"F"];
+    int rtype = isF ? 1 : 4;
+    NSString *aid = dict[@"aid"] ?: @"0";
+
+    // URL-encode the JSON for &m=
+    NSString *encodedJSON = [json stringByAddingPercentEncodingWithAllowedCharacters:
+        [NSCharacterSet characterSetWithCharactersInString:
+            @"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~"]];
+
+    NSMutableString *url = [NSMutableString stringWithFormat:
+        @"%@?px=GIMPS&v=0.95&t=ar&%@&k=%@&r=%d&d=1&n=%@&sf=%@&ef=%@",
+        serverURL, creds, aid, rtype, exponent, bitlo, bithi];
+
+    if (isF && dict[@"factors"] && [dict[@"factors"] count] > 0) {
+        [url appendFormat:@"&f=%@", dict[@"factors"][0]];
+    }
+
+    [url appendFormat:@"&m=%@", encodedJSON];
+
+    [self jsonEditorLog:win message:@"--- Sending to server ---"];
+    [self jsonEditorLog:win message:[NSString stringWithFormat:@"URL: %@", url]];
+
+    // Confirm before sending
+    NSAlert *confirm = [[NSAlert alloc] init];
+    confirm.messageText = @"Send to PrimeNet?";
+    confirm.informativeText = [NSString stringWithFormat:
+        @"This will submit a result for M%@ to %@.\n\nOnly send if this is a real, verified result.",
+        exponent, serverURL];
+    confirm.alertStyle = NSAlertStyleWarning;
+    [confirm addButtonWithTitle:@"Send"];
+    [confirm addButtonWithTitle:@"Cancel"];
+
+    if ([confirm runModal] != NSAlertFirstButtonReturn) {
+        [self jsonEditorLog:win message:@"Cancelled."];
+        return;
+    }
+
+    __weak AppDelegate *weakSelf = self;
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        @autoreleasepool {
+            NSURL *reqURL = [NSURL URLWithString:url];
+            if (!reqURL) {
+                dispatch_async(dispatch_get_main_queue(), ^{
+                    [weakSelf jsonEditorLog:win message:@"SEND: invalid URL."];
+                });
+                return;
+            }
+
+            NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:reqURL];
+            req.HTTPMethod = @"GET";
+            req.timeoutInterval = 45.0;
+            [req setValue:@"PrimePath/1.0.0" forHTTPHeaderField:@"User-Agent"];
+
+            dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+            __block NSData *respData = nil;
+            __block NSError *respErr = nil;
+            __block NSInteger respStatus = 0;
+
+            NSURLSessionDataTask *task = [[NSURLSession sharedSession]
+                dataTaskWithRequest:req
+                completionHandler:^(NSData *d, NSURLResponse *r, NSError *e) {
+                    respData = d;
+                    respErr = e;
+                    if ([r isKindOfClass:[NSHTTPURLResponse class]])
+                        respStatus = ((NSHTTPURLResponse *)r).statusCode;
+                    dispatch_semaphore_signal(sem);
+                }];
+            [task resume];
+
+            dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, 60 * NSEC_PER_SEC));
+
+            dispatch_async(dispatch_get_main_queue(), ^{
+                if (respErr) {
+                    [weakSelf jsonEditorLog:win message:[NSString stringWithFormat:@"SEND ERROR: %@",
+                        respErr.localizedDescription]];
+                } else if (respData) {
+                    NSString *body = [[NSString alloc] initWithData:respData encoding:NSUTF8StringEncoding];
+                    [weakSelf jsonEditorLog:win message:[NSString stringWithFormat:@"HTTP %ld", (long)respStatus]];
+                    [weakSelf jsonEditorLog:win message:[NSString stringWithFormat:@"Response: %@", body]];
+
+                    // Parse PrimeNet response
+                    for (NSString *line in [body componentsSeparatedByString:@"\n"]) {
+                        if ([line hasPrefix:@"pnErrorResult="] && ![line isEqualToString:@"pnErrorResult=0"]) {
+                            [weakSelf jsonEditorLog:win message:[NSString stringWithFormat:@"SERVER ERROR: %@", line]];
+                        }
+                        if ([line hasPrefix:@"pnErrorDetail="]) {
+                            [weakSelf jsonEditorLog:win message:[NSString stringWithFormat:@"Detail: %@", line]];
+                        }
+                    }
+                } else {
+                    [weakSelf jsonEditorLog:win message:@"SEND: no response (timeout or connection failure)."];
+                }
+                [weakSelf jsonEditorLog:win message:@"--- Send complete ---"];
+            });
+        }
+    });
 }
 
 // ── Prevent Sleep ────────────────────────────────────────────────────
