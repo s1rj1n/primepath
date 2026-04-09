@@ -76,7 +76,7 @@ bool PrimeNetClient::register_machine() {
         "&g=" + _state.guid +
         "&hg=" + hw_guid +
         "&wg="
-        "&a=" + url_encode("macOS,PrimePath,1.0 (github.com/s1rj1n/primepath)") +
+        "&a=" + url_encode("macOS,PrimePath,1.0.0 (github.com/s1rj1n/primepath)") +
         "&c=" + url_encode(chip_name + " (Metal GPU)") +
         "&f=" + url_encode("Metal,NEON,AES") +
         "&L1=192&L2=4096&L3=0"
@@ -223,20 +223,11 @@ bool PrimeNetClient::submit_result(const TFResult& result) {
         return false;
     }
 
+    // Build JSON result line (used for both &m= and results.json.txt)
+    std::string json = build_result_json(result);
+
     // r=1: factor found, r=4: no factor
     int result_type = result.factor_found ? 1 : 4;
-
-    std::string mdesc = machine_description();
-    std::string msg;
-    if (result.factor_found) {
-        msg = "M" + std::to_string(result.exponent) + " has a factor: " + result.factor +
-              " [" + mdesc + " | github.com/s1rj1n/primepath]";
-    } else {
-        msg = "M" + std::to_string(result.exponent) + " no factor from 2^" +
-              std::to_string((int)result.bit_lo) + " to 2^" + std::to_string((int)result.bit_hi) +
-              " [" + mdesc + " | github.com/s1rj1n/primepath]";
-    }
-
     std::string akey = result.assignment_key.empty() ? "0" : result.assignment_key;
 
     std::string url = "https://v5.mersenne.org/v5server/"
@@ -253,9 +244,9 @@ bool PrimeNetClient::submit_result(const TFResult& result) {
         url += "&f=" + result.factor;
     }
 
-    url += "&m=" + url_encode(msg) + "&ss=19191919&sh=ABCDABCDABCDABCDABCDABCDABCDABCD";
+    url += "&m=" + url_encode(json) + "&ss=19191919&sh=ABCDABCDABCDABCDABCDABCDABCDABCD";
 
-    _log("PrimeNet: submitting result -- " + msg);
+    _log("PrimeNet: submitting JSON result: " + json);
     _log("PrimeNet: URL=" + url);
     std::string response = http_get(url);
     _log("PrimeNet: raw response: [" + response + "]");
@@ -273,8 +264,8 @@ bool PrimeNetClient::submit_result(const TFResult& result) {
 
     _log("PrimeNet: result submitted successfully.");
 
-    // Also write to local file
-    write_result_json(result);
+    // Also write same JSON to local file
+    write_result_json(result, json);
 
     // Remove completed assignment
     if (!result.assignment_key.empty()) {
@@ -306,13 +297,11 @@ Assignment PrimeNetClient::fetch_work() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════
-// Local results.json.txt (mfaktc-compatible JSON)
+// JSON result builder (shared by submit_result and write_result_json)
 // ═══════════════════════════════════════════════════════════════════════
 
-void PrimeNetClient::write_result_json(const TFResult& result) {
-    std::string path = _data_dir + "/results.json.txt";
-
-    // Timestamp
+std::string PrimeNetClient::build_result_json(const TFResult& result) {
+    // UTC timestamp
     auto now = std::chrono::system_clock::now();
     auto tt = std::chrono::system_clock::to_time_t(now);
     struct tm tm_buf;
@@ -320,8 +309,35 @@ void PrimeNetClient::write_result_json(const TFResult& result) {
     char ts[32];
     strftime(ts, sizeof(ts), "%Y-%m-%d %H:%M:%S", &tm_buf);
 
+    // OS info
+    struct utsname un;
+    uname(&un);
+
+    // Hardware info
+    char chip[256] = {};
+    size_t chip_len = sizeof(chip);
+    sysctlbyname("machdep.cpu.brand_string", chip, &chip_len, NULL, 0);
+    std::string chip_str = chip[0] ? chip : "Apple Silicon";
+
+    int ncpu = (int)[[NSProcessInfo processInfo] processorCount];
+    int perf_cores = 0, eff_cores = 0;
+    size_t sz = sizeof(int);
+    sysctlbyname("hw.perflevel0.logicalcpu", &perf_cores, &sz, NULL, 0);
+    sz = sizeof(int);
+    sysctlbyname("hw.perflevel1.logicalcpu", &eff_cores, &sz, NULL, 0);
+
+    uint64_t memsize = 0;
+    sz = sizeof(memsize);
+    sysctlbyname("hw.memsize", &memsize, &sz, NULL, 0);
+    int ram_gb = (int)(memsize / (1024ULL * 1024 * 1024));
+
+    int gpu_cores = 0;
+    sz = sizeof(gpu_cores);
+    sysctlbyname("gpu.core_count", &gpu_cores, &sz, NULL, 0);
+
     std::ostringstream js;
-    js << "{\"exponent\":" << result.exponent
+    js << "{\"timestamp\":\"" << ts << "\""
+       << ",\"exponent\":" << result.exponent
        << ",\"worktype\":\"TF\""
        << ",\"status\":\"" << (result.factor_found ? "F" : "NF") << "\""
        << ",\"bitlo\":" << (int)result.bit_lo
@@ -332,9 +348,8 @@ void PrimeNetClient::write_result_json(const TFResult& result) {
         js << ",\"factors\":[\"" << result.factor << "\"]";
     }
 
-    js << ",\"program\":{\"name\":\"PrimePath\",\"version\":\"1.0\",\"kernel\":\"Metal96bit\",\"source\":\"github.com/s1rj1n/primepath\"}"
-       << ",\"machine\":\"" << machine_description() << "\""
-       << ",\"timestamp\":\"" << ts << "\""
+    js << ",\"program\":{\"name\":\"PrimePath\",\"version\":\"1.0.0\",\"kernel\":\"Metal96bit\"}"
+       << ",\"os\":{\"os\":\"macOS\",\"version\":\"" << un.release << "\",\"architecture\":\"ARM_64\"}"
        << ",\"user\":\"" << _state.username << "\""
        << ",\"computer\":\"" << _state.computer_name << "\"";
 
@@ -342,11 +357,30 @@ void PrimeNetClient::write_result_json(const TFResult& result) {
         js << ",\"aid\":\"" << result.assignment_key << "\"";
     }
 
-    js << "}";
+    js << ",\"hardware\":{\"chip\":\"" << chip_str << "\""
+       << ",\"cpu_cores\":" << ncpu;
+    if (perf_cores > 0)
+        js << ",\"cpu_performance\":" << perf_cores
+           << ",\"cpu_efficiency\":" << eff_cores;
+    if (gpu_cores > 0)
+        js << ",\"gpu_cores\":" << gpu_cores;
+    js << ",\"ram_gb\":" << ram_gb
+       << "}}";
+
+    return js.str();
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// Local results.json.txt (same JSON as submitted to PrimeNet)
+// ═══════════════════════════════════════════════════════════════════════
+
+void PrimeNetClient::write_result_json(const TFResult& result, const std::string& json) {
+    std::string path = _data_dir + "/results.json.txt";
+    std::string line = json.empty() ? build_result_json(result) : json;
 
     std::ofstream f(path, std::ios::app);
     if (f.is_open()) {
-        f << js.str() << "\n";
+        f << line << "\n";
         _log("PrimeNet: result written to results.json.txt");
     }
 }
@@ -462,7 +496,7 @@ std::string PrimeNetClient::http_get(const std::string& url) {
         NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:reqURL];
         req.HTTPMethod = @"GET";
         req.timeoutInterval = 45.0;  // Longer than semaphore so NSURLSession always finishes first
-        [req setValue:@"PrimePath/1.0" forHTTPHeaderField:@"User-Agent"];
+        [req setValue:@"PrimePath/1.0.0" forHTTPHeaderField:@"User-Agent"];
 
         // Use heap-allocated storage so the completion handler is safe even if
         // the semaphore times out (shouldn't happen since request timeout < sem timeout)
@@ -554,7 +588,7 @@ std::string PrimeNetClient::machine_description() {
     sysctlbyname("gpu.core_count", &gpu_cores, &sz, NULL, 0);
 
     std::ostringstream desc;
-    desc << "PrimePath/1.0 | " << chip_str
+    desc << "PrimePath/1.0.0 | " << chip_str
          << " | " << ncpu << " CPU";
     if (perf_cores > 0)
         desc << " (" << perf_cores << "P+" << eff_cores << "E)";

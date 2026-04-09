@@ -90,8 +90,11 @@ public:
 
     // ── Local results file ──────────────────────────────────────────
 
-    // Append a result to results.json.txt (mfaktc-compatible format)
-    void write_result_json(const TFResult& result);
+    // Build JSON result line (used for both PrimeNet submission and local file)
+    std::string build_result_json(const TFResult& result);
+
+    // Append JSON result to results.json.txt (same JSON as submitted to PrimeNet)
+    void write_result_json(const TFResult& result, const std::string& json = "");
 
     // ── State persistence ───────────────────────────────────────────
     void load_state();
