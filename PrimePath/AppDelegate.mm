@@ -3844,9 +3844,9 @@ static const int EQ_HISTORY = 32; // number of vertical bars (time history)
 - (void)showAboutPanel:(id)sender {
     NSDictionary *opts = @{
         @"ApplicationName": @"PrimePath",
-        @"Copyright": @"Development by Sergei Nester\nsnester@viewbuild.com",
-        @"ApplicationVersion": @"0.5",
-        @"Version": @"0.5.0",
+        @"Copyright": @"Development by Sergei Nester\nSuper smart coding by Claude\nsnester@viewbuild.com",
+        @"ApplicationVersion": @"1.3.0",
+        @"Version": @"1.3.0",
     };
     [[NSApplication sharedApplication] orderFrontStandardAboutPanelWithOptions:opts];
 }
