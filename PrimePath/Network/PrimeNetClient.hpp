@@ -29,6 +29,7 @@ struct Assignment {
     double bit_lo = 0;      // already factored to this many bits
     double bit_hi = 0;      // factor up to this many bits
     bool valid = false;
+    std::vector<std::string> known_factors; // already-known prime factors from worktodo.txt
 };
 
 // ── Result to submit ────────────────────────────────────────────────
@@ -38,9 +39,10 @@ struct TFResult {
     double bit_lo;
     double bit_hi;
     bool factor_found;
-    std::string factor;     // decimal string if found
+    std::vector<std::string> factors;   // decimal strings of NEW factors found
     std::string assignment_key;
     bool range_complete;
+    std::vector<std::string> known_factors; // from worktodo.txt, copied to JSON output
 };
 
 // ── Client state (persisted to primenet_state.txt) ──────────────────

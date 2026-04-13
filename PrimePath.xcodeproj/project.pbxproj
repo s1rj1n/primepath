@@ -311,6 +311,7 @@
 					"@executable_path/../Frameworks",
 				);
 				MTL_HEADER_SEARCH_PATHS = "$(SRCROOT)/PrimePath";
+				OTHER_LDFLAGS = "-lz";
 				PRODUCT_BUNDLE_IDENTIFIER = com.primes.PrimePath;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 			};
@@ -329,6 +330,7 @@
 					"@executable_path/../Frameworks",
 				);
 				MTL_HEADER_SEARCH_PATHS = "$(SRCROOT)/PrimePath";
+				OTHER_LDFLAGS = "-lz";
 				PRODUCT_BUNDLE_IDENTIFIER = com.primes.PrimePath;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 			};

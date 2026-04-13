@@ -107,6 +107,14 @@ struct SearchTask {
     std::thread worker;
     double rate = 0;            // candidates/sec
 
+    // Mersenne TF: known factors from worktodo.txt (already-discovered primes
+    // to skip during trial factoring). See James's known-factor spec.
+    std::vector<std::string> known_factors;
+
+    // Mersenne TF: bit range for the current assignment
+    double bit_lo = 0;
+    double bit_hi = 0;
+
     SearchTask() = default;
     SearchTask(TaskType t, uint64_t start, uint64_t end = 0)
         : type(t), start_pos(start), current_pos(start), end_pos(end) {}
@@ -116,7 +124,8 @@ struct SearchTask {
         : type(o.type), status(o.status), start_pos(o.start_pos),
           current_pos(o.current_pos), end_pos(o.end_pos),
           found_count(o.found_count), tested_count(o.tested_count),
-          rate(o.rate) {
+          rate(o.rate), known_factors(std::move(o.known_factors)),
+          bit_lo(o.bit_lo), bit_hi(o.bit_hi) {
         should_run.store(o.should_run.load());
     }
 };
@@ -244,6 +253,9 @@ public:
 
     // Mersenne TF sieve batch size (configurable from GIMPS panel)
     std::atomic<uint64_t> mersenne_k_batch{100000000}; // default 100M
+
+    // Mersenne TF: abort on first factor (default false = complete full bitlevel)
+    std::atomic<bool> mersenne_abort_on_factor{false};
 
     // Mode-based GPU ownership: only one task type uses GPU at a time.
     // GPU_OWNER_NONE = shared (round-robin via mutex), any specific type = exclusive.

@@ -919,6 +919,22 @@ struct CarryChainMulMod {
 
     CarryChainMulMod(unsigned __int128 m) : mod(m) {}
 
+    // Binary doubling fallback for moduli > 96 bits where staged shift overflows
+    unsigned __int128 mul_binary(unsigned __int128 a, unsigned __int128 b) const {
+        a %= mod; b %= mod;
+        unsigned __int128 result = 0;
+        while (b > 0) {
+            if (b & 1) {
+                result += a;
+                if (result >= mod) result -= mod;
+            }
+            a <<= 1;
+            if (a >= mod) a -= mod;
+            b >>= 1;
+        }
+        return result;
+    }
+
     unsigned __int128 mul(unsigned __int128 a, unsigned __int128 b) const {
         if (mod <= 1) return 0;
         a %= mod; b %= mod;
@@ -927,6 +943,11 @@ struct CarryChainMulMod {
         // Fast path: both fit in 64 bits
         if (a <= UINT64_MAX && b <= UINT64_MAX) {
             return (a * b) % mod;
+        }
+
+        // Fallback: if mod > 96 bits, staged shift would overflow
+        if (mod >> 96) {
+            return mul_binary(a, b);
         }
 
         uint64_t a_lo = (uint64_t)a, a_hi = (uint64_t)(a >> 64);
@@ -952,7 +973,7 @@ struct CarryChainMulMod {
         unsigned __int128 hi = ((unsigned __int128)r2 << 64) | r1;
         unsigned __int128 hi_mod = hi % mod;
 
-        // hi_mod * 2^64 + r0 — shift in two 32-bit steps to stay in 128 bits
+        // hi_mod * 2^64 + r0 -- shift in two 32-bit steps (safe: mod < 2^96)
         unsigned __int128 tmp = (hi_mod << 32) % mod;
         tmp = (tmp << 32) % mod;
         tmp = (tmp + r0) % mod;
@@ -2718,21 +2739,68 @@ void TaskManager::run_mersenne_trial(SearchTask& task) {
                         }
                     }
 
-                    total_hits++;
-                    task.found_count++;
-                    if (verify_ran && cpu_verified) {
-                        log("*** MERSENNE FACTOR VERIFIED (GPU+CPU): 2^" + std::to_string(exponent) +
-                            " - 1 has factor " + q_str + " *** [carry-chain CPU confirmed]");
-                    } else if (verify_ran && !cpu_verified) {
-                        log("WARNING: GPU found factor " + q_str + " for M" + std::to_string(exponent) +
-                            " but CPU carry-chain says NO — logging anyway for investigation");
-                        // Still save it but flag it in the log — don't silently drop
-                    } else {
-                        log("*** MERSENNE FACTOR FOUND: 2^" + std::to_string(exponent) +
-                            " - 1 has factor " + q_str + " *** [CPU verify skipped]");
+                    // Check if this factor is already known
+                    bool is_known = false;
+                    for (auto& kf : task.known_factors) {
+                        if (kf == q_str) { is_known = true; break; }
+                        // Also check if known factor divides this factor (composite case)
+                        // For now, exact string match; composite splitting below
                     }
-                    save_discovery({TaskType::MersenneTrial, q_val, exponent,
-                        PrimeClass::Composite, k_pos, q_str, timestamp()});
+
+                    if (is_known) {
+                        log("Mersenne TF: factor " + q_str + " is already known, skipping");
+                        summary_tested += 0; // no new discovery
+                    } else {
+                        // Check if composite containing known primes
+                        // Trial divide by each known factor, strip known components
+                        std::string new_factor = q_str;
+                        if (!task.known_factors.empty() && q_verify > 1) {
+                            unsigned __int128 remaining = q_verify;
+                            for (auto& kf : task.known_factors) {
+                                unsigned __int128 kf_val = 0;
+                                for (char c : kf) kf_val = kf_val * 10 + (c - '0');
+                                if (kf_val > 1) {
+                                    while (remaining > kf_val && remaining % kf_val == 0) {
+                                        remaining /= kf_val;
+                                        log("Mersenne TF: stripped known factor " + kf + " from composite " + q_str);
+                                    }
+                                }
+                            }
+                            if (remaining == 1) {
+                                log("Mersenne TF: factor " + q_str + " composed entirely of known primes, skipping");
+                                is_known = true;
+                            } else if (remaining != q_verify) {
+                                // Report the remaining cofactor
+                                char buf[40]; int bpos = 39; buf[bpos] = 0;
+                                unsigned __int128 tmp = remaining;
+                                while (tmp > 0) { buf[--bpos] = '0' + (int)(tmp % 10); tmp /= 10; }
+                                new_factor = &buf[bpos];
+                                log("Mersenne TF: composite " + q_str + " reduced to new factor " + new_factor);
+                            }
+                        }
+
+                        if (!is_known) {
+                            total_hits++;
+                            task.found_count++;
+                            if (verify_ran && cpu_verified) {
+                                log("*** MERSENNE FACTOR VERIFIED (GPU+CPU): 2^" + std::to_string(exponent) +
+                                    " - 1 has factor " + new_factor + " *** [carry-chain CPU confirmed]");
+                            } else if (verify_ran && !cpu_verified) {
+                                log("WARNING: GPU found factor " + new_factor + " for M" + std::to_string(exponent) +
+                                    " but CPU carry-chain says NO -- logging anyway for investigation");
+                            } else {
+                                log("*** MERSENNE FACTOR FOUND: 2^" + std::to_string(exponent) +
+                                    " - 1 has factor " + new_factor + " *** [CPU verify skipped]");
+                            }
+                            save_discovery({TaskType::MersenneTrial, q_val, exponent,
+                                PrimeClass::Composite, k_pos, new_factor, timestamp()});
+
+                            if (mersenne_abort_on_factor.load()) {
+                                log("Mersenne TF: aborting on first factor (user preference)");
+                                task.should_run.store(false);
+                            }
+                        }
+                    }
                 }
 
                 summary_tested += chunk;
@@ -2815,10 +2883,26 @@ void TaskManager::run_mersenne_trial(SearchTask& task) {
                 if (acc == 1) {
                     uint64_t q_lo = (uint64_t)q128;
                     std::string q_str = std::to_string(q_lo);
-                    task.found_count++;
-                    summary_hits++;
-                    log("*** MERSENNE FACTOR FOUND: 2^" + std::to_string(exponent) +
-                        " - 1 has factor " + q_str + " ***");
+
+                    // Check known factors
+                    bool is_known_cpu = false;
+                    for (auto& kf : task.known_factors) {
+                        if (kf == q_str) { is_known_cpu = true; break; }
+                    }
+                    if (is_known_cpu) {
+                        log("Mersenne TF: factor " + q_str + " is already known, skipping");
+                    } else {
+                        task.found_count++;
+                        summary_hits++;
+                        log("*** MERSENNE FACTOR FOUND: 2^" + std::to_string(exponent) +
+                            " - 1 has factor " + q_str + " ***");
+                        save_discovery({TaskType::MersenneTrial, q_lo, exponent,
+                            PrimeClass::Composite, task.current_pos, q_str, timestamp()});
+                        if (mersenne_abort_on_factor.load()) {
+                            log("Mersenne TF: aborting on first factor (user preference)");
+                            task.should_run.store(false);
+                        }
+                    }
                 }
             }
 

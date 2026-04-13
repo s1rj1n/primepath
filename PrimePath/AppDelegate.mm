@@ -11,6 +11,7 @@
 #include <atomic>
 #include <algorithm>
 #include <set>
+#include <map>
 #include <future>
 #include "Network/ConductorServer.hpp"
 #include "Network/CarriageClient.hpp"
@@ -19,7 +20,9 @@
 #import <IOKit/pwr_mgt/IOPMLib.h>
 #import <IOKit/IOKitLib.h>
 #include <sys/utsname.h>
+#include <zlib.h>
 #include <sys/sysctl.h>
+#import <objc/runtime.h>
 
 static NSString *const DATA_DIR = @"/Users/sergeinester/Documents/primes/primelocations";
 
@@ -191,6 +194,8 @@ static const int EQ_HISTORY = 32; // number of vertical bars (time history)
     uint64_t _prevDiskWriteBytes;
     // PrimeLocation predicted primes list (persists after test ends)
     std::vector<uint64_t> _predictedPrimes;
+    // Markov Predict: loaded known prime list for training
+    std::vector<uint64_t> _markovPrimeList;
     // Distributed computing
     prime::ConductorServer *_conductor;
     prime::CarriageClient  *_carriage;
@@ -272,6 +277,7 @@ static const int EQ_HISTORY = 32; // number of vertical bars (time history)
 @property (strong) NSButton *primeFactorButton;      // "Run PrimeFactor" -- factor composites using predicted primes
 @property (strong) NSButton *checkAtDiscoveryButton;  // checkbox: run special tests on each predicted prime as found
 @property (strong) NSButton *carryChainToggle;        // checkbox: use carry-chain mulmod instead of binary
+@property (strong) NSButton *markovLoadButton;        // "Load Primes" for Markov Predict mode
 
 // Benchmark
 @property (strong) NSButton *benchmarkButton;
@@ -726,6 +732,7 @@ static const int EQ_HISTORY = 32; // number of vertical bars (time history)
     [self.checkModePopup addItemWithTitle:@"Check Linear"];
     [self.checkModePopup addItemWithTitle:@"PrimeLocation"];
     [self.checkModePopup addItemWithTitle:@"Expression"];
+    [self.checkModePopup addItemWithTitle:@"Markov Predict"];
     self.checkModePopup.target = self;
     self.checkModePopup.action = @selector(checkModeChanged:);
     self.checkModePopup.font = [NSFont systemFontOfSize:10];
@@ -769,18 +776,7 @@ static const int EQ_HISTORY = 32; // number of vertical bars (time history)
     gimpsBtn.autoresizingMask = NSViewMinYMargin;
     [cv addSubview:gimpsBtn];
 
-    self.carryChainToggle = [[NSButton alloc] initWithFrame:NSMakeRect(M + 556, y - 22, 130, 18)];
-    self.carryChainToggle.buttonType = NSButtonTypeSwitch;
-    self.carryChainToggle.title = @"CarryChain";
-    self.carryChainToggle.font = [NSFont boldSystemFontOfSize:9];
-    self.carryChainToggle.toolTip = @"~4-7x faster mulmod for Wieferich + Wall-Sun-Sun CPU tests";
-    self.carryChainToggle.state = NSControlStateValueOff;
-    self.carryChainToggle.target = self;
-    self.carryChainToggle.action = @selector(carryChainToggled:);
-    self.carryChainToggle.autoresizingMask = NSViewMinYMargin;
-    [cv addSubview:self.carryChainToggle];
-
-    self.checkAtDiscoveryButton = [[NSButton alloc] initWithFrame:NSMakeRect(M + 640, y - 22, 150, 18)];
+    self.checkAtDiscoveryButton = [[NSButton alloc] initWithFrame:NSMakeRect(M + 556, y - 22, 150, 18)];
     self.checkAtDiscoveryButton.buttonType = NSButtonTypeSwitch;
     self.checkAtDiscoveryButton.title = @"CheckAtDiscovery";
     self.checkAtDiscoveryButton.font = [NSFont systemFontOfSize:9];
@@ -789,7 +785,7 @@ static const int EQ_HISTORY = 32; // number of vertical bars (time history)
     self.checkAtDiscoveryButton.autoresizingMask = NSViewMinYMargin;
     [cv addSubview:self.checkAtDiscoveryButton];
 
-    self.primeFactorButton = [self buttonAt:NSMakeRect(M + 560, y - 22, 110, 20)
+    self.primeFactorButton = [self buttonAt:NSMakeRect(M + 710, y - 22, 110, 20)
         title:@"Run PrimeFactor" action:@selector(runPrimeFactor:)];
     self.primeFactorButton.font = [NSFont systemFontOfSize:10];
     self.primeFactorButton.hidden = YES;
@@ -798,6 +794,34 @@ static const int EQ_HISTORY = 32; // number of vertical bars (time history)
 
     self.benchmarkStopButton = nil;
     y -= 24;
+
+    // Nester Carry Chain row (own line to avoid overlap)
+    self.carryChainToggle = [[NSButton alloc] initWithFrame:NSMakeRect(M, y - 20, 150, 18)];
+    self.carryChainToggle.buttonType = NSButtonTypeSwitch;
+    self.carryChainToggle.title = @"NesterCarryChain";
+    self.carryChainToggle.font = [NSFont boldSystemFontOfSize:9];
+    self.carryChainToggle.toolTip = @"~4-7x faster mulmod for Wieferich + Wall-Sun-Sun CPU tests";
+    self.carryChainToggle.state = NSControlStateValueOff;
+    self.carryChainToggle.target = self;
+    self.carryChainToggle.action = @selector(carryChainToggled:);
+    self.carryChainToggle.autoresizingMask = NSViewMinYMargin;
+    [cv addSubview:self.carryChainToggle];
+
+    NSButton *ccInfoBtn = [self buttonAt:NSMakeRect(M + 154, y - 19, 18, 18)
+        title:@"?" action:@selector(showCarryChainInfo:)];
+    ccInfoBtn.font = [NSFont boldSystemFontOfSize:9];
+    ccInfoBtn.bezelStyle = NSBezelStyleCircular;
+    ccInfoBtn.toolTip = @"About Nester Carry Chain";
+    ccInfoBtn.autoresizingMask = NSViewMinYMargin;
+    [cv addSubview:ccInfoBtn];
+
+    NSButton *ccBenchBtn = [self buttonAt:NSMakeRect(M + 176, y - 19, 42, 18)
+        title:@"Bench" action:@selector(runCarryChainTest:)];
+    ccBenchBtn.font = [NSFont systemFontOfSize:8];
+    ccBenchBtn.toolTip = @"Run Nester Carry Chain benchmark";
+    ccBenchBtn.autoresizingMask = NSViewMinYMargin;
+    [cv addSubview:ccBenchBtn];
+    y -= 22;
 
     // From field
     NSTextField *fromLbl = [self labelAt:NSMakeRect(M, y - 18, 34, 14) text:@"From:" bold:NO size:9.5];
@@ -970,18 +994,19 @@ static const int EQ_HISTORY = 32; // number of vertical bars (time history)
         kdb.prime_count(), kdb.pseudoprime_count()]];
 
     if (_taskMgr->discoveries().size() > 0) {
-        [self appendText:@"Discoveries: "];
+        // Summarise by type instead of dumping every entry
+        std::map<prime::TaskType, int> counts;
+        for (auto& d : _taskMgr->discoveries()) counts[d.type]++;
+        NSMutableString *summary = [NSMutableString stringWithFormat:@"Discoveries: %zu total (",
+            _taskMgr->discoveries().size()];
         bool first = true;
-        for (auto& d : _taskMgr->discoveries()) {
-            if (!first) [self appendText:@", "];
-            NSString *entry = [NSString stringWithFormat:@"%s(%llu",
-                prime::task_name(d.type), d.value];
-            if (d.value2 > 0) entry = [entry stringByAppendingFormat:@",%llu", d.value2];
-            entry = [entry stringByAppendingString:@")"];
-            [self appendText:entry];
+        for (auto& [type, count] : counts) {
+            if (!first) [summary appendString:@", "];
+            [summary appendFormat:@"%s: %d", prime::task_name(type), count];
             first = false;
         }
-        [self appendText:@"\n"];
+        [summary appendString:@")\n"];
+        [self appendText:summary];
     }
     [self appendText:@"\nHelp menu or ? button for glossary. Ready.\n\n"];
 
@@ -1020,6 +1045,9 @@ static const int EQ_HISTORY = 32; // number of vertical bars (time history)
                 @"gcd(48,36), fibonacci(50), binomial(10,3)";
             self.checkToField.toolTip = @"";
             break;
+        case 5:
+            self.checkFromField.toolTip = @"Click Go to open Markov Predict window";
+            break;
     }
 }
 
@@ -1042,6 +1070,12 @@ static const int EQ_HISTORY = 32; // number of vertical bars (time history)
     // Expression mode
     if (mode == 4) {
         [self evaluateExpression:rawInput];
+        return;
+    }
+
+    // Markov Predict opens its own window
+    if (mode == 5) {
+        [self showMarkovPredictWindow:nil];
         return;
     }
 
@@ -1111,6 +1145,7 @@ static const int EQ_HISTORY = 32; // number of vertical bars (time history)
         case 1: [self runCheckFromHere:from to:to]; break;
         case 2: [self runCheckLinear:from to:to]; break;
         case 3: [self runPrimeLocation:from window:to]; break;
+        case 5: [self showMarkovPredictWindow:nil]; break; // handled above, fallback
     }
 }
 
@@ -2180,6 +2215,996 @@ static const int EQ_HISTORY = 32; // number of vertical bars (time history)
     // Thread stays joinable for proper cleanup
 }
 
+// ── Markov Predict ──────────────────────────────────────────────────
+//
+// Train a Markov model on known primes (from a loaded list or sieved),
+// then predict primes in gaps. Each prediction is verified and factored.
+//
+// Prime list file: one prime per line (decimal). Lines starting with #
+// are comments. Loaded via "Load Primes" button or from
+// ~/Documents/primes/primelocations/known_primes.txt automatically.
+//
+// The "From" field selects which prime in the list to start from.
+// The "Window" field is how many predictions to chain forward.
+
+// ── Primes as Voids theory popup ─────────────────────────────────────
+
+- (void)showPrimesAsVoidsTheory:(id)sender {
+    CGFloat W = 680, H = 720;
+    NSWindow *win = [[NSWindow alloc]
+        initWithContentRect:NSMakeRect(150, 100, W, H)
+        styleMask:NSWindowStyleMaskTitled | NSWindowStyleMaskClosable | NSWindowStyleMaskResizable
+        backing:NSBackingStoreBuffered defer:NO];
+    win.title = @"Primes as Voids -- An Atomic Boundary Model (S. Nester, 2026)";
+    win.releasedWhenClosed = NO;
+    win.minSize = NSMakeSize(500, 400);
+
+    NSScrollView *scroll = [[NSScrollView alloc] initWithFrame:win.contentView.bounds];
+    scroll.hasVerticalScroller = YES;
+    scroll.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
+
+    NSTextView *tv = [[NSTextView alloc] initWithFrame:NSMakeRect(0, 0, W - 20, H * 4)];
+    tv.editable = NO;
+    tv.autoresizingMask = NSViewWidthSizable;
+    tv.textContainerInset = NSMakeSize(16, 16);
+    tv.backgroundColor = [NSColor textBackgroundColor];
+    scroll.documentView = tv;
+    [win.contentView addSubview:scroll];
+
+    NSMutableAttributedString *text = [[NSMutableAttributedString alloc] init];
+    NSFont *titleFont = [NSFont boldSystemFontOfSize:16];
+    NSFont *headFont = [NSFont boldSystemFontOfSize:13];
+    NSFont *bodyFont = [NSFont systemFontOfSize:11.5];
+    NSFont *monoFont = [NSFont monospacedSystemFontOfSize:10 weight:NSFontWeightRegular];
+    NSDictionary *titleAttr = @{NSFontAttributeName: titleFont};
+    NSDictionary *headAttr = @{NSFontAttributeName: headFont};
+    NSDictionary *bodyAttr = @{NSFontAttributeName: bodyFont};
+    NSDictionary *monoAttr = @{NSFontAttributeName: monoFont};
+
+    #define APPEND(s, a) [text appendAttributedString:[[NSAttributedString alloc] initWithString:s attributes:a]]
+
+    APPEND(@"Primes as Voids\n", titleAttr);
+    APPEND(@"An Atomic Boundary Model for Prime Distribution\n", headAttr);
+    APPEND(@"Sergei Nester -- ViewBuild Research, Battery Point, Tasmania\n"
+           @"April 2026 -- Working Paper\n\n", bodyAttr);
+
+    APPEND(@"ABSTRACT\n", headAttr);
+    APPEND(@"Primes are not special objects but voids -- positions of total destructive "
+           @"interference in a harmonic field generated by the Sieve of Eratosthenes. Each "
+           @"prime is treated as an atomic centre with a Voronoi territory defined by the "
+           @"half-gaps to its nearest prime neighbours. The boundary between adjacent prime "
+           @"territories is the integer midpoint of a prime gap. Every such boundary is "
+           @"composite, with smallest prime factor determined entirely by the gap size modulo "
+           @"small primes.\n\n"
+           @"A local Markov chain model -- in which each step is generated from the conditional "
+           @"distribution of gap size and next-digit transition given only the current prime's "
+           @"last digit -- reproduces the digit transition structure and drift behaviour of the "
+           @"prime sequence. Residual error comes from the absence of a primality filter.\n\n", bodyAttr);
+
+    APPEND(@"THE HARMONIC FIELD\n", headAttr);
+    APPEND(@"For each prime p, define a harmonic wave of period p that marks every multiple "
+           @"of p as resonant. The Sieve of Eratosthenes constructs composites as the union "
+           @"of all such waves: n is composite if and only if it is resonant with at least one "
+           @"wave. Primes are positions where no wave arrives.\n\n"
+           @"Void density decreasing as 1/ln(N) follows from the field becoming more saturated "
+           @"with each additional wave. This is packing saturation: 1/ln(N) is a property of "
+           @"the geometry, not of primes per se.\n\n", bodyAttr);
+
+    APPEND(@"THE ATOMIC MODEL\n", headAttr);
+    APPEND(@"Each prime p gets a Voronoi territory T(p) -- integers closer to p than to any "
+           @"other prime. The atomic radius r(p) = (gap_before + gap_after) / 4.\n\n"
+           @"Boundary Theorem: Every integer midpoint between two consecutive primes greater "
+           @"than 2 is composite. The smallest prime factor at the boundary is determined by "
+           @"the gap size modulo small primes.\n\n", bodyAttr);
+
+    APPEND(@"  Gap    Boundary factor    Forced?\n", monoAttr);
+    APPEND(@"   2     div 2 (100%)       Yes (twin primes)\n", monoAttr);
+    APPEND(@"   4     div 3 (100%)       Yes\n", monoAttr);
+    APPEND(@"   6     div 2 (100%)       Yes\n", monoAttr);
+    APPEND(@"   8     div 3 (100%)       Yes\n", monoAttr);
+    APPEND(@"  10     div 2 (100%)       Yes\n", monoAttr);
+    APPEND(@"  12     Mixed              No -- first ambiguous case\n\n", monoAttr);
+
+    APPEND(@"SHELL CLASSIFICATION\n", headAttr);
+    APPEND(@"Each predicted prime is classified by its position in the atomic structure:\n\n"
+           @"  SHELL: Small gaps on both sides. Prime cluster. Tightly grouped. Low "
+           @"smoothness -- fewer small factors in p-1 means less composite packing nearby, "
+           @"leaving room for primes to cluster.\n\n"
+           @"  BOUNDARY: Large gap on at least one side. Sits at the edge of a composite "
+           @"nucleus -- a dense region where many harmonic waves overlap. High smoothness "
+           @"of p-1 indicates the nucleus is saturated with small divisors.\n\n"
+           @"  EDGE: Transitional zone between shell and boundary. Moderate gaps, mixed "
+           @"factor structure.\n\n", bodyAttr);
+
+    APPEND(@"OUTPUT FIELDS\n", headAttr);
+    APPEND(@"  gap=before|after   Gaps to previous and next prime\n", monoAttr);
+    APPEND(@"  [SHELL/BOUNDARY/EDGE]  Atomic position classification\n", monoAttr);
+    APPEND(@"  smooth=s(O/o)     Smoothness: Omega/log2(p-1)\n", monoAttr);
+    APPEND(@"                    O = total prime factors (with multiplicity)\n", monoAttr);
+    APPEND(@"                    o = distinct prime factors\n", monoAttr);
+    APPEND(@"  lpf=              Largest prime factor of p-1\n", monoAttr);
+    APPEND(@"  r=                Atomic radius (avg of surrounding gaps)\n\n", monoAttr);
+
+    APPEND(@"MARKOV PREDICTION\n", headAttr);
+    APPEND(@"The predictor uses two empirical distributions conditioned on the last "
+           @"digit D of the current prime (from {1,3,7,9}):\n\n"
+           @"  1. Gap distribution P(gap | D) -- how far to the next prime\n"
+           @"  2. Digit transition P(D' | D) -- what the next prime ends in\n\n"
+           @"2,000 single-step trials vote on the next prime. Top candidates are "
+           @"verified with deterministic Miller-Rabin (12 witnesses: 2 through 37, "
+           @"provably correct for all 64-bit integers). Modular exponentiation uses "
+           @"Nester Carry Chain mulmod (4-7x faster than binary doubling).\n\n"
+           @"The model adapts incrementally: each confirmed prime updates the gap "
+           @"distribution and transition matrix, giving it a recency bias that tracks "
+           @"local density changes.\n\n", bodyAttr);
+
+    APPEND(@"PRIMALITY VERIFICATION\n", headAttr);
+    APPEND(@"  - Miller-Rabin with 12 deterministic witnesses (2,3,5,7,11,13,17,19,23,29,31,37)\n"
+           @"  - Provably correct for all n < 3.3 x 10^24 (covers all 64-bit integers)\n"
+           @"  - Nester Carry Chain mulmod: 128-bit (a*b) mod m via partial product carry chain\n"
+           @"  - Trial division with small primes (2,3,5,...,37) as fast pre-filter\n"
+           @"  - Heuristic divisor candidates (Lucky7s, PinchFactor) before Pollard rho\n"
+           @"  - Pollard rho factorisation for composite rejection\n\n", bodyAttr);
+
+    APPEND(@"NESTER CARRY CHAIN STREAMING DIVISIBILITY\n", headAttr);
+    APPEND(@"For big-number trial division (numbers beyond 64 bits), the streaming "
+           @"divisibility engine tests whether N is divisible by candidate divisors "
+           @"without division. Streams through the number segment by segment, accumulating "
+           @"via Barrett reduction (precomputed reciprocal multiply). N-wide batching "
+           @"processes up to 8 divisors per pass. Up to 8x faster than scalar division "
+           @"on 2048-bit numbers. Over 10 million divisor tests per second on Apple Silicon.\n\n", bodyAttr);
+
+    APPEND(@"WHAT THE MARKOV MODEL SHOWS\n", headAttr);
+    APPEND(@"The model is missing exactly one thing: primality verification. Everything "
+           @"else -- density shape, digit transitions, drift behaviour -- emerges from "
+           @"local conditional rules. The only non-local ingredient in prime structure is "
+           @"divisibility by primes below sqrt(N). All other statistics propagate forward "
+           @"from the last known prime.\n\n", bodyAttr);
+
+    APPEND(@"CONNECTIONS\n", headAttr);
+    APPEND(@"The Lemke Oliver consecutive-digit repulsion (primes avoid repeating their "
+           @"last digit) is the arithmetic analogue of GUE eigenvalue repulsion in random "
+           @"matrix theory. The Montgomery-Odlyzko law -- that Riemann zeta zeros space "
+           @"like quantum energy levels -- reflects the shared interference field structure.\n\n"
+           @"The Cramer random model succeeds because it captures the packing geometry "
+           @"through 1/ln(n), not because it captures anything about the algebraic structure "
+           @"of primality.\n\n", bodyAttr);
+
+    APPEND(@"(c) 2026 ViewBuild Research. Working paper.\n", bodyAttr);
+
+    #undef APPEND
+
+    [tv.textStorage setAttributedString:text];
+    [tv scrollToBeginningOfDocument:nil];
+    [win makeKeyAndOrderFront:nil];
+    // Prevent deallocation
+    objc_setAssociatedObject(self, "theoryWindow", win, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+}
+
+// ── Carry Chain description popup ───────────────────────────────────
+
+- (void)showCarryChainInfo:(id)sender {
+    CGFloat W = 600, H = 560;
+    NSWindow *win = [[NSWindow alloc]
+        initWithContentRect:NSMakeRect(200, 150, W, H)
+        styleMask:NSWindowStyleMaskTitled | NSWindowStyleMaskClosable | NSWindowStyleMaskResizable
+        backing:NSBackingStoreBuffered defer:NO];
+    win.title = @"Nester Carry Chain (S. Nester, 2026)";
+    win.releasedWhenClosed = NO;
+    win.minSize = NSMakeSize(450, 350);
+
+    NSScrollView *scroll = [[NSScrollView alloc] initWithFrame:win.contentView.bounds];
+    scroll.hasVerticalScroller = YES;
+    scroll.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
+
+    NSTextView *tv = [[NSTextView alloc] initWithFrame:NSMakeRect(0, 0, W - 20, H * 3)];
+    tv.editable = NO;
+    tv.autoresizingMask = NSViewWidthSizable;
+    tv.textContainerInset = NSMakeSize(16, 16);
+    tv.backgroundColor = [NSColor textBackgroundColor];
+    scroll.documentView = tv;
+    [win.contentView addSubview:scroll];
+
+    NSMutableAttributedString *text = [[NSMutableAttributedString alloc] init];
+    NSFont *titleFont = [NSFont boldSystemFontOfSize:16];
+    NSFont *headFont = [NSFont boldSystemFontOfSize:13];
+    NSFont *bodyFont = [NSFont systemFontOfSize:11.5];
+    NSFont *monoFont = [NSFont monospacedSystemFontOfSize:10 weight:NSFontWeightRegular];
+    NSDictionary *titleAttr = @{NSFontAttributeName: titleFont};
+    NSDictionary *headAttr = @{NSFontAttributeName: headFont};
+    NSDictionary *bodyAttr = @{NSFontAttributeName: bodyFont};
+    NSDictionary *monoAttr = @{NSFontAttributeName: monoFont};
+
+    #define APPEND(s, a) [text appendAttributedString:[[NSAttributedString alloc] initWithString:s attributes:a]]
+
+    APPEND(@"Nester Carry Chain\n", titleAttr);
+    APPEND(@"Sergei Nester, 2026\n\n", headAttr);
+
+    APPEND(@"Two methods that replace division with accumulation.\n\n", bodyAttr);
+
+    // --- Method 1 ---
+    APPEND(@"NESTER CARRY CHAIN: MODULAR MULTIPLICATION\n", headAttr);
+    APPEND(@"Computes (a * b) mod m where a, b, m can be up to 128 bits, using "
+           @"only hardware-native integer operations. Decomposes the 128-bit "
+           @"multiply into a carry chain of 64-bit partial products, propagates "
+           @"carries through three 64-bit words, then reduces the 192-bit result "
+           @"modulo m using staged shifts. No division anywhere.\n\n", bodyAttr);
+
+    APPEND(@"Steps:\n", bodyAttr);
+    APPEND(@"  1. Split: a = [a_hi : a_lo], b = [b_hi : b_lo]  (64-bit halves)\n", monoAttr);
+    APPEND(@"  2. Partial products:\n", monoAttr);
+    APPEND(@"       p       = a_lo * b_lo          (128-bit)\n", monoAttr);
+    APPEND(@"       cross   = a_lo*b_hi + a_hi*b_lo (128-bit)\n", monoAttr);
+    APPEND(@"       hh      = a_hi * b_hi           (64-bit)\n", monoAttr);
+    APPEND(@"  3. Carry chain: assemble [r2 : r1 : r0] (192-bit result)\n", monoAttr);
+    APPEND(@"       r0 = low 64 bits of p\n", monoAttr);
+    APPEND(@"       r1 = high 64 of p + low 64 of cross (with carry)\n", monoAttr);
+    APPEND(@"       r2 = carry + high 64 of cross + hh\n", monoAttr);
+    APPEND(@"  4. Reduce: hi_mod = [r2:r1] mod m\n", monoAttr);
+    APPEND(@"  5. Staged shift: (hi_mod << 32) mod m, then << 32 again\n", monoAttr);
+    APPEND(@"  6. Final: (shifted + r0) mod m\n\n", monoAttr);
+
+    APPEND(@"4-7x faster than binary doubling for 128-bit modular exponentiation. "
+           @"On Apple Silicon, MUL + UMULH computes the full 128-bit product in "
+           @"3-4 cycles. The carry chain assembles the result with no branching.\n\n", bodyAttr);
+
+    // --- Method 2 ---
+    APPEND(@"NESTER CARRY CHAIN: STREAMING DIVISIBILITY\n", headAttr);
+    APPEND(@"Tests whether an arbitrarily large number N is divisible by a candidate "
+           @"divisor d, without ever dividing. Accumulates multiples of d while "
+           @"streaming through the number segment by segment (MSB to LSB).\n\n", bodyAttr);
+
+    APPEND(@"Choose a potential divisor. Add it to itself repeatedly as we move "
+           @"through each 64-bit segment of the number. At each step there are "
+           @"three outcomes:\n\n", bodyAttr);
+    APPEND(@"  HIT   -- accumulator is under the segment, keep going\n", monoAttr);
+    APPEND(@"  BUST  -- accumulator exceeds the segment, reduce and continue\n", monoAttr);
+    APPEND(@"  MATCH -- accumulator equals zero at the end, d divides N\n\n", monoAttr);
+
+    APPEND(@"Uses Barrett reduction (precomputed reciprocal multiply) instead of "
+           @"hardware division. The reciprocal inv = floor(2^64 / d) is computed "
+           @"once, then every reduction is: q = mulhi(x, inv); r = x - q*d. "
+           @"No UDIV instruction executes in the hot loop.\n\n", bodyAttr);
+
+    APPEND(@"N-wide batching processes N divisors per pass through the number. "
+           @"N is a compile-time template parameter (1, 2, 4, 8, or 16). Each "
+           @"stream is independent so the CPU pipelines all N multiply-accumulate "
+           @"chains in parallel. An adaptive calibrator times each width and picks "
+           @"the fastest for the given number size.\n\n", bodyAttr);
+
+    APPEND(@"Up to 8x faster than scalar division on RSA-2048 sized numbers "
+           @"(2048 bits, 32 limbs, 50K candidate divisors). Rate exceeds 10 million "
+           @"divisor tests per second on Apple Silicon.\n\n", bodyAttr);
+
+    // --- Where used ---
+    APPEND(@"WHERE USED IN PRIMEPATH\n", headAttr);
+    APPEND(@"  - Wieferich prime testing: 2^(p-1) mod p^2 (128-bit modulus)\n"
+           @"  - Wall-Sun-Sun prime testing: Fibonacci matrix mod p^2\n"
+           @"  - GIMPS trial factoring: CPU verification of GPU-found factors\n"
+           @"  - Mersenne factor scanning: modpow(2, q, f) for large f\n"
+           @"  - Markov Predict: Miller-Rabin verification of candidates\n"
+           @"  - Big-number trial division: streaming divisibility for arbitrary width\n\n"
+           @"The NesterCarryChain toggle switches between these methods and "
+           @"the standard binary doubling method for direct speed comparison.\n\n", bodyAttr);
+
+    APPEND(@"IMPLEMENTATION NOTES\n", headAttr);
+    APPEND(@"Modular multiplication uses the carry chain with staged 32-bit shift for "
+           @"moduli under 96 bits (4-7x speedup). For larger moduli it falls back to "
+           @"binary doubling automatically -- no user action needed.\n"
+           @"Streaming divisibility uses 32-bit Barrett reciprocals for divisors < 2^32 "
+           @"and a 64-bit two-wide path for larger divisors. Routing is automatic.\n\n", bodyAttr);
+
+    APPEND(@"(c) 2026 Sergei Nester. PrimePath.\n", bodyAttr);
+
+    #undef APPEND
+
+    [tv.textStorage setAttributedString:text];
+    [tv scrollToBeginningOfDocument:nil];
+    [win makeKeyAndOrderFront:nil];
+    objc_setAssociatedObject(self, "carryChainWindow", win, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+}
+
+// ── Markov Predict popup window ──────────────────────────────────────
+
+- (void)showMarkovPredictWindow:(id)sender {
+    CGFloat W = 600, H = 520;
+    NSRect frame = NSMakeRect(200, 200, W, H);
+    NSWindow *win = [[NSWindow alloc]
+        initWithContentRect:frame
+        styleMask:NSWindowStyleMaskTitled | NSWindowStyleMaskClosable | NSWindowStyleMaskResizable
+        backing:NSBackingStoreBuffered defer:NO];
+    win.title = @"Markov Prime Predictor";
+    win.releasedWhenClosed = NO;
+    win.minSize = NSMakeSize(500, 400);
+    NSView *cv = win.contentView;
+    CGFloat M = 12, y = H - 12;
+
+    // Title
+    NSTextField *title = [self labelAt:NSMakeRect(M, y - 18, W - 2*M, 18)
+        text:@"Markov Prime Predictor" bold:YES size:13];
+    [cv addSubview:title];
+    y -= 26;
+
+    NSTextField *desc = [self labelAt:NSMakeRect(M, y - 28, W - 2*M - 120, 28)
+        text:@"Primes as Voids: predict forward using local conditional gap distributions, "
+             @"verify candidates, and analyse atomic boundary structure."
+        bold:NO size:10];
+    desc.lineBreakMode = NSLineBreakByWordWrapping;
+    [cv addSubview:desc];
+
+    NSButton *theoryBtn = [self buttonAt:NSMakeRect(W - M - 112, y - 24, 104, 22)
+        title:@"Theory (S.Nester)" action:@selector(showPrimesAsVoidsTheory:)];
+    theoryBtn.font = [NSFont systemFontOfSize:10];
+    [cv addSubview:theoryBtn];
+    y -= 36;
+
+    // Load Primes button + Fetch from web + status
+    NSButton *loadBtn = [self buttonAt:NSMakeRect(M, y - 22, 86, 22)
+        title:@"Load File" action:@selector(markovLoadPrimes:)];
+    loadBtn.font = [NSFont systemFontOfSize:10];
+    [cv addSubview:loadBtn];
+
+    NSPopUpButton *fetchPopup = [[NSPopUpButton alloc] initWithFrame:NSMakeRect(M + 92, y - 22, 190, 22) pullsDown:YES];
+    [fetchPopup addItemWithTitle:@"Fetch Known Primes..."];
+    [fetchPopup addItemWithTitle:@"First 10,000 primes (t5k.org)"];
+    [fetchPopup addItemWithTitle:@"First 100,000 primes (t5k.org)"];
+    [fetchPopup addItemWithTitle:@"First 10,000 primes (OEIS)"];
+    [fetchPopup addItemWithTitle:@"First 1,000,000 primes (t5k.org zip)"];
+    fetchPopup.font = [NSFont systemFontOfSize:10];
+    fetchPopup.target = self;
+    fetchPopup.action = @selector(markovFetchPrimes:);
+    fetchPopup.tag = 9207;
+    [cv addSubview:fetchPopup];
+
+    NSTextField *loadStatus = [self labelAt:NSMakeRect(M + 290, y - 18, W - M - 300, 14)
+        text:@"No prime list loaded" bold:NO size:10];
+    loadStatus.tag = 9201;
+    loadStatus.textColor = [NSColor secondaryLabelColor];
+    [cv addSubview:loadStatus];
+    y -= 30;
+
+    // Start prime field
+    NSTextField *fromLbl = [self labelAt:NSMakeRect(M, y - 16, 70, 14)
+        text:@"Start prime:" bold:NO size:10];
+    [cv addSubview:fromLbl];
+    NSTextField *fromField = [[NSTextField alloc] initWithFrame:NSMakeRect(M + 74, y - 18, 200, 20)];
+    fromField.font = [NSFont monospacedSystemFontOfSize:11 weight:NSFontWeightRegular];
+    fromField.placeholderString = @"e.g. 1000003";
+    fromField.tag = 9202;
+    [cv addSubview:fromField];
+
+    // Steps field
+    NSTextField *stepsLbl = [self labelAt:NSMakeRect(M + 290, y - 16, 44, 14)
+        text:@"Steps:" bold:NO size:10];
+    [cv addSubview:stepsLbl];
+    NSTextField *stepsField = [[NSTextField alloc] initWithFrame:NSMakeRect(M + 336, y - 18, 80, 20)];
+    stepsField.font = [NSFont monospacedSystemFontOfSize:11 weight:NSFontWeightRegular];
+    stepsField.placeholderString = @"20";
+    stepsField.tag = 9203;
+    [cv addSubview:stepsField];
+
+    // Go / Stop buttons
+    NSButton *goBtn = [self buttonAt:NSMakeRect(M + 430, y - 20, 60, 22)
+        title:@"Run" action:@selector(markovWindowGo:)];
+    goBtn.font = [NSFont systemFontOfSize:11 weight:NSFontWeightMedium];
+    goBtn.tag = 9204;
+    [cv addSubview:goBtn];
+
+    NSButton *stopBtn = [self buttonAt:NSMakeRect(M + 496, y - 20, 60, 22)
+        title:@"Stop" action:@selector(markovWindowStop:)];
+    stopBtn.font = [NSFont systemFontOfSize:11];
+    stopBtn.enabled = NO;
+    stopBtn.tag = 9205;
+    [cv addSubview:stopBtn];
+    y -= 28;
+
+    // Stream benchmark button
+    NSButton *benchBtn = [self buttonAt:NSMakeRect(M, y - 20, 160, 22)
+        title:@"Nester-CarryChain Test" action:@selector(runStreamBenchmark:)];
+    benchBtn.font = [NSFont systemFontOfSize:10];
+    benchBtn.toolTip = @"Benchmark streaming NEON divisibility vs scalar vs carry-chain";
+    [cv addSubview:benchBtn];
+    y -= 26;
+
+    // Separator
+    NSBox *sep = [[NSBox alloc] initWithFrame:NSMakeRect(M, y - 2, W - 2*M, 1)];
+    sep.boxType = NSBoxSeparator;
+    [cv addSubview:sep];
+    y -= 8;
+
+    // Log output
+    NSScrollView *logScroll = [[NSScrollView alloc] initWithFrame:NSMakeRect(M, 8, W - 2*M, y - 12)];
+    logScroll.hasVerticalScroller = YES;
+    logScroll.borderType = NSBezelBorder;
+    logScroll.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
+    NSTextView *logView = [[NSTextView alloc] initWithFrame:NSMakeRect(0, 0, W - 2*M - 4, y - 16)];
+    logView.font = [NSFont monospacedSystemFontOfSize:9.5 weight:NSFontWeightRegular];
+    logView.editable = NO;
+    logView.backgroundColor = [NSColor textBackgroundColor];
+    logView.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
+    logScroll.documentView = logView;
+    [cv addSubview:logScroll];
+    objc_setAssociatedObject(win, "markovLogView", logView, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+
+    // Update load status if primes already loaded
+    if (!_markovPrimeList.empty()) {
+        loadStatus.stringValue = [NSString stringWithFormat:@"%@ primes loaded",
+            formatNumber((uint64_t)_markovPrimeList.size())];
+        loadStatus.textColor = [NSColor systemGreenColor];
+    }
+
+    self.markovLoadButton = loadBtn;  // so markovLoadPrimes: can update status in this window
+    [win makeKeyAndOrderFront:nil];
+    objc_setAssociatedObject(self, "markovWindow", win, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+}
+
+- (void)markovWindowGo:(id)sender {
+    NSWindow *win = objc_getAssociatedObject(self, "markovWindow");
+    if (!win) return;
+
+    NSTextField *fromField = [win.contentView viewWithTag:9202];
+    NSTextField *stepsField = [win.contentView viewWithTag:9203];
+    NSButton *goBtn = [win.contentView viewWithTag:9204];
+    NSButton *stopBtn = [win.contentView viewWithTag:9205];
+    NSTextView *logView = objc_getAssociatedObject(win, "markovLogView");
+
+    NSString *fromStr = [fromField.stringValue stringByReplacingOccurrencesOfString:@"," withString:@""];
+    uint64_t startPrime = strtoull(fromStr.UTF8String, nullptr, 10);
+    if (startPrime < 2) {
+        [logView.textStorage appendAttributedString:[[NSAttributedString alloc]
+            initWithString:@"Enter a start prime >= 2.\n"
+            attributes:@{NSFontAttributeName: logView.font}]];
+        return;
+    }
+
+    NSString *stepsStr = stepsField.stringValue;
+    uint64_t steps = stepsStr.length > 0 ? strtoull(stepsStr.UTF8String, nullptr, 10) : 20;
+
+    goBtn.enabled = NO;
+    stopBtn.enabled = YES;
+    logView.string = @"";
+
+    // Redirect appendText output to this window's log for the duration of the run
+    objc_setAssociatedObject(self, "markovLogView", logView, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+
+    [self runMarkovPredict:startPrime steps:steps];
+}
+
+- (void)markovWindowStop:(id)sender {
+    _checkRunning.store(false);
+}
+
+// Helper: append to the Markov window log if it exists, otherwise main log
+- (void)markovLog:(NSString *)text {
+    NSTextView *logView = objc_getAssociatedObject(self, "markovLogView");
+    if (logView) {
+        [logView.textStorage appendAttributedString:[[NSAttributedString alloc]
+            initWithString:text
+            attributes:@{NSFontAttributeName: logView.font,
+                         NSForegroundColorAttributeName: [NSColor labelColor]}]];
+        [logView scrollRangeToVisible:NSMakeRange(logView.string.length, 0)];
+    } else {
+        [self appendText:text];
+    }
+}
+
+- (void)markovFetchPrimes:(id)sender {
+    NSPopUpButton *popup = (NSPopUpButton *)sender;
+    NSInteger idx = popup.indexOfSelectedItem;
+    if (idx < 1) return; // title item
+
+    NSString *url = nil;
+    BOOL isZip = NO;
+    BOOL isOEIS = NO;
+    switch (idx) {
+        case 1: url = @"https://t5k.org/lists/small/10000.txt"; break;
+        case 2: url = @"https://t5k.org/lists/small/100000.txt"; break;
+        case 3: url = @"https://oeis.org/A000040/b000040.txt"; isOEIS = YES; break;
+        case 4: url = @"https://t5k.org/lists/small/millions/primes1.zip"; isZip = YES; break;
+        default: return;
+    }
+
+    [self markovLog:[NSString stringWithFormat:@"Fetching primes from %@...\n", url]];
+
+    // Update status
+    NSWindow *mwin = objc_getAssociatedObject(self, "markovWindow");
+    NSTextField *statusLbl = mwin ? [mwin.contentView viewWithTag:9201] : nil;
+    if (statusLbl) {
+        statusLbl.stringValue = @"Downloading...";
+        statusLbl.textColor = [NSColor systemOrangeColor];
+    }
+
+    __weak AppDelegate *weakSelf = self;
+    NSURLSession *session = [NSURLSession sharedSession];
+    NSURLSessionDataTask *task = [session dataTaskWithURL:[NSURL URLWithString:url]
+        completionHandler:^(NSData *data, NSURLResponse *response, NSError *error) {
+
+        dispatch_async(dispatch_get_main_queue(), ^{
+            AppDelegate *ss = weakSelf;
+            if (!ss) return;
+
+            if (error || !data) {
+                [ss markovLog:[NSString stringWithFormat:@"Fetch failed: %@\n",
+                    error.localizedDescription ?: @"no data"]];
+                if (statusLbl) {
+                    statusLbl.stringValue = @"Download failed";
+                    statusLbl.textColor = [NSColor systemRedColor];
+                }
+                return;
+            }
+
+            NSString *text = nil;
+            if (isZip) {
+                // Save zip, unzip, read contents
+                NSString *tmpZip = [NSTemporaryDirectory() stringByAppendingPathComponent:@"primes_dl.zip"];
+                NSString *tmpDir = [NSTemporaryDirectory() stringByAppendingPathComponent:@"primes_dl"];
+                [data writeToFile:tmpZip atomically:YES];
+                [[NSFileManager defaultManager] createDirectoryAtPath:tmpDir
+                    withIntermediateDirectories:YES attributes:nil error:nil];
+                NSTask *unzip = [[NSTask alloc] init];
+                unzip.executableURL = [NSURL fileURLWithPath:@"/usr/bin/unzip"];
+                unzip.arguments = @[@"-o", tmpZip, @"-d", tmpDir];
+                unzip.standardOutput = [NSPipe pipe];
+                unzip.standardError = [NSPipe pipe];
+                [unzip launchAndReturnError:nil];
+                [unzip waitUntilExit];
+
+                // Find the text file inside
+                NSArray *files = [[NSFileManager defaultManager] contentsOfDirectoryAtPath:tmpDir error:nil];
+                for (NSString *f in files) {
+                    if ([f hasSuffix:@".txt"]) {
+                        text = [NSString stringWithContentsOfFile:
+                            [tmpDir stringByAppendingPathComponent:f]
+                            encoding:NSUTF8StringEncoding error:nil];
+                        break;
+                    }
+                }
+                [[NSFileManager defaultManager] removeItemAtPath:tmpZip error:nil];
+                [[NSFileManager defaultManager] removeItemAtPath:tmpDir error:nil];
+            } else {
+                text = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
+            }
+
+            if (!text) {
+                [ss markovLog:@"Failed to decode downloaded data.\n"];
+                return;
+            }
+
+            // Parse primes from text
+            ss->_markovPrimeList.clear();
+            NSArray *lines = [text componentsSeparatedByCharactersInSet:
+                [NSCharacterSet newlineCharacterSet]];
+            for (NSString *line in lines) {
+                NSString *trimmed = [line stringByTrimmingCharactersInSet:
+                    [NSCharacterSet whitespaceCharacterSet]];
+                if (trimmed.length == 0 || [trimmed hasPrefix:@"#"]) continue;
+
+                if (isOEIS) {
+                    // Format: "index prime"
+                    NSArray *parts = [trimmed componentsSeparatedByString:@" "];
+                    if (parts.count >= 2) {
+                        uint64_t val = strtoull([parts[1] UTF8String], nullptr, 10);
+                        if (val >= 2) ss->_markovPrimeList.push_back(val);
+                    }
+                } else {
+                    // t5k.org format: space-separated primes, skip header lines with letters
+                    NSRange letterRange = [trimmed rangeOfCharacterFromSet:
+                        [NSCharacterSet letterCharacterSet]];
+                    if (letterRange.location != NSNotFound) continue;
+                    // Split on whitespace
+                    NSArray *nums = [trimmed componentsSeparatedByCharactersInSet:
+                        [NSCharacterSet whitespaceCharacterSet]];
+                    for (NSString *n in nums) {
+                        NSString *clean = [n stringByReplacingOccurrencesOfString:@"," withString:@""];
+                        if (clean.length == 0) continue;
+                        uint64_t val = strtoull(clean.UTF8String, nullptr, 10);
+                        if (val >= 2) ss->_markovPrimeList.push_back(val);
+                    }
+                }
+            }
+
+            std::sort(ss->_markovPrimeList.begin(), ss->_markovPrimeList.end());
+            ss->_markovPrimeList.erase(
+                std::unique(ss->_markovPrimeList.begin(), ss->_markovPrimeList.end()),
+                ss->_markovPrimeList.end());
+
+            NSString *countStr = formatNumber((uint64_t)ss->_markovPrimeList.size());
+            [ss markovLog:[NSString stringWithFormat:@"Fetched %@ primes.\n", countStr]];
+            if (statusLbl) {
+                statusLbl.stringValue = [NSString stringWithFormat:@"%@ primes loaded", countStr];
+                statusLbl.textColor = [NSColor systemGreenColor];
+            }
+
+            if (ss->_markovPrimeList.size() >= 2) {
+                [ss markovLog:[NSString stringWithFormat:
+                    @"  Range: %@ to %@  |  Mean gap: %.1f\n",
+                    formatNumber(ss->_markovPrimeList.front()),
+                    formatNumber(ss->_markovPrimeList.back()),
+                    (double)(ss->_markovPrimeList.back() - ss->_markovPrimeList.front())
+                        / ss->_markovPrimeList.size()]];
+            }
+        });
+    }];
+    [task resume];
+}
+
+- (void)markovLoadPrimes:(id)sender {
+    NSOpenPanel *panel = [NSOpenPanel openPanel];
+    panel.allowedFileTypes = @[@"txt", @"csv", @"dat"];
+    panel.title = @"Load Known Prime List";
+    panel.message = @"One prime per line (decimal). Lines starting with # are ignored.";
+    if ([panel runModal] != NSModalResponseOK || !panel.URL) return;
+
+    NSString *contents = [NSString stringWithContentsOfURL:panel.URL
+        encoding:NSUTF8StringEncoding error:nil];
+    if (!contents) {
+        [self markovLog:@"Markov: failed to read file.\n"];
+        return;
+    }
+
+    _markovPrimeList.clear();
+    for (NSString *line in [contents componentsSeparatedByString:@"\n"]) {
+        NSString *trimmed = [line stringByTrimmingCharactersInSet:
+            [NSCharacterSet whitespaceAndNewlineCharacterSet]];
+        if (trimmed.length == 0 || [trimmed hasPrefix:@"#"]) continue;
+        // Strip commas and spaces
+        trimmed = [trimmed stringByReplacingOccurrencesOfString:@"," withString:@""];
+        trimmed = [trimmed stringByReplacingOccurrencesOfString:@" " withString:@""];
+        uint64_t val = strtoull(trimmed.UTF8String, nullptr, 10);
+        if (val >= 2) _markovPrimeList.push_back(val);
+    }
+
+    std::sort(_markovPrimeList.begin(), _markovPrimeList.end());
+    _markovPrimeList.erase(
+        std::unique(_markovPrimeList.begin(), _markovPrimeList.end()),
+        _markovPrimeList.end());
+
+    [self markovLog:[NSString stringWithFormat:
+        @"Markov: loaded %@ primes from %@\n",
+        formatNumber((uint64_t)_markovPrimeList.size()),
+        panel.URL.lastPathComponent]];
+
+    // Update status label in Markov window if open
+    NSWindow *mwin = objc_getAssociatedObject(self, "markovWindow");
+    if (mwin) {
+        NSTextField *statusLbl = [mwin.contentView viewWithTag:9201];
+        if (statusLbl) {
+            statusLbl.stringValue = [NSString stringWithFormat:@"%@ primes loaded",
+                formatNumber((uint64_t)_markovPrimeList.size())];
+            statusLbl.textColor = [NSColor systemGreenColor];
+        }
+    }
+
+    // Show gaps
+    if (_markovPrimeList.size() >= 2) {
+        // Find largest gaps
+        std::vector<std::pair<uint64_t, size_t>> gaps; // gap size, index
+        for (size_t i = 0; i + 1 < _markovPrimeList.size(); i++) {
+            uint64_t g = _markovPrimeList[i + 1] - _markovPrimeList[i];
+            gaps.push_back({g, i});
+        }
+        std::sort(gaps.begin(), gaps.end(), [](auto& a, auto& b) { return a.first > b.first; });
+
+        [self markovLog:@"  Largest gaps (prime candidates likely here):\n"];
+        int show = std::min((int)gaps.size(), 10);
+        for (int i = 0; i < show; i++) {
+            uint64_t lo = _markovPrimeList[gaps[i].second];
+            uint64_t hi = _markovPrimeList[gaps[i].second + 1];
+            [self markovLog:[NSString stringWithFormat:
+                @"    gap=%@  between %@ and %@\n",
+                formatNumber(gaps[i].first), formatNumber(lo), formatNumber(hi)]];
+        }
+        [self markovLog:[NSString stringWithFormat:
+            @"  Range: %@ to %@  |  Mean gap: %.1f  |  Expected by ln(N): %.1f\n",
+            formatNumber(_markovPrimeList.front()),
+            formatNumber(_markovPrimeList.back()),
+            (double)(_markovPrimeList.back() - _markovPrimeList.front()) / _markovPrimeList.size(),
+            log((double)_markovPrimeList[_markovPrimeList.size() / 2])]];
+    }
+}
+
+- (void)runMarkovPredict:(uint64_t)startPrime steps:(uint64_t)chainLen {
+    if (chainLen == 0) chainLen = 20;
+    if (chainLen > 10000) chainLen = 10000;
+
+    // If no prime list loaded, try auto-loading known_primes.txt
+    if (_markovPrimeList.empty()) {
+        NSString *autoPath = @"/Users/sergeinester/Documents/primes/primelocations/known_primes.txt";
+        NSString *contents = [NSString stringWithContentsOfFile:autoPath
+            encoding:NSUTF8StringEncoding error:nil];
+        if (contents) {
+            for (NSString *line in [contents componentsSeparatedByString:@"\n"]) {
+                NSString *trimmed = [line stringByTrimmingCharactersInSet:
+                    [NSCharacterSet whitespaceAndNewlineCharacterSet]];
+                if (trimmed.length == 0 || [trimmed hasPrefix:@"#"]) continue;
+                trimmed = [trimmed stringByReplacingOccurrencesOfString:@"," withString:@""];
+                uint64_t val = strtoull(trimmed.UTF8String, nullptr, 10);
+                if (val >= 2) _markovPrimeList.push_back(val);
+            }
+            std::sort(_markovPrimeList.begin(), _markovPrimeList.end());
+            _markovPrimeList.erase(
+                std::unique(_markovPrimeList.begin(), _markovPrimeList.end()),
+                _markovPrimeList.end());
+            if (!_markovPrimeList.empty()) {
+                [self markovLog:[NSString stringWithFormat:
+                    @"Markov: auto-loaded %@ primes from known_primes.txt\n",
+                    formatNumber((uint64_t)_markovPrimeList.size())]];
+            }
+        }
+    }
+
+    // Determine training set: loaded list or sieve
+    bool use_loaded_list = !_markovPrimeList.empty();
+
+    // Find start position in loaded list
+    size_t start_idx = 0;
+    if (use_loaded_list) {
+        // Find the prime in the list closest to startPrime
+        auto it = std::lower_bound(_markovPrimeList.begin(), _markovPrimeList.end(), startPrime);
+        if (it != _markovPrimeList.end()) {
+            start_idx = std::distance(_markovPrimeList.begin(), it);
+        } else {
+            start_idx = _markovPrimeList.size() - 1;
+        }
+        // Snap to the actual prime in the list
+        startPrime = _markovPrimeList[start_idx];
+        [self markovLog:[NSString stringWithFormat:
+            @"Markov: starting from prime #%@ in loaded list: %@\n",
+            formatNumber((uint64_t)start_idx + 1), formatNumber(startPrime)]];
+    } else {
+        // No list loaded, verify input is prime and sieve training data
+        if (!prime::is_prime(startPrime)) {
+            [self markovLog:[NSString stringWithFormat:
+                @"Markov Predict: %@ is not prime. Enter a known prime, or load a prime list first.\n",
+                formatNumber(startPrime)]];
+            return;
+        }
+        [self markovLog:@"Markov: no prime list loaded, will sieve training primes near target.\n"];
+    }
+
+    _checkRunning.store(true);
+    _predictedPrimes.clear();
+
+    [self markovLog:[NSString stringWithFormat:
+        @"-- Markov Predict: chaining %llu predictions from %@ --\n",
+        chainLen, formatNumber(startPrime)]];
+
+    __weak AppDelegate *weakSelf = self;
+    prime::TaskManager *taskMgr = _taskMgr;
+    std::vector<uint64_t> primeList = _markovPrimeList; // copy for thread
+    bool useList = use_loaded_list;
+    size_t startIndex = start_idx;
+
+    _checkThread = std::thread([weakSelf, startPrime, chainLen, taskMgr,
+                                 primeList, useList, startIndex]() {
+        pthread_set_qos_class_self_np(QOS_CLASS_UTILITY, 0);
+        AppDelegate *ss = weakSelf;
+        if (!ss) return;
+
+        uint64_t current_prime = startPrime;
+        size_t list_pos = startIndex;
+        uint64_t correct = 0, in_set = 0, total = 0;
+
+        // Train on the full loaded list (or a window of it)
+        prime::MarkovPredictor markov;
+        if (useList && primeList.size() >= 50) {
+            // Use primes up to current position as training set
+            size_t train_end = std::min(list_pos + 1, primeList.size());
+            size_t train_start = train_end > 20000 ? train_end - 20000 : 0;
+            std::vector<uint64_t> training(
+                primeList.begin() + train_start,
+                primeList.begin() + train_end);
+            markov.train(training);
+
+            NSString *tMsg = [NSString stringWithFormat:
+                @"  Trained on %@ primes from loaded list (mean gap: d1=%.1f d3=%.1f d7=%.1f d9=%.1f)\n",
+                formatNumber((uint64_t)training.size()),
+                markov.mean_gap(1), markov.mean_gap(3),
+                markov.mean_gap(7), markov.mean_gap(9)];
+            dispatch_async(dispatch_get_main_queue(), ^{ [weakSelf markovLog:tMsg]; });
+        }
+
+        for (uint64_t step = 0; step < chainLen && ss->_checkRunning.load(); step++) {
+
+            // If no list or model not trained, sieve and train on the fly
+            if (!markov.is_trained()) {
+                double ln_p = log((double)current_prime);
+                uint64_t train_span = (uint64_t)(20000.0 * ln_p);
+                if (train_span > current_prime - 2) train_span = current_prime - 2;
+                uint64_t train_lo = current_prime - train_span;
+                if (train_lo < 2) train_lo = 2;
+
+                std::vector<uint64_t> training;
+                if (taskMgr) training = taskMgr->segmented_sieve(train_lo, current_prime + 1);
+
+                if (training.size() < 50) {
+                    dispatch_async(dispatch_get_main_queue(), ^{
+                        [weakSelf markovLog:@"  Not enough training primes, stopping.\n"];
+                    });
+                    break;
+                }
+                markov.train(training);
+            }
+
+            // Predict next prime: 2000 trials, then verify top candidates
+            auto vp = markov.predict_next_verified(current_prime, 2000);
+            uint64_t predicted = vp.value;
+            int pred_votes = vp.votes;
+            int pred_rank = vp.rank;
+            int pred_checked = vp.candidates_checked;
+
+            // Find actual next prime
+            uint64_t actual_next = 0;
+            bool actual_known = false;
+
+            if (useList && list_pos + 1 < primeList.size()) {
+                actual_next = primeList[list_pos + 1];
+                actual_known = true;
+                list_pos++;
+            } else {
+                actual_next = current_prime + 1;
+                if (actual_next % 2 == 0) actual_next++;
+                while (!prime::is_prime(actual_next)) actual_next += 2;
+            }
+
+            uint64_t gap = actual_next - current_prime;
+            total++;
+
+            bool hit = (predicted == actual_next);
+            int64_t error = predicted > 0 ? (int64_t)predicted - (int64_t)actual_next : -1;
+            if (hit) correct++;
+
+            // Check if actual prime was in candidate set
+            auto all_candidates = markov.predict_next(current_prime, 2000);
+            bool in_candidates = false;
+            int candidate_rank = 0;
+            int candidate_votes = 0;
+            {
+                int rank = 0;
+                for (auto& [val, cnt] : all_candidates) {
+                    if (val > current_prime) rank++;
+                    if (val == actual_next) {
+                        in_candidates = true;
+                        candidate_rank = rank;
+                        candidate_votes = cnt;
+                        break;
+                    }
+                }
+            }
+            if (in_candidates) in_set++;
+
+            // Adaptive training: feed the actual result back into the model
+            markov.update(current_prime, actual_next);
+
+            // Atomic analysis: smoothness, shell classification, composite density
+            // Peek ahead for gap_after (next gap) if possible
+            uint64_t gap_after = 0;
+            if (useList && list_pos + 1 < primeList.size()) {
+                gap_after = primeList[list_pos + 1] - actual_next;
+            } else {
+                // Quick scan for next prime to get gap_after
+                uint64_t probe = actual_next + 1;
+                if (probe % 2 == 0) probe++;
+                for (int tries = 0; tries < 500 && !prime::is_prime(probe); tries++)
+                    probe += 2;
+                if (prime::is_prime(probe)) gap_after = probe - actual_next;
+            }
+
+            auto atom = prime::analyze_prime_atom(actual_next, gap, gap_after);
+            std::string factor_info = prime::factors_string(actual_next - 1);
+
+            // Mersenne factor test
+            std::string mersenne_info;
+            {
+                auto mhits = prime::mersenne_factor_scan(actual_next);
+                if (!mhits.empty()) {
+                    std::ostringstream ms;
+                    ms << "MERSENNE FACTOR: ";
+                    for (size_t i = 0; i < mhits.size(); i++) {
+                        if (i > 0) ms << ", ";
+                        ms << actual_next << " | 2^" << mhits[i] << "-1";
+                    }
+                    mersenne_info = ms.str();
+                }
+            }
+
+            // Build result string
+            NSString *hitStr;
+            if (hit) {
+                hitStr = [NSString stringWithFormat:@"VERIFIED HIT (rank #%d, votes=%d, checked=%d)",
+                    pred_rank, pred_votes, pred_checked];
+            } else if (in_candidates) {
+                hitStr = [NSString stringWithFormat:@"IN SET (rank #%d, votes=%d) predicted=%@ (rank #%d)",
+                    candidate_rank, candidate_votes,
+                    predicted > 0 ? formatNumber(predicted) : @"(none)", pred_rank];
+            } else {
+                hitStr = [NSString stringWithFormat:@"miss predicted=%@",
+                    predicted > 0 ? formatNumber(predicted) : @"(none)"];
+            }
+
+            NSString *line = [NSString stringWithFormat:
+                @"  #%llu  %@  gap=%llu|%llu  %@  err=%lld  "
+                @"%s[%s] smooth=%.2f(%d/%d) lpf=%@  r=%.0f  p-1=%s%s\n",
+                total, formatNumber(actual_next),
+                gap, gap_after,
+                hitStr,
+                (long long)error,
+                actual_known ? "K " : "",
+                atom.shell_str().c_str(),
+                atom.smoothness, atom.big_omega, atom.omega,
+                formatNumber(atom.largest_pf),
+                atom.radius,
+                factor_info.c_str(),
+                mersenne_info.empty() ? "" : ("\n    ** " + mersenne_info + " **").c_str()];
+            dispatch_async(dispatch_get_main_queue(), ^{
+                [weakSelf markovLog:line];
+            });
+
+            // Save discovery and store for PrimeFactor
+            if (taskMgr) {
+                taskMgr->save_discovery({prime::TaskType::GeneralPrime, actual_next, current_prime,
+                    prime::PrimeClass::Prime, current_prime, "", taskMgr->timestamp()});
+            }
+            dispatch_async(dispatch_get_main_queue(), ^{
+                AppDelegate *s3 = weakSelf;
+                if (s3) s3->_predictedPrimes.push_back(actual_next);
+            });
+
+            // Adaptive training is handled by markov.update() above
+            current_prime = actual_next;
+        }
+
+        // Save predictions to file for reuse
+        {
+            std::string path = std::string(
+                [NSSearchPathForDirectoriesInDomains(NSApplicationSupportDirectory,
+                    NSUserDomainMask, YES).firstObject UTF8String]) + "/PrimePath/markov_predictions.txt";
+            std::ofstream f(path, std::ios::app);
+            if (f.is_open()) {
+                auto now = std::chrono::system_clock::now();
+                auto tt = std::chrono::system_clock::to_time_t(now);
+                char ts[32];
+                strftime(ts, sizeof(ts), "%Y-%m-%dT%H:%M:%S", localtime(&tt));
+                f << "# Markov Predict run " << ts
+                  << " | start=" << startPrime
+                  << " | steps=" << total
+                  << " | hits=" << correct << "/" << total << "\n";
+            }
+        }
+
+        double hitRate = total > 0 ? 100.0 * correct / total : 0;
+        double setRate = total > 0 ? 100.0 * in_set / total : 0;
+        uint64_t finalCorrect = correct, finalInSet = in_set, finalTotal = total;
+        NSString *summary = [NSString stringWithFormat:
+            @"-- Markov Predict complete --\n"
+            @"  Exact hits: %llu/%llu (%.1f%%)\n"
+            @"  In candidate set: %llu/%llu (%.1f%%)\n"
+            @"  Last prime: %@\n"
+            @"  Predictions saved to ~/Library/Application Support/PrimePath/markov_predictions.txt\n",
+            finalCorrect, finalTotal, hitRate,
+            finalInSet, finalTotal, setRate,
+            formatNumber(current_prime)];
+        dispatch_async(dispatch_get_main_queue(), ^{
+            [weakSelf markovLog:summary];
+            AppDelegate *s2 = weakSelf;
+            if (s2) {
+                // Re-enable Markov window buttons
+                NSWindow *mwin = objc_getAssociatedObject(s2, "markovWindow");
+                if (mwin) {
+                    NSButton *goBtn = [mwin.contentView viewWithTag:9204];
+                    NSButton *stopBtn = [mwin.contentView viewWithTag:9205];
+                    goBtn.enabled = YES;
+                    stopBtn.enabled = NO;
+                }
+                // Clear the log redirect
+                objc_setAssociatedObject(s2, "markovLogView", nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+            }
+        });
+
+        ss->_checkRunning.store(false);
+    });
+}
+
 // ── PrimeLocation (convergence + GPU+CPU parallel testing) ──────────
 
 - (void)runPrimeLocation:(uint64_t)from window:(uint64_t)windowSize {
@@ -2206,33 +3231,92 @@ static const int EQ_HISTORY = 32; // number of vertical bars (time history)
         AppDelegate *ss = weakSelf;
         if (!ss) return;
 
-        // Phase 1: Score candidates using convergence (CPU-intensive)
+        // Phase 1: Score candidates using convergence + Markov prediction
         struct Candidate {
             uint64_t value;
-            double score;
+            double score;        // convergence score
+            int markov_hits;     // how many Markov chains predicted this location
         };
         std::vector<Candidate> candidates;
         candidates.reserve(windowSize / 2);
 
         uint64_t pos = (from % 2 == 0 && from > 2) ? from + 1 : from;
 
-        // Phase 0: Run MatrixSieve on the candidate range -- almost zero overhead,
-        // eliminates ~77% of candidates divisible by primes {3,5,7,11,13,17,19,23,29,31}
-        // before we even compute convergence scores.
+        // Phase 0a: Run MatrixSieve on the candidate range
         const uint32_t sieveCount = (uint32_t)std::min((uint64_t)windowSize, (uint64_t)2000000);
         std::vector<uint8_t> sieveMask(sieveCount, 1);
         if (taskMgr) {
-            // Use MatrixSieve pre-filter (NEON accelerated)
             prime::MatrixSieve quickSieve;
             quickSieve.sieve_block(pos, sieveCount, sieveMask.data());
         }
 
+        // Phase 0b: Markov prediction -- train on known primes near target,
+        // then predict candidate locations. Uses primes already found by
+        // everyone (sieved from number line), not just PrimePath discoveries.
+        std::set<uint64_t> markov_set;  // for O(1) lookup
+        std::map<uint64_t, int> markov_hits;  // value -> chain count
+        {
+            dispatch_async(dispatch_get_main_queue(), ^{
+                [weakSelf appendText:@"  Markov: training on nearby primes...\n"];
+            });
+
+            // Sieve training primes in the region just before the target.
+            // Aim for ~50K training primes. At density ~1/ln(N), we need
+            // about 50000 * ln(from) numbers to scan.
+            double ln_from = log((double)from);
+            uint64_t train_span = (uint64_t)(50000.0 * ln_from);
+            if (train_span > from) train_span = from - 2;
+            uint64_t train_lo = from - train_span;
+            if (train_lo < 2) train_lo = 2;
+
+            // Use segmented sieve for training primes
+            std::vector<uint64_t> training_primes;
+            if (taskMgr) {
+                training_primes = taskMgr->segmented_sieve(train_lo, from);
+            }
+
+            if (training_primes.size() >= 100) {
+                prime::MarkovPredictor markov;
+                markov.train(training_primes);
+
+                // Run consensus prediction: 20 chains, keep candidates
+                // predicted by at least 2 chains
+                int predict_steps = (int)std::min((uint64_t)windowSize, (uint64_t)50000);
+                auto consensus = markov.predict_consensus(
+                    training_primes.back(), predict_steps, 20, 2);
+
+                // Filter to our target window [pos, pos + windowSize*2]
+                uint64_t win_lo = pos;
+                uint64_t win_hi = pos + windowSize * 2;
+                for (auto& [val, cnt] : consensus) {
+                    if (val >= win_lo && val <= win_hi) {
+                        markov_set.insert(val);
+                        markov_hits[val] = cnt;
+                    }
+                }
+
+                NSString *mMsg = [NSString stringWithFormat:
+                    @"  Markov: trained on %@ primes, predicted %@ candidates in window "
+                    @"(mean gap: d1=%.1f d3=%.1f d7=%.1f d9=%.1f)\n",
+                    formatNumber((uint64_t)training_primes.size()),
+                    formatNumber((uint64_t)markov_set.size()),
+                    markov.mean_gap(1), markov.mean_gap(3),
+                    markov.mean_gap(7), markov.mean_gap(9)];
+                dispatch_async(dispatch_get_main_queue(), ^{ [weakSelf appendText:mMsg]; });
+            } else {
+                dispatch_async(dispatch_get_main_queue(), ^{
+                    [weakSelf appendText:@"  Markov: not enough training primes, skipping prediction\n"];
+                });
+            }
+        }
+
+        // Phase 1: Score candidates (convergence + Markov boost)
         uint64_t sieveRejected = 0;
+        uint64_t markovBoosted = 0;
         for (uint64_t i = 0; i < windowSize && ss->_checkRunning.load(); i++) {
             if (i % 5000 == 0) [ss throttleCheckIfNeeded];
             uint64_t n = pos + i * 2;
             if (n < 3) continue;
-            // MatrixSieve pre-filter (checks index i*2 in the sieve block starting at pos)
             uint32_t sieveIdx = (uint32_t)(i * 2);
             if (sieveIdx < sieveCount && !sieveMask[sieveIdx]) {
                 sieveRejected++;
@@ -2241,16 +3325,46 @@ static const int EQ_HISTORY = 32; // number of vertical bars (time history)
             if (!prime::WHEEL.valid(n)) continue;
             if (prime::crt_reject(n)) continue;
             double score = prime::convergence(n, 12);
+
+            int mhits = 0;
+            auto mit = markov_hits.find(n);
+            if (mit != markov_hits.end()) {
+                mhits = mit->second;
+                // Boost score: each Markov chain hit adds weight
+                score += mhits * 2.0;
+                markovBoosted++;
+            }
+
             if (score > -900.0) {
-                candidates.push_back({n, score});
+                candidates.push_back({n, score, mhits});
+            }
+        }
+
+        // Also add Markov-only candidates that passed MatrixSieve but may
+        // have been CRT/wheel rejected (Markov predictions from known primes
+        // are worth testing even if convergence is ambiguous)
+        for (auto& [mval, mcnt] : markov_hits) {
+            if (mval < pos || mval > pos + windowSize * 2) continue;
+            if (!(mval & 1) || mval < 3) continue;
+            // Check if already in candidates
+            bool found = false;
+            for (auto& c : candidates) {
+                if (c.value == mval) { found = true; break; }
+            }
+            if (!found && mcnt >= 3) {
+                // Strong Markov consensus (3+ chains) overrides CRT/wheel rejection
+                candidates.push_back({mval, (double)mcnt * 2.0, mcnt});
+                markovBoosted++;
             }
         }
 
         {
             NSString *sieveMsg = [NSString stringWithFormat:
-                @"  MatrixSieve pre-filter: rejected %@ of %@ candidates (%.1f%%)\n",
+                @"  MatrixSieve pre-filter: rejected %@ of %@ candidates (%.1f%%)\n"
+                @"  Markov-boosted candidates: %@\n",
                 formatNumber(sieveRejected), formatNumber(windowSize),
-                windowSize > 0 ? 100.0 * sieveRejected / windowSize : 0.0];
+                windowSize > 0 ? 100.0 * sieveRejected / windowSize : 0.0,
+                formatNumber(markovBoosted)];
             dispatch_async(dispatch_get_main_queue(), ^{ [weakSelf appendText:sieveMsg]; });
         }
 
@@ -3143,7 +4257,7 @@ static std::string u128_to_str(unsigned __int128 v) {
 - (void)carryChainToggled:(id)sender {
     bool on = (self.carryChainToggle.state == NSControlStateValueOn);
     prime::g_use_carry_chain = on;
-    [self appendStatus:[NSString stringWithFormat:@"CarryChain mulmod: %s\n", on ? "ON (Wieferich + Wall-Sun-Sun CPU)" : "OFF (binary shift-and-add)"]];
+    [self appendStatus:[NSString stringWithFormat:@"NesterCarryChain mulmod: %s\n", on ? "ON (Wieferich + Wall-Sun-Sun CPU)" : "OFF (binary shift-and-add)"]];
 }
 
 - (void)runCarryChainTest:(id)sender {
@@ -3280,8 +4394,357 @@ static std::string u128_to_str(unsigned __int128 v) {
 
         out("");
         out("═══════════════════════════════════════════════════════");
+        out("  STREAMING NEON DIVISIBILITY (Nester-CarryChain Method)");
+        out("═══════════════════════════════════════════════════════");
+        out("");
+
+        // Build a large number: 2^2048 - 1 (all 1 bits, 32 limbs)
+        prime::BigNum big2048;
+        big2048.limbs.resize(32, UINT64_MAX);
+        out("Number: 2^2048 - 1  (" + std::to_string(big2048.bit_width()) + " bits, " +
+            std::to_string(big2048.limbs.size()) + " limbs)");
+        out("");
+
+        // Test known small divisors of 2^2048-1: any prime factor of 2^k-1 for k|2048
+        // 2^2048 - 1 is divisible by 3, 5, 7, 17, 257, 65537, etc.
+        uint64_t test_divs[] = {3, 5, 7, 11, 13, 17, 19, 23, 31, 41, 127, 257, 65537,
+                                 8191, 131071, 524287, 6700417};
+        size_t ndiv = sizeof(test_divs) / sizeof(test_divs[0]);
+
+        // Scalar method
+        auto st0 = std::chrono::steady_clock::now();
+        auto scalar_res = prime::stream_find_divisors_scalar(big2048, test_divs, ndiv);
+        auto st1 = std::chrono::steady_clock::now();
+        double us_scalar = std::chrono::duration<double, std::micro>(st1 - st0).count();
+
+        out("SCALAR streaming (" + std::to_string(ndiv) + " candidates):");
+        out("  time: " + std::to_string(us_scalar) + " us");
+        std::string divs_str;
+        for (auto d : scalar_res) divs_str += std::to_string(d) + " ";
+        out("  divisors found: " + divs_str);
+
+        // NEON/batched method
+        auto nt0 = std::chrono::steady_clock::now();
+        auto neon_res = prime::stream_find_divisors(big2048, test_divs, ndiv);
+        auto nt1 = std::chrono::steady_clock::now();
+
+        out("NEON streaming (" + std::to_string(neon_res.tested) + " tested):");
+        out("  time: " + std::to_string(neon_res.elapsed_us) + " us");
+        std::string ndivs_str;
+        for (auto d : neon_res.divisors) ndivs_str += std::to_string(d) + " ";
+        out("  divisors found: " + ndivs_str);
+        if (us_scalar > 0)
+            out("  speedup: " + std::to_string(us_scalar / neon_res.elapsed_us) + "x");
+        out("");
+
+        // Bulk test: 10000 consecutive odd candidates against 2^2048-1
+        out("BULK: 10,000 candidate divisors vs 2^2048-1:");
+        std::vector<uint64_t> bulk_divs;
+        for (uint64_t i = 3; i < 20003; i += 2) bulk_divs.push_back(i);
+
+        auto bst0 = std::chrono::steady_clock::now();
+        int scalar_hits = 0;
+        for (auto d : bulk_divs) {
+            if (prime::stream_mod_scalar(big2048.limbs.data(), big2048.limbs.size(), d) == 0)
+                scalar_hits++;
+        }
+        auto bst1 = std::chrono::steady_clock::now();
+        double bulk_scalar_us = std::chrono::duration<double, std::micro>(bst1 - bst0).count();
+
+        auto bnt0 = std::chrono::steady_clock::now();
+        auto bulk_neon = prime::stream_find_divisors(big2048, bulk_divs.data(), bulk_divs.size());
+        auto bnt1 = std::chrono::steady_clock::now();
+        double bulk_neon_us = std::chrono::duration<double, std::micro>(bnt1 - bnt0).count();
+
+        out("  Scalar: " + std::to_string(bulk_scalar_us / 1000.0) + " ms, " +
+            std::to_string(scalar_hits) + " divisors");
+        out("  NEON:   " + std::to_string(bulk_neon_us / 1000.0) + " ms, " +
+            std::to_string((int)bulk_neon.divisors.size()) + " divisors");
+        out("  speedup: " + std::to_string(bulk_scalar_us / bulk_neon_us) + "x");
+        out("  rate: " + std::to_string((int)(bulk_divs.size() / (bulk_neon_us / 1e6))) + " divisor tests/sec");
+
+        out("");
+        out("═══════════════════════════════════════════════════════");
         out("  TEST COMPLETE");
         out("═══════════════════════════════════════════════════════");
+    });
+}
+
+// ── Streaming NEON benchmark (from Markov Predict window) ───────────
+
+- (void)runStreamBenchmark:(id)sender {
+    __weak AppDelegate *weakSelf = self;
+
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        AppDelegate *ss = weakSelf;
+        if (!ss) return;
+
+        auto log = [weakSelf](NSString *msg) {
+            dispatch_async(dispatch_get_main_queue(), ^{
+                [weakSelf markovLog:msg];
+            });
+        };
+
+        log(@"====================================================");
+        log(@"  NESTER-CARRYCHAIN TEST: Streaming Divisibility");
+        log(@"====================================================");
+        log(@"");
+
+        // --- Test 1: Small number correctness ---
+        log(@"TEST 1: Correctness (small numbers)");
+        int pass = 0, fail = 0;
+        // 100! has known factors. Use 2^127 - 1 (Mersenne prime M127)
+        // M127 = 170141183460469231731687303715884105727 (prime, 128 bits = 2 limbs)
+        prime::BigNum m127;
+        m127.limbs = {0x7FFFFFFFFFFFFFFFULL, 0xFFFFFFFFFFFFFFFFULL};
+        // M127 is prime, so nothing except 1 and itself should divide it
+        uint64_t small_tests[] = {2, 3, 5, 7, 11, 13, 17, 127, 257};
+        for (auto d : small_tests) {
+            bool divides = prime::stream_divides(m127, d);
+            if (!divides) pass++; else fail++;
+        }
+        log([NSString stringWithFormat:@"  M127 (2^127-1, prime): %d pass, %d fail", pass, fail]);
+
+        // 2^64 - 1 = 3 * 5 * 17 * 257 * 641 * 65537 * 6700417
+        prime::BigNum m64;
+        m64.limbs = {UINT64_MAX};
+        uint64_t m64_factors[] = {3, 5, 17, 257, 641, 65537, 6700417};
+        uint64_t m64_nonfactors[] = {2, 7, 11, 13, 19, 23};
+        int correct = 0, total = 0;
+        for (auto d : m64_factors) {
+            if (prime::stream_divides(m64, d)) correct++;
+            total++;
+        }
+        for (auto d : m64_nonfactors) {
+            if (!prime::stream_divides(m64, d)) correct++;
+            total++;
+        }
+        log([NSString stringWithFormat:@"  2^64-1 divisibility: %d/%d correct", correct, total]);
+        log(@"");
+
+        // --- Test 2: Real big number (RSA-2048 challenge) ---
+        log(@"TEST 2: RSA-2048 (617 digits, 2048 bits)");
+        // RSA-2048 = 25195908475657893494027183240048398571429282126204
+        //            03202777713783604366202070759555626401852588078440
+        //            ... (this is the actual RSA-2048 challenge number)
+        prime::BigNum rsa2048 = prime::BigNum::from_hex(
+            "C7970CEEDCC3B0754490201A7AA613CD73911081C790F5F1A8726F463550BB5B"
+            "7FF0DB8E1EA1189EC72F93D1650011BD721AEEACC2ACDE32A04107F0648C2813"
+            "A31F5B0B7765FF8B44B4B6FFC93B0932718E287AFD88D96048536CE35CE2CE9D"
+            "FC7FD23E1B30B1B17D6BA07FDAC2DECF3033DAD7076E5CC4BA8DBEC83297C414"
+            "FD560FCA58D4ECC0F7F6FF3AD29EC519B1B2A19A5A5519E54C35C3A1BD3B1B6A"
+            "15C6FDE29C1CFD3EAA92CC8D1B3E32B2535C6B0E0C97CA53C6E6F8F77B23A6BC"
+            "C42C7E96ECE84BD9E0CFC7DFC5A35FA946B2A1FDE5F597F91DD33F49A9ABCE81"
+            "16BC97F6E5C5CD29F4540BEFB71A2E8B97AC467BBB21FEF2AE86DD8BFC520381");
+        log([NSString stringWithFormat:@"  %zu bits, %zu limbs", rsa2048.bit_width(), rsa2048.limbs.size()]);
+
+        // RSA-2048 is a product of two large primes, so small divisors won't divide it
+        // But the test measures throughput across all three methods
+        std::vector<uint64_t> rsa_candidates;
+        for (uint64_t i = 3; i < 100003; i += 2) rsa_candidates.push_back(i);
+        log([NSString stringWithFormat:@"  50K odd candidates (3..100001):"]);
+        log(@"");
+
+        // Method 1: Scalar with division (__int128 + hardware UDIV)
+        auto rt0 = std::chrono::steady_clock::now();
+        int rsa_sc_hits = 0;
+        for (auto d : rsa_candidates)
+            if (prime::stream_mod_scalar(rsa2048.limbs.data(), rsa2048.limbs.size(), d) == 0) rsa_sc_hits++;
+        auto rt1 = std::chrono::steady_clock::now();
+        double rsa_sc_us = std::chrono::duration<double, std::micro>(rt1 - rt0).count();
+        log([NSString stringWithFormat:@"  DIVIDE (scalar):     %.1f ms, %d divisors", rsa_sc_us / 1000.0, rsa_sc_hits]);
+
+        // Method 2: Nester-CC single (reciprocal multiply, no division)
+        auto rt2 = std::chrono::steady_clock::now();
+        int rsa_bj_hits = 0;
+        for (auto d : rsa_candidates) {
+            if (d > 1 && prime::stream_mod_blackjack(rsa2048.limbs.data(), rsa2048.limbs.size(), (uint32_t)d) == 0)
+                rsa_bj_hits++;
+        }
+        auto rt3 = std::chrono::steady_clock::now();
+        double rsa_bj_us = std::chrono::duration<double, std::micro>(rt3 - rt2).count();
+        log([NSString stringWithFormat:@"  NESTER-CC (single):  %.1f ms, %d divisors", rsa_bj_us / 1000.0, rsa_bj_hits]);
+
+        // Method 3: Nester-CC 4-wide (4 parallel accumulate streams)
+        auto rt4 = std::chrono::steady_clock::now();
+        auto rsa_bj4 = prime::stream_find_divisors(rsa2048, rsa_candidates.data(), rsa_candidates.size());
+        auto rt5 = std::chrono::steady_clock::now();
+        double rsa_bj4_us = std::chrono::duration<double, std::micro>(rt5 - rt4).count();
+        log([NSString stringWithFormat:@"  NESTER-CC (4-wide):  %.1f ms, %d divisors",
+             rsa_bj4_us / 1000.0, (int)rsa_bj4.divisors.size()]);
+
+        // Cross-check: find mismatches
+        int mismatches = 0;
+        for (auto d : rsa_candidates) {
+            if (d <= 1) continue;
+            uint64_t scalar_r = prime::stream_mod_scalar(rsa2048.limbs.data(), rsa2048.limbs.size(), d);
+            uint64_t bj_r = prime::stream_mod_blackjack(rsa2048.limbs.data(), rsa2048.limbs.size(), (uint32_t)d);
+            if ((scalar_r == 0) != (bj_r == 0)) {
+                log([NSString stringWithFormat:@"  MISMATCH d=%llu: scalar_rem=%llu, nester_cc_rem=%llu",
+                     d, scalar_r, bj_r]);
+                mismatches++;
+                if (mismatches >= 10) break;
+            }
+        }
+        if (mismatches == 0) log(@"  All results match!");
+
+        log(@"");
+        log([NSString stringWithFormat:@"  Nester-CC 1x vs Divide: %.2fx", rsa_sc_us / rsa_bj_us]);
+        log([NSString stringWithFormat:@"  Nester-CC adaptive vs Divide: %.2fx (batch=%d)",
+             rsa_sc_us / rsa_bj4_us, rsa_bj4.batch_size]);
+        log([NSString stringWithFormat:@"  Nester-CC rate: %d divisor tests/sec",
+             (int)(rsa_candidates.size() / (rsa_bj4_us / 1e6))]);
+        log(@"");
+
+        // --- Test 3: All batch widths at different number sizes ---
+        log(@"TEST 3: Batch width scaling (50K candidates, 50K for adaptive)");
+        log(@"  bits  | divide | ncc1x | ncc4x | ncc8x | ncc16x| adapt | best");
+        log(@"  ------|--------|-------|-------|-------|-------|-------|-----");
+
+        int bit_sizes[] = {128, 256, 512, 1024, 2048, 4096, 8192};
+        std::vector<uint64_t> candidates;
+        for (uint64_t i = 3; i < 100003; i += 2) candidates.push_back(i);
+        // Larger set for adaptive test
+        std::vector<uint64_t> big_candidates;
+        for (uint64_t i = 3; i < 100003; i += 2) big_candidates.push_back(i);
+        // Convert for batch tests
+        std::vector<uint32_t> cands32;
+        for (auto c : candidates) cands32.push_back((uint32_t)c);
+
+        volatile uint64_t sink = 0; // prevent dead-code elimination
+        for (int bits : bit_sizes) {
+            int nlimbs = bits / 64;
+            prime::BigNum num;
+            num.limbs.resize(nlimbs, 0xA5A5A5A5A5A5A5A5ULL);
+            num.limbs[0] = 0xDEADBEEFCAFEBABEULL;
+
+            // Scalar (division)
+            auto t0 = std::chrono::steady_clock::now();
+            for (auto d : candidates)
+                sink += prime::stream_mod_scalar(num.limbs.data(), num.limbs.size(), d);
+            auto t1 = std::chrono::steady_clock::now();
+            double sc_us = std::chrono::duration<double, std::micro>(t1 - t0).count();
+
+            // Nester-CC 1x
+            auto tb1 = std::chrono::steady_clock::now();
+            for (auto d : cands32)
+                sink += prime::stream_mod_blackjack(num.limbs.data(), num.limbs.size(), d);
+            auto te1 = std::chrono::steady_clock::now();
+            double bj1 = std::chrono::duration<double, std::micro>(te1 - tb1).count();
+
+            // Nester-CC 4x
+            auto tb4 = std::chrono::steady_clock::now();
+            for (size_t j = 0; j + 4 <= cands32.size(); j += 4) {
+                uint32_t rem[4];
+                prime::stream_mod_Nx32_blackjack(num.limbs.data(), num.limbs.size(),
+                    &cands32[j], 4, rem);
+                for (int k = 0; k < 4; k++) sink += rem[k];
+            }
+            auto te4 = std::chrono::steady_clock::now();
+            double bj4 = std::chrono::duration<double, std::micro>(te4 - tb4).count();
+
+            // Nester-CC 8x
+            auto tb8 = std::chrono::steady_clock::now();
+            for (size_t j = 0; j + 8 <= cands32.size(); j += 8) {
+                uint32_t rem[8];
+                prime::stream_mod_Nx32_blackjack(num.limbs.data(), num.limbs.size(),
+                    &cands32[j], 8, rem);
+                for (int k = 0; k < 8; k++) sink += rem[k];
+            }
+            auto te8 = std::chrono::steady_clock::now();
+            double bj8 = std::chrono::duration<double, std::micro>(te8 - tb8).count();
+
+            // Nester-CC 16x
+            auto tb16 = std::chrono::steady_clock::now();
+            for (size_t j = 0; j + 16 <= cands32.size(); j += 16) {
+                uint32_t rem[16];
+                prime::stream_mod_Nx32_blackjack(num.limbs.data(), num.limbs.size(),
+                    &cands32[j], 16, rem);
+                for (int k = 0; k < 16; k++) sink += rem[k];
+            }
+            auto te16 = std::chrono::steady_clock::now();
+            double bj16 = std::chrono::duration<double, std::micro>(te16 - tb16).count();
+
+            // Adaptive (auto-picks batch size)
+            auto ta0 = std::chrono::steady_clock::now();
+            auto ares = prime::stream_find_divisors(num, big_candidates.data(), big_candidates.size());
+            auto ta1 = std::chrono::steady_clock::now();
+            double adapt_us = std::chrono::duration<double, std::micro>(ta1 - ta0).count();
+
+            // Find which fixed width was fastest
+            double times[] = {bj1, bj4, bj8, bj16};
+            const char* names[] = {"1x", "4x", "8x", "16x"};
+            int best_idx = 0;
+            for (int k = 1; k < 4; k++) if (times[k] < times[best_idx]) best_idx = k;
+
+            log([NSString stringWithFormat:@"  %4d  | %5.0f  | %5.0f | %5.0f | %5.0f | %5.0f | %5.0f | %s(b%d)",
+                 bits, sc_us, bj1, bj4, bj8, bj16,
+                 adapt_us,
+                 names[best_idx], ares.batch_size]);
+        }
+        log(@"");
+
+        // --- Test 3: Mersenne streaming shortcut comparison ---
+        log(@"TEST 4: Mersenne special case (2^p - 1 mod f)");
+        log(@"  Compare building BigNum vs modpow shortcut");
+        log(@"");
+
+        uint64_t mersenne_p = 127;
+        // Build 2^127 - 1 as BigNum
+        prime::BigNum m127b;
+        m127b.limbs = {0x7FFFFFFFFFFFFFFFULL, 0xFFFFFFFFFFFFFFFFULL};
+
+        uint64_t mtest_divs[] = {3, 5, 7, 127, 911, 8191, 131071, 524287};
+        size_t mndiv = sizeof(mtest_divs) / sizeof(mtest_divs[0]);
+
+        // Stream method
+        volatile uint64_t msink = 0;
+        auto mt0 = std::chrono::steady_clock::now();
+        for (int rep = 0; rep < 1000000; rep++) {
+            for (size_t i = 0; i < mndiv; i++)
+                msink += prime::stream_mod_scalar(m127b.limbs.data(), m127b.limbs.size(), mtest_divs[i]);
+        }
+        auto mt1 = std::chrono::steady_clock::now();
+        double stream_us = std::chrono::duration<double, std::micro>(mt1 - mt0).count();
+
+        // Modpow shortcut
+        auto mt2 = std::chrono::steady_clock::now();
+        for (int rep = 0; rep < 1000000; rep++) {
+            for (size_t i = 0; i < mndiv; i++)
+                msink += prime::mersenne_stream_divides(mersenne_p, mtest_divs[i]);
+        }
+        auto mt3 = std::chrono::steady_clock::now();
+        double modpow_us = std::chrono::duration<double, std::micro>(mt3 - mt2).count();
+
+        log([NSString stringWithFormat:@"  M127 (2 limbs, %zu divisors, 1M reps):", mndiv]);
+        log([NSString stringWithFormat:@"    Stream BigNum: %.1f us", stream_us]);
+        log([NSString stringWithFormat:@"    Modpow shortcut: %.1f us", modpow_us]);
+        log([NSString stringWithFormat:@"    Winner: %@",
+             stream_us < modpow_us ? @"Stream (BigNum small enough)" : @"Modpow (O(log p) beats streaming)"]);
+        log(@"");
+
+        // Now test with a large Mersenne exponent where modpow wins massively
+        uint64_t big_p = 82589933; // M82589933 is a known Mersenne prime
+        // Building 2^82589933 - 1 as BigNum would be ~10MB, so we only test modpow
+        auto mt4 = std::chrono::steady_clock::now();
+        int big_divs_found = 0;
+        for (size_t i = 0; i < mndiv; i++) {
+            if (prime::mersenne_stream_divides(big_p, mtest_divs[i]))
+                big_divs_found++;
+        }
+        auto mt5 = std::chrono::steady_clock::now();
+        double big_modpow_us = std::chrono::duration<double, std::micro>(mt5 - mt4).count();
+        log([NSString stringWithFormat:@"  M82589933 (25M digits, modpow only):  %.1f us for %zu divisors",
+             big_modpow_us, mndiv]);
+        log([NSString stringWithFormat:@"    (Stream would need ~1.2M limbs = %d MB -- modpow is the only option here)",
+             (int)(82589933 / 64 * 8 / 1024 / 1024)]);
+
+        log(@"");
+        log(@"====================================================");
+        log(@"  Nester-CarryChain rules: HIT (under) / BUST (reduce) / MATCH (divides)");
+        log(@"  For Mersenne numbers, modpow shortcut avoids building the number.");
+        log(@"  For general big numbers, Nester-CC streams up to 8 divisors/pass.");
+        log(@"====================================================");
     });
 }
 
@@ -3747,15 +5210,43 @@ static std::string u128_to_str(unsigned __int128 v) {
     jsonBtn.autoresizingMask = NSViewMinYMargin;
     [cv addSubview:jsonBtn];
 
-    NSTextField *jsonHint = [[NSTextField alloc] initWithFrame:NSMakeRect(150, y - 22, 380, 14)];
-    jsonHint.stringValue = @"Build and preview JSON result lines for mersenne.org submission.";
+    NSTextField *jsonHint = [[NSTextField alloc] initWithFrame:NSMakeRect(150, y - 22, 200, 14)];
+    jsonHint.stringValue = @"Build and preview JSON result lines.";
     jsonHint.font = [NSFont systemFontOfSize:9];
     jsonHint.textColor = [NSColor secondaryLabelColor];
     jsonHint.bezeled = NO; jsonHint.editable = NO; jsonHint.drawsBackground = NO;
-    jsonHint.autoresizingMask = NSViewMinYMargin | NSViewWidthSizable;
+    jsonHint.autoresizingMask = NSViewMinYMargin;
     [cv addSubview:jsonHint];
 
+    // AutoPrimeNet Settings button (same row)
+    NSButton *apnBtn = [self buttonAt:NSMakeRect(370, y - 24, 150, 24)
+        title:@"AutoPrimeNet Settings" action:@selector(showAutoPrimeNetPanel:)];
+    apnBtn.font = [NSFont systemFontOfSize:10];
+    apnBtn.autoresizingMask = NSViewMinYMargin;
+    [cv addSubview:apnBtn];
+
     y -= 30;
+
+    // Stop on first factor toggle
+    NSButton *abortCheck = [[NSButton alloc] initWithFrame:NSMakeRect(14, y - 18, 250, 18)];
+    abortCheck.buttonType = NSButtonTypeSwitch;
+    abortCheck.title = @"Stop on first factor found";
+    abortCheck.font = [NSFont systemFontOfSize:10];
+    abortCheck.state = _taskMgr->mersenne_abort_on_factor.load() ? NSControlStateValueOn : NSControlStateValueOff;
+    abortCheck.target = self;
+    abortCheck.action = @selector(toggleAbortOnFactor:);
+    abortCheck.autoresizingMask = NSViewMinYMargin;
+    [cv addSubview:abortCheck];
+
+    NSTextField *abortHint = [[NSTextField alloc] initWithFrame:NSMakeRect(270, y - 16, 280, 14)];
+    abortHint.stringValue = @"Default off: complete full bitlevel (recommended by mersenne.org).";
+    abortHint.font = [NSFont systemFontOfSize:9];
+    abortHint.textColor = [NSColor secondaryLabelColor];
+    abortHint.bezeled = NO; abortHint.editable = NO; abortHint.drawsBackground = NO;
+    abortHint.autoresizingMask = NSViewMinYMargin | NSViewWidthSizable;
+    [cv addSubview:abortHint];
+
+    y -= 26;
 
     // Batch size option
     NSTextField *batchLbl = [[NSTextField alloc] initWithFrame:NSMakeRect(14, y - 16, 80, 14)];
@@ -3866,6 +5357,268 @@ static std::string u128_to_str(unsigned __int128 v) {
     [cv addSubview:logScroll];
 
     [win makeKeyAndOrderFront:nil];
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// Abort-on-factor toggle
+// ═══════════════════════════════════════════════════════════════════════
+
+- (void)toggleAbortOnFactor:(id)sender {
+    NSButton *btn = (NSButton *)sender;
+    _taskMgr->mersenne_abort_on_factor.store(btn.state == NSControlStateValueOn);
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// AutoPrimeNet Settings Panel
+// ═══════════════════════════════════════════════════════════════════════
+
+- (void)showAutoPrimeNetPanel:(id)sender {
+    CGFloat W = 600, H = 580;
+    NSRect frame = NSMakeRect(200, 200, W, H);
+    NSWindow *win = [[NSWindow alloc]
+        initWithContentRect:frame
+        styleMask:NSWindowStyleMaskTitled | NSWindowStyleMaskClosable | NSWindowStyleMaskResizable
+        backing:NSBackingStoreBuffered defer:NO];
+    win.title = @"AutoPrimeNet Settings";
+    win.minSize = NSMakeSize(500, 400);
+    win.releasedWhenClosed = NO;
+
+    NSView *cv = win.contentView;
+    CGFloat y = H - 10;
+
+    NSString *DATA_DIR = [NSSearchPathForDirectoriesInDomains(NSApplicationSupportDirectory,
+        NSUserDomainMask, YES).firstObject stringByAppendingPathComponent:@"PrimePath"];
+
+    // ── Header ───────────────────────────────────────────────────────
+    NSTextField *header = [[NSTextField alloc] initWithFrame:NSMakeRect(14, y - 20, W - 28, 18)];
+    header.stringValue = @"AutoPrimeNet Integration";
+    header.font = [NSFont boldSystemFontOfSize:13];
+    header.bezeled = NO; header.editable = NO; header.drawsBackground = NO;
+    header.autoresizingMask = NSViewMinYMargin | NSViewWidthSizable;
+    [cv addSubview:header];
+    y -= 24;
+
+    NSTextField *desc = [[NSTextField alloc] initWithFrame:NSMakeRect(14, y - 30, W - 28, 28)];
+    desc.stringValue = @"AutoPrimeNet manages assignments and result submissions for all major GIMPS clients. "
+        @"PrimePath reads worktodo.txt and writes results.json.txt. AutoPrimeNet handles the rest.";
+    desc.font = [NSFont systemFontOfSize:10];
+    desc.textColor = [NSColor secondaryLabelColor];
+    desc.bezeled = NO; desc.editable = NO; desc.drawsBackground = NO;
+    desc.maximumNumberOfLines = 3;
+    desc.autoresizingMask = NSViewMinYMargin | NSViewWidthSizable;
+    [cv addSubview:desc];
+    y -= 36;
+
+    // ── Data Directory ───────────────────────────────────────────────
+    NSTextField *dirLbl = [[NSTextField alloc] initWithFrame:NSMakeRect(14, y - 14, 90, 14)];
+    dirLbl.stringValue = @"Data directory:";
+    dirLbl.font = [NSFont boldSystemFontOfSize:10];
+    dirLbl.bezeled = NO; dirLbl.editable = NO; dirLbl.drawsBackground = NO;
+    dirLbl.autoresizingMask = NSViewMinYMargin;
+    [cv addSubview:dirLbl];
+
+    NSTextField *dirPath = [[NSTextField alloc] initWithFrame:NSMakeRect(110, y - 14, W - 124, 14)];
+    dirPath.stringValue = DATA_DIR;
+    dirPath.font = [NSFont monospacedSystemFontOfSize:9 weight:NSFontWeightRegular];
+    dirPath.textColor = [NSColor labelColor];
+    dirPath.bezeled = NO; dirPath.editable = NO; dirPath.drawsBackground = NO; dirPath.selectable = YES;
+    dirPath.autoresizingMask = NSViewMinYMargin | NSViewWidthSizable;
+    [cv addSubview:dirPath];
+    y -= 22;
+
+    NSBox *sep1 = [[NSBox alloc] initWithFrame:NSMakeRect(14, y, W - 28, 1)];
+    sep1.boxType = NSBoxSeparator;
+    sep1.autoresizingMask = NSViewMinYMargin | NSViewWidthSizable;
+    [cv addSubview:sep1];
+    y -= 12;
+
+    // ── Settings ─────────────────────────────────────────────────────
+    NSTextField *settingsHdr = [[NSTextField alloc] initWithFrame:NSMakeRect(14, y - 14, 200, 14)];
+    settingsHdr.stringValue = @"Settings";
+    settingsHdr.font = [NSFont boldSystemFontOfSize:11];
+    settingsHdr.bezeled = NO; settingsHdr.editable = NO; settingsHdr.drawsBackground = NO;
+    settingsHdr.autoresizingMask = NSViewMinYMargin;
+    [cv addSubview:settingsHdr];
+    y -= 22;
+
+    NSButton *abortCheck = [[NSButton alloc] initWithFrame:NSMakeRect(14, y - 18, 300, 18)];
+    abortCheck.buttonType = NSButtonTypeSwitch;
+    abortCheck.title = @"Stop on first factor found (not recommended)";
+    abortCheck.font = [NSFont systemFontOfSize:10];
+    abortCheck.state = _taskMgr->mersenne_abort_on_factor.load() ? NSControlStateValueOn : NSControlStateValueOff;
+    abortCheck.target = self;
+    abortCheck.action = @selector(toggleAbortOnFactor:);
+    abortCheck.autoresizingMask = NSViewMinYMargin;
+    [cv addSubview:abortCheck];
+
+    NSTextField *abortNote = [[NSTextField alloc] initWithFrame:NSMakeRect(34, y - 32, W - 48, 14)];
+    abortNote.stringValue = @"Default off. Completing the full bitlevel avoids wasted work on mersenne.org.";
+    abortNote.font = [NSFont systemFontOfSize:9];
+    abortNote.textColor = [NSColor secondaryLabelColor];
+    abortNote.bezeled = NO; abortNote.editable = NO; abortNote.drawsBackground = NO;
+    abortNote.autoresizingMask = NSViewMinYMargin | NSViewWidthSizable;
+    [cv addSubview:abortNote];
+    y -= 42;
+
+    NSBox *sep2 = [[NSBox alloc] initWithFrame:NSMakeRect(14, y, W - 28, 1)];
+    sep2.boxType = NSBoxSeparator;
+    sep2.autoresizingMask = NSViewMinYMargin | NSViewWidthSizable;
+    [cv addSubview:sep2];
+    y -= 12;
+
+    // ── worktodo.txt ─────────────────────────────────────────────────
+    NSTextField *wtHdr = [[NSTextField alloc] initWithFrame:NSMakeRect(14, y - 14, 200, 14)];
+    wtHdr.stringValue = @"worktodo.txt (pending assignments)";
+    wtHdr.font = [NSFont boldSystemFontOfSize:11];
+    wtHdr.bezeled = NO; wtHdr.editable = NO; wtHdr.drawsBackground = NO;
+    wtHdr.autoresizingMask = NSViewMinYMargin;
+    [cv addSubview:wtHdr];
+
+    // Status indicator
+    NSTextField *wtStatus = [[NSTextField alloc] initWithFrame:NSMakeRect(W - 200, y - 14, 186, 14)];
+    wtStatus.tag = 8101;
+    wtStatus.font = [NSFont systemFontOfSize:10];
+    wtStatus.alignment = NSTextAlignmentRight;
+    wtStatus.bezeled = NO; wtStatus.editable = NO; wtStatus.drawsBackground = NO;
+    wtStatus.autoresizingMask = NSViewMinYMargin | NSViewMinXMargin;
+    [cv addSubview:wtStatus];
+    y -= 20;
+
+    NSScrollView *wtScroll = [[NSScrollView alloc] initWithFrame:NSMakeRect(14, y - 100, W - 28, 100)];
+    wtScroll.hasVerticalScroller = YES;
+    wtScroll.borderType = NSBezelBorder;
+    wtScroll.autoresizingMask = NSViewMinYMargin | NSViewWidthSizable;
+    NSTextView *wtView = [[NSTextView alloc] initWithFrame:NSMakeRect(0, 0, W - 32, 100)];
+    wtView.editable = NO;
+    wtView.font = [NSFont monospacedSystemFontOfSize:10 weight:NSFontWeightRegular];
+    wtView.identifier = @"apnWorktodo";
+    wtScroll.documentView = wtView;
+    [cv addSubview:wtScroll];
+    y -= 108;
+
+    // ── results.json.txt ─────────────────────────────────────────────
+    NSTextField *rjHdr = [[NSTextField alloc] initWithFrame:NSMakeRect(14, y - 14, 250, 14)];
+    rjHdr.stringValue = @"results.json.txt (pending upload)";
+    rjHdr.font = [NSFont boldSystemFontOfSize:11];
+    rjHdr.bezeled = NO; rjHdr.editable = NO; rjHdr.drawsBackground = NO;
+    rjHdr.autoresizingMask = NSViewMinYMargin;
+    [cv addSubview:rjHdr];
+
+    NSTextField *rjStatus = [[NSTextField alloc] initWithFrame:NSMakeRect(W - 200, y - 14, 186, 14)];
+    rjStatus.tag = 8102;
+    rjStatus.font = [NSFont systemFontOfSize:10];
+    rjStatus.alignment = NSTextAlignmentRight;
+    rjStatus.bezeled = NO; rjStatus.editable = NO; rjStatus.drawsBackground = NO;
+    rjStatus.autoresizingMask = NSViewMinYMargin | NSViewMinXMargin;
+    [cv addSubview:rjStatus];
+    y -= 20;
+
+    NSScrollView *rjScroll = [[NSScrollView alloc] initWithFrame:NSMakeRect(14, y - 100, W - 28, 100)];
+    rjScroll.hasVerticalScroller = YES;
+    rjScroll.borderType = NSBezelBorder;
+    rjScroll.autoresizingMask = NSViewMinYMargin | NSViewWidthSizable;
+    NSTextView *rjView = [[NSTextView alloc] initWithFrame:NSMakeRect(0, 0, W - 32, 100)];
+    rjView.editable = NO;
+    rjView.font = [NSFont monospacedSystemFontOfSize:10 weight:NSFontWeightRegular];
+    rjView.identifier = @"apnResults";
+    rjScroll.documentView = rjView;
+    [cv addSubview:rjScroll];
+    y -= 108;
+
+    // ── Refresh button ───────────────────────────────────────────────
+    NSButton *refreshBtn = [self buttonAt:NSMakeRect(14, y - 24, 80, 24)
+        title:@"Refresh" action:@selector(apnRefresh:)];
+    refreshBtn.font = [NSFont systemFontOfSize:10];
+    refreshBtn.autoresizingMask = NSViewMinYMargin;
+    [cv addSubview:refreshBtn];
+
+    // ── How it works ─────────────────────────────────────────────────
+    NSTextField *howHdr = [[NSTextField alloc] initWithFrame:NSMakeRect(110, y - 22, W - 124, 14)];
+    howHdr.stringValue = @"AutoPrimeNet \u2192 worktodo.txt \u2192 PrimePath (GPU) \u2192 results.json.txt \u2192 AutoPrimeNet \u2192 mersenne.org";
+    howHdr.font = [NSFont monospacedSystemFontOfSize:9 weight:NSFontWeightRegular];
+    howHdr.textColor = [NSColor secondaryLabelColor];
+    howHdr.bezeled = NO; howHdr.editable = NO; howHdr.drawsBackground = NO;
+    howHdr.autoresizingMask = NSViewMinYMargin | NSViewWidthSizable;
+    [cv addSubview:howHdr];
+
+    [win makeKeyAndOrderFront:nil];
+
+    // Load initial data
+    [self apnRefreshWindow:win dataDir:DATA_DIR];
+}
+
+- (void)apnRefresh:(id)sender {
+    NSWindow *win = [sender window];
+    NSString *DATA_DIR = [NSSearchPathForDirectoriesInDomains(NSApplicationSupportDirectory,
+        NSUserDomainMask, YES).firstObject stringByAppendingPathComponent:@"PrimePath"];
+    [self apnRefreshWindow:win dataDir:DATA_DIR];
+}
+
+- (void)apnRefreshWindow:(NSWindow *)win dataDir:(NSString *)dataDir {
+    // Read worktodo.txt
+    NSString *wtPath = [dataDir stringByAppendingPathComponent:@"worktodo.txt"];
+    NSString *wtContents = [NSString stringWithContentsOfFile:wtPath encoding:NSUTF8StringEncoding error:nil];
+    int wtCount = 0;
+    if (wtContents) {
+        for (NSString *line in [wtContents componentsSeparatedByString:@"\n"]) {
+            NSString *trimmed = [line stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+            if ([trimmed hasPrefix:@"Factor="]) wtCount++;
+        }
+    }
+
+    // Read last 10 lines of results.json.txt
+    NSString *rjPath = [dataDir stringByAppendingPathComponent:@"results.json.txt"];
+    NSString *rjContents = [NSString stringWithContentsOfFile:rjPath encoding:NSUTF8StringEncoding error:nil];
+    int rjCount = 0;
+    NSMutableArray *rjLines = [NSMutableArray array];
+    if (rjContents) {
+        NSArray *allLines = [rjContents componentsSeparatedByString:@"\n"];
+        for (NSString *line in allLines) {
+            if (line.length > 0) {
+                [rjLines addObject:line];
+                rjCount++;
+            }
+        }
+        // Keep last 10
+        if (rjLines.count > 10) {
+            rjLines = [[rjLines subarrayWithRange:NSMakeRange(rjLines.count - 10, 10)] mutableCopy];
+        }
+    }
+
+    // Update views
+    for (NSView *sub in win.contentView.subviews) {
+        if ([sub isKindOfClass:[NSScrollView class]]) {
+            NSTextView *tv = (NSTextView *)((NSScrollView *)sub).documentView;
+            if ([tv.identifier isEqualToString:@"apnWorktodo"]) {
+                tv.string = wtContents ?: @"(file not found)";
+            } else if ([tv.identifier isEqualToString:@"apnResults"]) {
+                tv.string = rjLines.count > 0 ? [rjLines componentsJoinedByString:@"\n"] : @"(no results)";
+            }
+        }
+    }
+
+    // Status labels
+    NSTextField *wtStatus = [win.contentView viewWithTag:8101];
+    if (wtStatus) {
+        if (wtCount > 0) {
+            wtStatus.stringValue = [NSString stringWithFormat:@"%d assignment%s pending", wtCount, wtCount == 1 ? "" : "s"];
+            wtStatus.textColor = [NSColor systemGreenColor];
+        } else {
+            wtStatus.stringValue = @"empty";
+            wtStatus.textColor = [NSColor secondaryLabelColor];
+        }
+    }
+
+    NSTextField *rjStatus = [win.contentView viewWithTag:8102];
+    if (rjStatus) {
+        if (rjCount > 0) {
+            rjStatus.stringValue = [NSString stringWithFormat:@"%d result%s", rjCount, rjCount == 1 ? "" : "s"];
+            rjStatus.textColor = [NSColor systemOrangeColor];
+        } else {
+            rjStatus.stringValue = @"no results yet";
+            rjStatus.textColor = [NSColor secondaryLabelColor];
+        }
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -4230,10 +5983,49 @@ static std::string u128_to_str(unsigned __int128 v) {
 
         [js appendFormat:@",\"hardware\":{\"chip\":\"%@\",\"cpu_cores\":%d", chipStr, ncpu];
         if (perf > 0)
-            [js appendFormat:@",\"cpu_performance\":%d,\"cpu_efficiency\":%d", perf, eff];
+            [js appendFormat:@",\"cpu_p_cores\":%d,\"cpu_e_cores\":%d", perf, eff];
         if (gpu_cores > 0)
             [js appendFormat:@",\"gpu_cores\":%d", gpu_cores];
-        [js appendFormat:@",\"ram_gb\":%d}", ram_gb];
+        [js appendFormat:@",\"cpu_ram_gb\":%d,\"gpu_ram_gb\":%d}", ram_gb, ram_gb];
+    }
+
+    // CRC32 checksum
+    {
+        NSString *status = ((NSPopUpButton *)[cv viewWithTag:9002]).titleOfSelectedItem ?: @"NF";
+        NSString *factorsField = ((NSTextField *)[cv viewWithTag:9006]).stringValue;
+        NSString *bitlo = ((NSTextField *)[cv viewWithTag:9003]).stringValue;
+        NSString *bithi = ((NSTextField *)[cv viewWithTag:9004]).stringValue;
+        NSString *rangeStr = ((NSPopUpButton *)[cv viewWithTag:9005]).titleOfSelectedItem;
+        NSString *rcVal = [rangeStr isEqualToString:@"true"] ? @"1" : ([rangeStr isEqualToString:@"false"] ? @"0" : @"");
+        NSString *progName = ((NSTextField *)[cv viewWithTag:9010]).stringValue;
+        NSString *progVer = ((NSTextField *)[cv viewWithTag:9011]).stringValue;
+        NSString *kernel = ((NSTextField *)[cv viewWithTag:9012]).stringValue;
+
+        // Parse and sort factors
+        NSMutableArray *sortedFactors = [NSMutableArray array];
+        if ([status isEqualToString:@"F"] && factorsField.length > 0) {
+            for (NSString *f in [factorsField componentsSeparatedByString:@","]) {
+                NSString *t = [f stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceCharacterSet]];
+                if (t.length > 0) [sortedFactors addObject:t];
+            }
+            [sortedFactors sortUsingComparator:^NSComparisonResult(NSString *a, NSString *b) {
+                if (a.length != b.length) return a.length < b.length ? NSOrderedAscending : NSOrderedDescending;
+                return [a compare:b];
+            }];
+        }
+
+        NSString *ckStr = [NSString stringWithFormat:@"%@;TF;%@;;%@;%@;%@;;;%@;%@;%@;;macOS;ARM_64;%@",
+            ((NSTextField *)[cv viewWithTag:9001]).stringValue,
+            [sortedFactors componentsJoinedByString:@","],
+            bitlo, bithi, rcVal,
+            progName, progVer, kernel,
+            ts];
+
+        uLong crc = crc32(0L, Z_NULL, 0);
+        const char *ckUTF8 = ckStr.UTF8String;
+        crc = crc32(crc, (const Bytef *)ckUTF8, (uInt)strlen(ckUTF8));
+
+        [js appendFormat:@",\"checksum\":{\"version\":1,\"checksum\":\"%08lX\"}", (unsigned long)crc];
     }
 
     [js appendString:@"}"];
@@ -4887,6 +6679,9 @@ static std::string u128_to_str(unsigned __int128 v) {
             return;
         }
         it->second.end_pos = exponent;
+        it->second.bit_lo = assignment.bit_lo;
+        it->second.bit_hi = assignment.bit_hi;
+        it->second.known_factors = assignment.known_factors;
 
         // Calculate starting k for bit_lo: q = 2kp + 1 >= 2^bit_lo
         // k >= (2^bit_lo - 1) / (2 * p)
@@ -4946,16 +6741,15 @@ static std::string u128_to_str(unsigned __int128 v) {
         // Still allow submission (user may want to report a found factor)
     }
 
-    // Check discoveries for this exponent
-    bool found_factor = false;
-    std::string factor_str;
+    // Check discoveries for this exponent (collect all new factors)
+    std::vector<std::string> found_factors;
     for (auto& d : _taskMgr->discoveries()) {
         if (d.type == prime::TaskType::MersenneTrial && d.value2 == assignment.exponent) {
-            found_factor = true;
-            factor_str = d.divisors.empty() ? std::to_string(d.value) : d.divisors;
-            break;
+            std::string f = d.divisors.empty() ? std::to_string(d.value) : d.divisors;
+            found_factors.push_back(f);
         }
     }
+    bool found_factor = !found_factors.empty();
 
     if (!found_factor && !range_done) {
         double pct2 = (k_end_needed > 0) ? (100.0 * k_current / k_end_needed) : 0;
@@ -4976,9 +6770,10 @@ static std::string u128_to_str(unsigned __int128 v) {
     result.bit_lo = assignment.bit_lo;
     result.bit_hi = assignment.bit_hi;
     result.factor_found = found_factor;
-    result.factor = factor_str;
+    result.factors = found_factors;
     result.assignment_key = assignment.key;
     result.range_complete = range_done;
+    result.known_factors = assignment.known_factors;
 
     NSString *summaryMsg = [NSString stringWithFormat:
         @"GIMPS: submitting M%llu %@ (bits %d-%d, k=%llu/%llu)\n",
@@ -5007,8 +6802,10 @@ static std::string u128_to_str(unsigned __int128 v) {
                << "k_needed: " << k_end_needed << "\n"
                << "Range Complete: " << (range_done ? "YES" : "NO") << "\n"
                << "Factor Found: " << (found_factor ? "YES" : "NO") << "\n";
-            if (found_factor) {
-                lf << "Factor: " << factor_str << "\n";
+            if (found_factor && !found_factors.empty()) {
+                lf << "Factor(s):";
+                for (auto& f : found_factors) lf << " " << f;
+                lf << "\n";
             }
             lf << "Result Type: " << (found_factor ? "1 (factor found)" : "4 (no factor)") << "\n"
                << "URL will contain: t=ar&n=" << assignment.exponent

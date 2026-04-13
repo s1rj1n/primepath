@@ -9,6 +9,7 @@
 #include <iomanip>
 #include <sys/utsname.h>
 #include <sys/sysctl.h>
+#include <zlib.h>
 
 namespace primenet {
 
@@ -336,8 +337,8 @@ bool PrimeNetClient::submit_result(const TFResult& result) {
         "&sf=" + std::to_string((int)result.bit_lo) +
         "&ef=" + std::to_string((int)result.bit_hi);
 
-    if (result.factor_found) {
-        url += "&f=" + result.factor;
+    if (result.factor_found && !result.factors.empty()) {
+        url += "&f=" + result.factors.front();
     }
 
     url += "&m=" + url_encode(json) + "&ss=19191919&sh=ABCDABCDABCDABCDABCDABCDABCDABCD";
@@ -464,6 +465,21 @@ std::string PrimeNetClient::build_result_json(const TFResult& result) {
 
     int gpu_cores = detect_gpu_core_count();
 
+    // Sort factors ascending for JSON and checksum
+    std::vector<std::string> sorted_factors = result.factors;
+    std::sort(sorted_factors.begin(), sorted_factors.end(),
+        [](const std::string& a, const std::string& b) {
+            if (a.size() != b.size()) return a.size() < b.size();
+            return a < b;
+        });
+
+    std::vector<std::string> sorted_known = result.known_factors;
+    std::sort(sorted_known.begin(), sorted_known.end(),
+        [](const std::string& a, const std::string& b) {
+            if (a.size() != b.size()) return a.size() < b.size();
+            return a < b;
+        });
+
     std::ostringstream js;
     js << "{\"timestamp\":\"" << ts << "\""
        << ",\"exponent\":" << result.exponent
@@ -473,8 +489,22 @@ std::string PrimeNetClient::build_result_json(const TFResult& result) {
        << ",\"bithi\":" << (int)result.bit_hi
        << ",\"rangecomplete\":" << (result.range_complete ? "true" : "false");
 
-    if (result.factor_found) {
-        js << ",\"factors\":[\"" << result.factor << "\"]";
+    if (result.factor_found && !sorted_factors.empty()) {
+        js << ",\"factors\":[";
+        for (size_t i = 0; i < sorted_factors.size(); i++) {
+            if (i > 0) js << ",";
+            js << "\"" << sorted_factors[i] << "\"";
+        }
+        js << "]";
+    }
+
+    if (!sorted_known.empty()) {
+        js << ",\"known-factors\":[";
+        for (size_t i = 0; i < sorted_known.size(); i++) {
+            if (i > 0) js << ",";
+            js << "\"" << sorted_known[i] << "\"";
+        }
+        js << "]";
     }
 
     js << ",\"program\":{\"name\":\"PrimePath\",\"version\":\"1.2.1\",\"kernel\":\"Metal96bit\"}"
@@ -495,13 +525,53 @@ std::string PrimeNetClient::build_result_json(const TFResult& result) {
     js << ",\"hardware\":{\"chip\":\"" << chip_str << "\""
        << ",\"cpu_cores\":" << ncpu;
     if (perf_cores > 0)
-        js << ",\"cpu_performance\":" << perf_cores
-           << ",\"cpu_efficiency\":" << eff_cores;
+        js << ",\"cpu_p_cores\":" << perf_cores
+           << ",\"cpu_e_cores\":" << eff_cores;
     if (gpu_cores > 0)
         js << ",\"gpu_cores\":" << gpu_cores;
-    js << ",\"ram_gb\":" << ram_gb
-       << "}}";
+    js << ",\"cpu_ram_gb\":" << ram_gb
+       << ",\"gpu_ram_gb\":" << ram_gb
+       << "}";
 
+    // CRC32 checksum (anti-tampering)
+    // Build semicolon-separated string per James's spec:
+    // exponent;worktype;factors;known-factors;bitlo;bithi;rangecomplete;
+    // fft-length;error-code;program.name;program.version;program.kernel;
+    // program.details;os.os;os.architecture;timestamp
+    {
+        std::ostringstream ck;
+        ck << result.exponent << ";TF;";
+        // factors: comma-separated ascending
+        for (size_t i = 0; i < sorted_factors.size(); i++) {
+            if (i > 0) ck << ",";
+            ck << sorted_factors[i];
+        }
+        ck << ";";
+        // known-factors: comma-separated ascending
+        for (size_t i = 0; i < sorted_known.size(); i++) {
+            if (i > 0) ck << ",";
+            ck << sorted_known[i];
+        }
+        ck << ";"
+           << (int)result.bit_lo << ";" << (int)result.bit_hi << ";"
+           << (result.range_complete ? "1" : "0") << ";"
+           << ";" // fft-length (empty for TF)
+           << ";" // error-code (empty for TF)
+           << "PrimePath;1.2.1;Metal96bit;"
+           << ";" // program.details (empty)
+           << "macOS;ARM_64;"
+           << ts;
+
+        std::string ck_str = ck.str();
+        uLong crc = crc32(0L, Z_NULL, 0);
+        crc = crc32(crc, (const Bytef*)ck_str.data(), (uInt)ck_str.size());
+
+        char hex[9];
+        snprintf(hex, sizeof(hex), "%08lX", (unsigned long)crc);
+        js << ",\"checksum\":{\"version\":1,\"checksum\":\"" << hex << "\"}";
+    }
+
+    js << "}";
     return js.str();
 }
 
@@ -618,7 +688,27 @@ static bool parse_worktodo_line(const std::string& raw, Assignment& out) {
     if (line.compare(0, prefix.size(), prefix) != 0) return false;
     std::string rest = line.substr(prefix.size());
 
-    // Split on commas
+    // Extract known-factors if trailing quoted string present:
+    // Factor=AID,exp,lo,hi,"factor1,factor2"
+    std::vector<std::string> known;
+    auto qstart = rest.find('"');
+    if (qstart != std::string::npos) {
+        auto qend = rest.find('"', qstart + 1);
+        if (qend != std::string::npos) {
+            std::string kf_str = rest.substr(qstart + 1, qend - qstart - 1);
+            std::istringstream kfs(kf_str);
+            std::string kf;
+            while (std::getline(kfs, kf, ',')) {
+                std::string t = trim(kf);
+                if (!t.empty()) known.push_back(t);
+            }
+        }
+        // Remove the quoted portion (and preceding comma) from rest
+        size_t comma = (qstart > 0 && rest[qstart - 1] == ',') ? qstart - 1 : qstart;
+        rest = rest.substr(0, comma);
+    }
+
+    // Split remaining on commas
     std::vector<std::string> parts;
     std::string tok;
     std::istringstream ss(rest);
@@ -626,25 +716,28 @@ static bool parse_worktodo_line(const std::string& raw, Assignment& out) {
 
     if (parts.size() < 3) return false;
 
-    // Detect AID: 32 hex chars, not all digits
+    // Detect AID: 32 hex chars or "N/A"
     bool has_aid = false;
     if (parts.size() >= 4) {
         const std::string& p0 = parts[0];
-        if (p0.size() == 32) {
+        if (p0 == "N/A") {
+            // N/A = no assignment, skip AID entirely
+            has_aid = true;
+            out.key = "";
+        } else if (p0.size() == 32) {
             bool all_hex = true;
             for (char c : p0) {
                 if (!isxdigit((unsigned char)c)) { all_hex = false; break; }
             }
-            if (all_hex) has_aid = true;
+            if (all_hex) {
+                has_aid = true;
+                out.key = p0;
+            }
         }
     }
 
-    size_t idx = 0;
-    if (has_aid) {
-        out.key = parts[idx++];
-    } else {
-        out.key = "";
-    }
+    size_t idx = has_aid ? 1 : 0;
+    if (!has_aid) out.key = "";
 
     if (idx + 2 >= parts.size()) return false;
     try {
@@ -654,6 +747,7 @@ static bool parse_worktodo_line(const std::string& raw, Assignment& out) {
     } catch (...) {
         return false;
     }
+    out.known_factors = known;
     out.valid = true;
     return true;
 }

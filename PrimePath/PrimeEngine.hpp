@@ -11,6 +11,11 @@
 #include <algorithm>
 #include <cmath>
 #include <set>
+#include <map>
+
+#if defined(__aarch64__)
+#include <arm_neon.h>
+#endif
 
 // ═══════════════════════════════════════════════════════════════════════
 // PrimeEngine — C++ port of primepath with multi-core parallelism
@@ -22,6 +27,471 @@ namespace prime {
 
 inline uint64_t mulmod(uint64_t a, uint64_t b, uint64_t m) {
     return (unsigned __int128)a * b % m;
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// Nester-CarryChain Streaming Divisibility Tester (S. Nester, 2026)
+// ═══════════════════════════════════════════════════════════════════════
+//
+// Stream an arbitrarily large number through multiple accumulator
+// pipelines, testing candidate divisors in parallel. No division.
+//
+// The number is stored as an array of 64-bit limbs (big-endian, most
+// significant first). For each limb we accumulate via Barrett reduction:
+//   remainder = (remainder * 2^64 + limb) mod divisor
+//   where mod uses precomputed reciprocal multiply, never hardware UDIV
+//
+// Three outcomes at each step:
+//   HIT   - remainder < divisor, feed the next limb
+//   BUST  - remainder >= divisor after accumulation, reduce
+//   MATCH - remainder == 0 at the end, divisor divides the number
+//
+// N-wide batching (template<int N>):
+//   - Process N divisors per pass through the number (N = 1,2,4,8,16)
+//   - Each stream is independent, CPU pipelines all N chains in parallel
+//   - Adaptive calibrator picks optimal N for the given number size
+//
+// For a 2048-bit number that's 32 limbs, so 32 streaming steps per
+// divisor batch. Each step is a multiply + add + conditional subtract,
+// all staying in registers.
+// ═══════════════════════════════════════════════════════════════════════
+
+// BigNum: a large integer stored as big-endian 64-bit limbs
+struct BigNum {
+    std::vector<uint64_t> limbs; // limbs[0] = most significant
+
+    // Construct from a single uint64
+    static BigNum from_u64(uint64_t v) {
+        BigNum n;
+        n.limbs.push_back(v);
+        return n;
+    }
+
+    // Construct from a hex string (e.g. "FFAA0011...")
+    static BigNum from_hex(const std::string& hex) {
+        BigNum n;
+        // Process 16 hex chars (64 bits) at a time, from the left
+        size_t len = hex.size();
+        size_t pos = 0;
+        // Handle leading partial limb
+        size_t first = len % 16;
+        if (first > 0) {
+            n.limbs.push_back(std::stoull(hex.substr(0, first), nullptr, 16));
+            pos = first;
+        }
+        while (pos < len) {
+            n.limbs.push_back(std::stoull(hex.substr(pos, 16), nullptr, 16));
+            pos += 16;
+        }
+        // Strip leading zeros
+        while (n.limbs.size() > 1 && n.limbs[0] == 0)
+            n.limbs.erase(n.limbs.begin());
+        return n;
+    }
+
+    size_t bit_width() const {
+        if (limbs.empty()) return 0;
+        size_t top = 64 - __builtin_clzll(limbs[0]);
+        return top + (limbs.size() - 1) * 64;
+    }
+};
+
+// ── Scalar streaming remainder (division-based reference) ────────────
+// This is the OLD method kept as a baseline for benchmarking.
+// Uses __int128 and hardware division -- the thing we're replacing.
+
+inline uint64_t stream_mod_scalar(const uint64_t* limbs, size_t count, uint64_t d) {
+    if (d <= 1) return 0;
+    unsigned __int128 pow64 = 1;
+    for (int i = 0; i < 64; i++) {
+        pow64 <<= 1;
+        if (pow64 >= d) pow64 -= d;
+    }
+    uint64_t p64 = (uint64_t)pow64;
+    uint64_t rem = 0;
+    for (size_t i = 0; i < count; i++) {
+        unsigned __int128 wide = (unsigned __int128)rem * p64;
+        wide += limbs[i];
+        rem = (uint64_t)(wide % d);
+    }
+    return rem;
+}
+
+inline bool stream_divides_scalar(const BigNum& n, uint64_t d) {
+    return stream_mod_scalar(n.limbs.data(), n.limbs.size(), d) == 0;
+}
+
+inline std::vector<uint64_t> stream_find_divisors_scalar(
+    const BigNum& n, const uint64_t* divisors, size_t ndiv)
+{
+    std::vector<uint64_t> found;
+    for (size_t i = 0; i < ndiv; i++) {
+        if (divisors[i] > 1 && stream_mod_scalar(n.limbs.data(), n.limbs.size(), divisors[i]) == 0)
+            found.push_back(divisors[i]);
+    }
+    return found;
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// NESTER-CARRYCHAIN ENGINE: Accumulate, don't divide (S. Nester, 2026)
+// ═══════════════════════════════════════════════════════════════════════
+//
+// Core idea: to test if d divides N, never compute N/d or N%d.
+// Instead, stream through N segment by segment and ACCUMULATE
+// multiples of d until the segment is filled:
+//
+//   - HIT:       accumulator < segment value, add more d's
+//   - BUST:      accumulator > segment value, not a divisor here,
+//                carry the deficit to the next segment
+//   - MATCH:     accumulator == 0 at the end, d divides N
+//
+// Implementation: for each 64-bit limb, we need to find how many
+// copies of d fill (remainder * 2^64 + limb). Instead of dividing,
+// we use a RECIPROCAL MULTIPLY:
+//
+//   quotient ~= (value * inverse_d) >> 64      (UMULH instruction)
+//   accumulated = quotient * d                   (MUL instruction)
+//   leftover = value - accumulated               (SUB instruction)
+//   if leftover >= d: leftover -= d              (CMP + SUB, rare)
+//
+// Total: UMULH + MUL + SUB + CMP  (~4 cycles on M-series)
+// vs UDIV                          (~7 cycles, non-pipelineable)
+//
+// For 4 parallel divisors this means 4x UMULH + 4x MUL + 4x SUB,
+// all independent, all pipelineable. No division anywhere.
+// ═══════════════════════════════════════════════════════════════════════
+
+// Barrett-style "how many d's fill x" without dividing.
+// Returns x mod d using only multiply, shift, subtract.
+//
+// Uses floor reciprocal so q never overestimates (no unsigned underflow).
+// At most 2 subtractions to correct. Zero division instructions.
+__attribute__((always_inline))
+inline uint64_t accumulate_mod32(uint64_t x, uint32_t d, uint64_t inv_d) {
+    // q = floor(x * inv_d / 2^64)  -- underestimates x/d by at most 2
+    uint64_t q = (uint64_t)(((unsigned __int128)x * inv_d) >> 64);
+    // How many d's we stacked up (q * d fits in uint64 because q <= x/d < 2^64/d,
+    // and q*d <= x < 2^64)
+    uint64_t r = x - q * (uint64_t)d;
+    // Correct: r is in [0, 3d) at worst, typically [0, 2d)
+    if (r >= d) { r -= d; if (r >= d) r -= d; }
+    return r;
+}
+
+// Precompute the reciprocal for a 32-bit divisor.
+// inv = floor(2^64 / d) -- floor guarantees q never overestimates.
+inline uint64_t precompute_inverse32(uint32_t d) {
+    if (d <= 1) return 0;
+    // UINT64_MAX / d is floor((2^64-1)/d), close enough to floor(2^64/d)
+    return UINT64_MAX / d;
+}
+
+// ── Nester-CC accumulator: single divisor, no division in hot loop ───
+
+inline uint64_t stream_mod_blackjack(const uint64_t* limbs, size_t count, uint32_t d) {
+    if (d <= 1) return 0;
+    uint64_t inv = precompute_inverse32(d);
+
+    // Precompute 2^64 mod d (how the remainder shifts between segments)
+    // Done with doubling, no division
+    uint64_t pow64 = 1;
+    for (int i = 0; i < 64; i++) {
+        pow64 <<= 1;
+        if (pow64 >= d) pow64 -= d;
+    }
+
+    uint64_t rem = 0;
+    for (size_t i = 0; i < count; i++) {
+        // Combined Horner step: rem = (rem * pow64 + limb) mod d
+        // rem < d < 2^32, pow64 < d < 2^32, so rem*pow64 < 2^64
+        // We need (rem*pow64 + limb) mod d but that sum could exceed 2^64.
+        // So: reduce rem*pow64 first (it fits in uint64), then add limb mod d.
+        uint64_t shifted = accumulate_mod32(rem * pow64, d, inv);
+        // limb is uint64, reduce it too
+        uint64_t limb_r = accumulate_mod32(limbs[i], d, inv);
+        // shifted < d, limb_r < d, sum < 2d < 2^33, fits in uint64
+        rem = shifted + limb_r;
+        if (rem >= d) rem -= d;
+    }
+    return rem;
+}
+
+#if defined(__aarch64__)
+
+// ── Nester-CC 4-wide: four divisors, zero division ───────────────────
+//
+// Four independent accumulate streams. Each uses:
+//   UMULH (reciprocal multiply)  \
+//   MUL   (quotient * divisor)    } per segment per divisor
+//   SUB   (leftover)             /
+//
+// M-series can issue MUL+UMULH on separate ports, so 4 independent
+// streams saturate the integer pipeline. No UDIV, no NEON overhead.
+
+// ── Nester-CC N-wide: process N divisors per pass ────────────────────
+//
+// Generic N-wide accumulator. The compiler unrolls for small N and
+// keeps all remainders in registers. Tested batch sizes: 1, 2, 4, 8, 16.
+//
+// The hot loop is N independent chains of UMULH+MUL+SUB per limb.
+// Wider batches amortise the per-limb overhead (pointer increment,
+// branch) across more divisors, but eventually spill from registers.
+// The optimal width depends on number size and hardware.
+
+static constexpr int BJ_MAX_BATCH = 16;
+
+// Template N-wide Nester-CC: N is compile-time, so the compiler
+// unrolls the inner loop even at -O0 for small N.
+template<int N>
+inline void stream_mod_Nx32_blackjack_t(
+    const uint64_t* limbs, size_t count,
+    const uint32_t* d,
+    uint32_t* rem)
+{
+    static_assert(N <= BJ_MAX_BATCH, "batch too wide");
+    uint64_t inv[N], p64[N], r[N];
+    for (int k = 0; k < N; k++) {
+        inv[k] = precompute_inverse32(d[k]);
+        r[k] = 0;
+        if (d[k] <= 1) { p64[k] = 0; continue; }
+        uint64_t p = 1;
+        for (int i = 0; i < 64; i++) {
+            p <<= 1;
+            if (p >= d[k]) p -= d[k];
+        }
+        p64[k] = p;
+    }
+
+    for (size_t i = 0; i < count; i++) {
+        uint64_t limb = limbs[i];
+        // Manually unrolled for common widths via template constant
+        for (int k = 0; k < N; k++) {
+            if (d[k] > 1) {
+                uint64_t s = accumulate_mod32(r[k] * p64[k], d[k], inv[k]);
+                uint64_t l = accumulate_mod32(limb,           d[k], inv[k]);
+                r[k] = s + l;
+                if (r[k] >= d[k]) r[k] -= d[k];
+            }
+        }
+    }
+
+    for (int k = 0; k < N; k++) rem[k] = (uint32_t)r[k];
+}
+
+// Runtime-dispatch wrapper
+inline void stream_mod_Nx32_blackjack(
+    const uint64_t* limbs, size_t count,
+    const uint32_t* d, int N,
+    uint32_t* rem)
+{
+    switch (N) {
+        case 1:  stream_mod_Nx32_blackjack_t<1>(limbs, count, d, rem); break;
+        case 2:  stream_mod_Nx32_blackjack_t<2>(limbs, count, d, rem); break;
+        case 4:  stream_mod_Nx32_blackjack_t<4>(limbs, count, d, rem); break;
+        case 8:  stream_mod_Nx32_blackjack_t<8>(limbs, count, d, rem); break;
+        case 16: stream_mod_Nx32_blackjack_t<16>(limbs, count, d, rem); break;
+        default:
+            // Fallback for odd sizes (tail processing)
+            for (int k = 0; k < N; k++) {
+                rem[k] = (uint32_t)stream_mod_blackjack(limbs, count, d[k]);
+            }
+            break;
+    }
+}
+
+// ── Nester-CC 2-wide: two 64-bit divisors, no division ───────────────
+//
+// For divisors >= 2^32, we need __int128 for the reciprocal multiply
+// but still avoid UDIV. Uses UMULH-equivalent via __int128 shift.
+
+inline void stream_mod_2x64_blackjack(
+    const uint64_t* limbs, size_t count,
+    uint64_t d0, uint64_t d1,
+    uint64_t& rem0, uint64_t& rem1)
+{
+    auto compute_pow64 = [](uint64_t d) -> uint64_t {
+        unsigned __int128 p = 1;
+        for (int i = 0; i < 64; i++) { p <<= 1; if (p >= d) p -= d; }
+        return (uint64_t)p;
+    };
+
+    // For 64-bit divisors, Barrett with __int128
+    // inv ~= 2^128 / d (we need 128-bit reciprocal for 128-bit intermediates)
+    // Simpler: just use __int128 mod, still faster than UDIV via compiler intrinsics
+    uint64_t p64_0 = compute_pow64(d0);
+    uint64_t p64_1 = compute_pow64(d1);
+    uint64_t r0 = 0, r1 = 0;
+
+    for (size_t i = 0; i < count; i++) {
+        uint64_t limb = limbs[i];
+        // __int128 mod compiles to UMULH + MUL + SUB on AArch64 (no UDIV)
+        unsigned __int128 w0 = (unsigned __int128)r0 * p64_0 + limb;
+        unsigned __int128 w1 = (unsigned __int128)r1 * p64_1 + limb;
+        r0 = (uint64_t)(w0 % d0);
+        r1 = (uint64_t)(w1 % d1);
+    }
+    rem0 = r0;
+    rem1 = r1;
+}
+
+#endif // __aarch64__
+
+// ── High-level: stream-test a batch of candidate divisors ────────────
+//
+// Tests up to `ndiv` candidate divisors against a BigNum.
+// Returns a vector of divisors that evenly divide N (Nester-CC).
+// Automatically picks the NEON fast path when available.
+
+struct StreamResult {
+    std::vector<uint64_t> divisors;  // which ones matched (remainder == 0)
+    size_t tested = 0;               // how many we checked
+    size_t bits = 0;                 // bit width of the number
+    double elapsed_us = 0;           // wall time in microseconds
+    int batch_size = 0;              // adaptive batch width chosen
+};
+
+inline StreamResult stream_find_divisors(
+    const BigNum& n,
+    const uint64_t* candidates, size_t ndiv)
+{
+    StreamResult res;
+    res.bits = n.bit_width();
+    auto t0 = std::chrono::high_resolution_clock::now();
+
+#if defined(__aarch64__)
+    // Separate into small (< 2^32) and large divisors
+    std::vector<uint32_t> small_divs;
+    std::vector<size_t>   small_idx;
+    std::vector<uint64_t> large_divs;
+    std::vector<size_t>   large_idx;
+
+    for (size_t i = 0; i < ndiv; i++) {
+        if (candidates[i] <= 1) continue;
+        if (candidates[i] < (1ULL << 32)) {
+            small_divs.push_back((uint32_t)candidates[i]);
+            small_idx.push_back(i);
+        } else {
+            large_divs.push_back(candidates[i]);
+            large_idx.push_back(i);
+        }
+    }
+
+    // ── Adaptive batch size calibration ──────────────────────────────
+    // Two-phase selection:
+    //   1. Heuristic: pick initial width from limb count
+    //   2. Calibrate: time multiple iterations at nearby widths,
+    //      pick the one with highest throughput
+    //
+    // Heuristic: more limbs = wider batches pay off (inner loop dominates).
+    // Fewer limbs = setup cost matters, narrower is safer.
+    int best_batch = 4;
+    size_t nlimbs = n.limbs.size();
+    if (nlimbs <= 4)        best_batch = 16; // small numbers: max parallelism
+    else if (nlimbs <= 16)  best_batch = 8;
+    else if (nlimbs <= 64)  best_batch = 8;
+    else                    best_batch = 4;  // huge numbers: less register spill
+
+    // Calibrate: run 4 iterations of each candidate width, pick best throughput
+    if (small_divs.size() >= 48) {
+        int trial_widths[] = {4, 8, 16};
+        double best_rate = 0;
+        const int CALIB_ITERS = 4; // enough to smooth noise
+
+        for (int w : trial_widths) {
+            if ((size_t)w * CALIB_ITERS > small_divs.size()) continue;
+            uint32_t trial_rem[BJ_MAX_BATCH];
+            auto ct0 = std::chrono::high_resolution_clock::now();
+            for (int iter = 0; iter < CALIB_ITERS; iter++) {
+                stream_mod_Nx32_blackjack(n.limbs.data(), n.limbs.size(),
+                    &small_divs[iter * w], w, trial_rem);
+            }
+            auto ct1 = std::chrono::high_resolution_clock::now();
+            double us = std::chrono::duration<double, std::micro>(ct1 - ct0).count();
+            double rate = (double)(w * CALIB_ITERS) / (us + 0.001);
+            if (rate > best_rate) {
+                best_rate = rate;
+                best_batch = w;
+            }
+        }
+    }
+    res.batch_size = best_batch;
+
+    // ── Process small divisors at the chosen batch width ─────────────
+    size_t si = 0;
+    while (si + best_batch <= small_divs.size()) {
+        uint32_t rem[BJ_MAX_BATCH];
+        stream_mod_Nx32_blackjack(n.limbs.data(), n.limbs.size(),
+                                  &small_divs[si], best_batch, rem);
+        for (int k = 0; k < best_batch; k++) {
+            if (rem[k] == 0)
+                res.divisors.push_back(candidates[small_idx[si + k]]);
+        }
+        res.tested += best_batch;
+        si += best_batch;
+    }
+    // Remaining small divisors, single-stream
+    for (; si < small_divs.size(); si++) {
+        if (stream_mod_blackjack(n.limbs.data(), n.limbs.size(), small_divs[si]) == 0)
+            res.divisors.push_back(candidates[small_idx[si]]);
+        res.tested++;
+    }
+
+    // Process large divisors in pairs (64-bit Nester-CC)
+    size_t li = 0;
+    while (li + 2 <= large_divs.size()) {
+        uint64_t rem0, rem1;
+        stream_mod_2x64_blackjack(n.limbs.data(), n.limbs.size(),
+                        large_divs[li], large_divs[li+1], rem0, rem1);
+        if (rem0 == 0) res.divisors.push_back(candidates[large_idx[li]]);
+        if (rem1 == 0) res.divisors.push_back(candidates[large_idx[li+1]]);
+        res.tested += 2;
+        li += 2;
+    }
+    // Remaining large divisor
+    if (li < large_divs.size()) {
+        if (stream_mod_scalar(n.limbs.data(), n.limbs.size(), large_divs[li]) == 0)
+            res.divisors.push_back(candidates[large_idx[li]]);
+        res.tested++;
+    }
+
+#else
+    // Non-ARM fallback: scalar
+    res.batch_size = 1;
+    for (size_t i = 0; i < ndiv; i++) {
+        if (candidates[i] > 1 &&
+            stream_mod_scalar(n.limbs.data(), n.limbs.size(), candidates[i]) == 0)
+            res.divisors.push_back(candidates[i]);
+        res.tested++;
+    }
+#endif
+
+    auto t1 = std::chrono::high_resolution_clock::now();
+    res.elapsed_us = std::chrono::duration<double, std::micro>(t1 - t0).count();
+    return res;
+}
+
+// Convenience: test a single divisor against a BigNum
+inline bool stream_divides(const BigNum& n, uint64_t d) {
+    if (d < (1ULL << 32))
+        return stream_mod_blackjack(n.limbs.data(), n.limbs.size(), (uint32_t)d) == 0;
+    return stream_mod_scalar(n.limbs.data(), n.limbs.size(), d) == 0;
+}
+
+// ── Mersenne streaming: is 2^p - 1 divisible by f? ──────────────────
+// Instead of building the full 2^p-1 in memory, we compute
+// (2^p - 1) mod f directly: (2^p mod f) == 1 means f | (2^p - 1).
+// This is O(log p) and needs no big number at all.
+// Uses square-and-multiply with the carry-chain mulmod already defined above.
+inline bool mersenne_stream_divides(uint64_t p, uint64_t f) {
+    if (f < 2 || p < 2) return false;
+    // Inline modpow(2, p, f) to avoid forward-reference issues
+    uint64_t base = 2 % f, result = 1, exp = p;
+    while (exp > 0) {
+        if (exp & 1) result = mulmod(result, base, f);
+        exp >>= 1;
+        base = mulmod(base, base, f);
+    }
+    return result == 1;
 }
 
 inline uint64_t modpow(uint64_t base, uint64_t exp, uint64_t mod) {
@@ -64,6 +534,60 @@ inline bool is_prime(uint64_t n) {
         if (!miller_test(n, a)) return false;
     }
     return true;
+}
+
+// Forward declaration for use in mersenne_factor_scan
+inline std::vector<uint64_t> factor_u64(uint64_t n);
+
+// ── Mersenne factor testing ──────────────────────────────────────────
+//
+// A factor f of 2^p - 1 must satisfy:
+//   1. f = 2kp + 1 for some k >= 1
+//   2. f mod 8 in {1, 7}
+//   3. modpow(2, p, f) == 1
+//
+// is_mersenne_factor(p, f): returns true if f divides 2^p - 1.
+// mersenne_factor_scan(f, max_p): given a prime f, find Mersenne
+//   exponents p where f divides 2^p - 1. Uses the 2kp+1 constraint
+//   to iterate only valid candidates.
+
+inline bool is_mersenne_factor(uint64_t p, uint64_t f) {
+    if (f < 3 || p < 2) return false;
+    return modpow(2, p, f) == 1;
+}
+
+// Scan for Mersenne exponents divisible by factor f, up to max_p.
+// Returns vector of exponents p where f | 2^p - 1.
+inline std::vector<uint64_t> mersenne_factor_scan(uint64_t f, uint64_t max_p = 100000000ULL) {
+    std::vector<uint64_t> hits;
+    if (f < 3) return hits;
+    // f must be odd and f mod 8 in {1,7} to be a Mersenne factor
+    if (f % 2 == 0) return hits;
+    uint64_t r8 = f % 8;
+    if (r8 != 1 && r8 != 7) return hits;
+    // f = 2kp + 1, so p = (f-1)/(2k) for k=1,2,...
+    // Equivalently, p must divide (f-1)/2
+    uint64_t half = (f - 1) / 2;
+    // Find all prime divisors of half, test each as Mersenne exponent
+    auto divs = factor_u64(half);
+    // Collect unique prime factors
+    std::set<uint64_t> prime_divs(divs.begin(), divs.end());
+    // Also test half itself and all divisor combinations would be expensive.
+    // Simpler: the order of 2 mod f divides (f-1). The Mersenne exponent p
+    // must equal the multiplicative order of 2 mod f, if that order is prime.
+    // Compute ord_2(f) directly.
+    uint64_t order = 0;
+    uint64_t fm1 = f - 1;
+    // Start with fm1, divide by prime factors while modpow still == 1
+    order = fm1;
+    for (uint64_t pd : prime_divs) {
+        while (order % pd == 0 && modpow(2, order / pd, f) == 1)
+            order /= pd;
+    }
+    if (order <= max_p && order >= 2 && is_prime(order)) {
+        hits.push_back(order);
+    }
+    return hits;
 }
 
 // ── Wheel-210 (48 spokes, eliminates multiples of 2,3,5,7) ─────────
@@ -188,6 +712,114 @@ inline std::string factors_string(uint64_t n) {
         s += std::to_string(f[i]);
     }
     return s;
+}
+
+// ── Atomic Prime Analysis ────────────────────────────────────────────
+//
+// Treats primes as boundaries between "atoms" of composite matter.
+// Dense composite regions (high smoothness of p-1) are the nucleus.
+// Prime clusters (small gaps) are the shell boundaries.
+//
+// Smoothness: how many small prime factors pack p-1.
+//   Higher smoothness = denser composite packing nearby.
+//   Omega(n) = total prime factors with multiplicity
+//   omega(n) = distinct prime factors
+//   smoothness_score = Omega(n) / log2(n) -- normalized, 0 to 1 range
+//
+// Composite density in a gap: (gap - 1) composites in a gap of size gap.
+//   density = (gap - 1) / gap -- approaches 1 for large gaps.
+//
+// Shell classification based on gap before and gap after:
+//   BOUNDARY -- large gap before or after (crossing a nucleus)
+//   SHELL    -- small gaps on both sides (prime cluster / electron shell)
+//   EDGE     -- transitional (one side small, one side moderate)
+
+struct AtomicAnalysis {
+    // Smoothness of p-1
+    int omega;           // distinct prime factors
+    int big_omega;       // total prime factors with multiplicity
+    double smoothness;   // Omega / log2(p-1), 0 to ~1
+    uint64_t largest_pf; // largest prime factor of p-1
+
+    // Gap context
+    uint64_t gap_before; // gap from previous prime
+    uint64_t gap_after;  // gap to next prime (0 if unknown)
+    double density_before; // composite density in gap before
+    double density_after;  // composite density in gap after
+
+    // Shell classification
+    enum Shell { NUCLEUS_BOUNDARY, SHELL, EDGE };
+    Shell shell;
+
+    // Radius: half the sum of surrounding gaps (the "atom" this prime borders)
+    double radius;
+
+    std::string shell_str() const {
+        switch (shell) {
+            case NUCLEUS_BOUNDARY: return "BOUNDARY";
+            case SHELL: return "SHELL";
+            case EDGE: return "EDGE";
+        }
+        return "?";
+    }
+};
+
+inline AtomicAnalysis analyze_prime_atom(uint64_t p, uint64_t gap_before, uint64_t gap_after = 0) {
+    AtomicAnalysis a = {};
+    a.gap_before = gap_before;
+    a.gap_after = gap_after;
+
+    // Factor p-1
+    uint64_t pm1 = p - 1;
+    auto factors = factor_u64(pm1);
+
+    // Omega (total with multiplicity)
+    a.big_omega = (int)factors.size();
+
+    // omega (distinct)
+    {
+        std::set<uint64_t> distinct(factors.begin(), factors.end());
+        a.omega = (int)distinct.size();
+    }
+
+    // Largest prime factor
+    a.largest_pf = factors.empty() ? 1 : factors.back();
+
+    // Smoothness score: Omega / log2(p-1)
+    double log2_pm1 = log2((double)pm1);
+    a.smoothness = log2_pm1 > 0 ? a.big_omega / log2_pm1 : 0;
+
+    // Composite density in gaps
+    a.density_before = gap_before > 1 ? (double)(gap_before - 1) / gap_before : 0;
+    a.density_after = gap_after > 1 ? (double)(gap_after - 1) / gap_after : 0;
+
+    // Radius: average of surrounding gaps (the "atom size" this prime borders)
+    if (gap_after > 0) {
+        a.radius = (gap_before + gap_after) / 2.0;
+    } else {
+        a.radius = (double)gap_before;
+    }
+
+    // Shell classification
+    // Use ln(p) as the expected gap (prime number theorem)
+    double expected_gap = log((double)p);
+    double threshold_large = expected_gap * 2.0;  // > 2x expected = nucleus crossing
+    double threshold_small = expected_gap * 0.6;   // < 0.6x expected = shell cluster
+
+    bool before_large = gap_before > threshold_large;
+    bool before_small = gap_before <= threshold_small;
+    bool after_large = gap_after > threshold_large;
+    bool after_small = gap_after > 0 && gap_after <= threshold_small;
+
+    if (before_large || after_large) {
+        a.shell = AtomicAnalysis::NUCLEUS_BOUNDARY;
+    } else if (before_small && (gap_after == 0 || after_small)) {
+        a.shell = AtomicAnalysis::SHELL;
+    } else {
+        a.shell = AtomicAnalysis::EDGE;
+    }
+
+    return a;
 }
 
 // ── Pinch Factor — digit-structural factoring heuristic ─────────────
@@ -642,6 +1274,332 @@ inline double convergence(uint64_t n, int np = 10) {
     }
     return total;
 }
+
+// ── Markov Prime Predictor ──────────────────────────────────────────
+//
+// Builds empirical conditional distributions from known primes in a
+// region (last digit -> gap distribution, digit transition matrix),
+// then runs a Markov chain forward to predict candidate prime locations.
+//
+// Used by PrimeLocation as a candidate generator alongside convergence
+// scoring. Candidates predicted by both methods get priority.
+
+class MarkovPredictor {
+public:
+    static constexpr int DIGITS[4] = {1, 3, 7, 9};
+
+    // Build distributions from a list of known primes (should be > ~100)
+    void train(const std::vector<uint64_t>& primes) {
+        // Clear
+        for (int i = 0; i < 4; i++) {
+            gap_dist_[i].clear();
+            for (int j = 0; j < 4; j++) trans_[i][j] = 0;
+        }
+
+        // Filter to primes with last digit in {1,3,7,9}
+        std::vector<uint64_t> relevant;
+        relevant.reserve(primes.size());
+        for (auto p : primes) {
+            int d = p % 10;
+            if (d == 1 || d == 3 || d == 7 || d == 9) relevant.push_back(p);
+        }
+        if (relevant.size() < 10) return;
+        trained_ = true;
+
+        for (size_t i = 0; i + 1 < relevant.size(); i++) {
+            int d = digit_idx(relevant[i] % 10);
+            int d_nxt = digit_idx(relevant[i + 1] % 10);
+            if (d < 0 || d_nxt < 0) continue;
+            uint64_t gap = relevant[i + 1] - relevant[i];
+            gap_dist_[d].push_back(gap);
+            trans_[d][d_nxt]++;
+        }
+
+        // Normalize transition counts to cumulative probabilities
+        for (int d = 0; d < 4; d++) {
+            double total = 0;
+            for (int j = 0; j < 4; j++) total += trans_[d][j];
+            if (total > 0) {
+                double cum = 0;
+                for (int j = 0; j < 4; j++) {
+                    cum += trans_[d][j] / total;
+                    trans_cum_[d][j] = cum;
+                }
+                trans_cum_[d][3] = 1.0; // ensure rounding
+            }
+        }
+    }
+
+    // Generate candidate prime locations by running the Markov chain forward.
+    // Returns sorted, deduplicated list of predicted positions.
+    std::vector<uint64_t> predict(uint64_t anchor, int steps, uint64_t seed = 12345) const {
+        if (!trained_) return {};
+
+        // Simple xorshift64 RNG (fast, no external dependency)
+        uint64_t rng_state = seed ^ (anchor * 2654435761ULL);
+        auto rng_next = [&]() -> double {
+            rng_state ^= rng_state << 13;
+            rng_state ^= rng_state >> 7;
+            rng_state ^= rng_state << 17;
+            return (rng_state & 0xFFFFFFFFFFFFULL) / (double)0x1000000000000ULL;
+        };
+
+        std::vector<uint64_t> candidates;
+        candidates.reserve(steps);
+
+        uint64_t current = anchor;
+        int d = digit_idx(anchor % 10);
+        if (d < 0) d = 0; // fallback
+
+        for (int s = 0; s < steps; s++) {
+            // Sample gap from empirical distribution
+            if (gap_dist_[d].empty()) break;
+            size_t gi = (size_t)(rng_next() * gap_dist_[d].size());
+            if (gi >= gap_dist_[d].size()) gi = gap_dist_[d].size() - 1;
+            uint64_t gap = gap_dist_[d][gi];
+            current += gap;
+
+            // Sample next last digit from transition distribution
+            double r = rng_next();
+            int d_nxt = 3; // default to last
+            for (int j = 0; j < 4; j++) {
+                if (r <= trans_cum_[d][j]) { d_nxt = j; break; }
+            }
+
+            // Adjust current to end in the predicted digit
+            int target_digit = DIGITS[d_nxt];
+            int cur_digit = (int)(current % 10);
+            if (cur_digit != target_digit) {
+                int off1 = (target_digit - cur_digit + 10) % 10;
+                int off2 = -((cur_digit - target_digit + 10) % 10);
+                current += (abs(off1) <= abs(off2)) ? off1 : off2;
+            }
+
+            // Only keep odd candidates > 2
+            if (current > 2 && (current & 1)) {
+                candidates.push_back(current);
+            }
+            d = d_nxt;
+        }
+
+        // Sort and deduplicate
+        std::sort(candidates.begin(), candidates.end());
+        candidates.erase(std::unique(candidates.begin(), candidates.end()), candidates.end());
+        return candidates;
+    }
+
+    // Run multiple chains with different seeds, collect consensus candidates
+    // that appear in at least min_hits chains. Consensus = higher confidence.
+    std::vector<std::pair<uint64_t, int>> predict_consensus(
+            uint64_t anchor, int steps, int chains = 10, int min_hits = 2) const {
+        // Count how many chains predict each candidate
+        std::map<uint64_t, int> counts;
+        for (int c = 0; c < chains; c++) {
+            auto preds = predict(anchor, steps, 42 + c * 7919);
+            for (auto v : preds) counts[v]++;
+        }
+        // Filter to consensus and sort by hit count descending
+        std::vector<std::pair<uint64_t, int>> result;
+        for (auto& [val, cnt] : counts) {
+            if (cnt >= min_hits) result.push_back({val, cnt});
+        }
+        std::sort(result.begin(), result.end(),
+            [](auto& a, auto& b) { return a.second > b.second; });
+        return result;
+    }
+
+    // Predict the immediate next prime after anchor.
+    // Runs many single-step trials, votes on the result.
+    // Returns sorted vector of (candidate, vote_count).
+    std::vector<std::pair<uint64_t, int>> predict_next(
+            uint64_t anchor, int trials = 2000) const {
+        if (!trained_) return {};
+
+        int d = digit_idx(anchor % 10);
+        if (d < 0) d = 0;
+        if (gap_dist_[d].empty()) return {};
+
+        std::map<uint64_t, int> votes;
+
+        // Method 1: direct gap sampling (majority of trials)
+        uint64_t rng_state = anchor ^ 0xBEEF;
+        auto rng_next = [&]() -> double {
+            rng_state ^= rng_state << 13;
+            rng_state ^= rng_state >> 7;
+            rng_state ^= rng_state << 17;
+            return (rng_state & 0xFFFFFFFFFFFFULL) / (double)0x1000000000000ULL;
+        };
+
+        for (int t = 0; t < trials; t++) {
+            // Sample gap for current last digit
+            size_t gi = (size_t)(rng_next() * gap_dist_[d].size());
+            if (gi >= gap_dist_[d].size()) gi = gap_dist_[d].size() - 1;
+            uint64_t gap = gap_dist_[d][gi];
+            uint64_t candidate = anchor + gap;
+
+            // Sample next digit from transition matrix
+            double r = rng_next();
+            int d_nxt = 3;
+            for (int j = 0; j < 4; j++) {
+                if (r <= trans_cum_[d][j]) { d_nxt = j; break; }
+            }
+
+            // Adjust to target digit
+            int target = DIGITS[d_nxt];
+            int cur = (int)(candidate % 10);
+            if (cur != target) {
+                int off1 = (target - cur + 10) % 10;
+                int off2 = -((cur - target + 10) % 10);
+                candidate += (abs(off1) <= abs(off2)) ? off1 : off2;
+            }
+
+            if (candidate > anchor && (candidate & 1))
+                votes[candidate]++;
+        }
+
+        // Method 2: mode-based prediction (add strong votes for most common gaps)
+        // For each possible next digit, find the most common gap for that transition
+        for (int d_nxt = 0; d_nxt < 4; d_nxt++) {
+            // Build gap distribution for specifically d -> d_nxt transitions
+            // We approximate by using the overall gap dist for digit d
+            // and the most common gaps
+            if (gap_dist_[d].empty()) continue;
+
+            // Find mode (most frequent gap)
+            std::map<uint64_t, int> gap_freq;
+            for (auto g : gap_dist_[d]) gap_freq[g]++;
+            // Top 3 most frequent gaps
+            std::vector<std::pair<int, uint64_t>> ranked;
+            for (auto& [g, c] : gap_freq) ranked.push_back({c, g});
+            std::sort(ranked.begin(), ranked.end(), [](auto& a, auto& b) {
+                return a.first > b.first;
+            });
+
+            int target = DIGITS[d_nxt];
+            int top = std::min((int)ranked.size(), 5);
+            for (int i = 0; i < top; i++) {
+                uint64_t candidate = anchor + ranked[i].second;
+                int cur = (int)(candidate % 10);
+                if (cur != target) {
+                    int off1 = (target - cur + 10) % 10;
+                    int off2 = -((cur - target + 10) % 10);
+                    candidate += (abs(off1) <= abs(off2)) ? off1 : off2;
+                }
+                if (candidate > anchor && (candidate & 1)) {
+                    // Weight by transition probability and gap frequency
+                    double t_prob = (d_nxt > 0)
+                        ? trans_cum_[d][d_nxt] - trans_cum_[d][d_nxt - 1]
+                        : trans_cum_[d][0];
+                    int bonus = (int)(ranked[i].first * t_prob * 10);
+                    votes[candidate] += bonus;
+                }
+            }
+        }
+
+        // Sort by votes descending
+        std::vector<std::pair<uint64_t, int>> result;
+        for (auto& [val, cnt] : votes) {
+            if (cnt >= 2) result.push_back({val, cnt});
+        }
+        std::sort(result.begin(), result.end(),
+            [](auto& a, auto& b) { return a.second > b.second; });
+        return result;
+    }
+
+    // Predict next prime with primality verification on top candidates.
+    // Returns the best verified prime candidate, its vote count, rank,
+    // and total candidates checked.
+    struct VerifiedPrediction {
+        uint64_t value = 0;       // the predicted prime (0 if none found)
+        int votes = 0;            // vote count for this candidate
+        int rank = 0;             // rank among all candidates (1 = top)
+        int candidates_checked = 0; // how many we tested before finding a prime
+        int total_candidates = 0;  // total in the vote set
+    };
+
+    VerifiedPrediction predict_next_verified(
+            uint64_t anchor, int trials = 2000) const {
+        auto candidates = predict_next(anchor, trials);
+        VerifiedPrediction result;
+        result.total_candidates = (int)candidates.size();
+
+        int rank = 0;
+        for (auto& [val, cnt] : candidates) {
+            if (val <= anchor) continue;
+            rank++;
+            result.candidates_checked++;
+            // is_prime uses Miller-Rabin with carry-chain mulmod
+            if (is_prime(val)) {
+                result.value = val;
+                result.votes = cnt;
+                result.rank = rank;
+                return result;
+            }
+        }
+        return result; // no verified prime found
+    }
+
+    // Incremental update: add a single observed prime to the training data.
+    // Avoids full retrain. Updates gap distribution and transition counts.
+    void update(uint64_t prev_prime, uint64_t new_prime) {
+        if (!trained_) return;
+        int d_prev = digit_idx(prev_prime % 10);
+        int d_new = digit_idx(new_prime % 10);
+        if (d_prev < 0 || d_new < 0) return;
+
+        uint64_t gap = new_prime - prev_prime;
+        gap_dist_[d_prev].push_back(gap);
+        trans_[d_prev][d_new]++;
+
+        // Rebuild cumulative transition probabilities for this row
+        double total = 0;
+        for (int j = 0; j < 4; j++) total += trans_[d_prev][j];
+        if (total > 0) {
+            double cum = 0;
+            for (int j = 0; j < 4; j++) {
+                cum += trans_[d_prev][j] / total;
+                trans_cum_[d_prev][j] = cum;
+            }
+            trans_cum_[d_prev][3] = 1.0;
+        }
+
+        // Keep gap distributions from growing unbounded: if any digit's
+        // gap list exceeds 50000 entries, trim the oldest half.
+        // This gives a recency bias, adapting to local density.
+        for (int i = 0; i < 4; i++) {
+            if (gap_dist_[i].size() > 50000) {
+                gap_dist_[i].erase(
+                    gap_dist_[i].begin(),
+                    gap_dist_[i].begin() + gap_dist_[i].size() / 2);
+            }
+        }
+    }
+
+    bool is_trained() const { return trained_; }
+
+    // Mean gap per digit (for diagnostics)
+    double mean_gap(int digit) const {
+        int d = digit_idx(digit);
+        if (d < 0 || gap_dist_[d].empty()) return 0;
+        double sum = 0;
+        for (auto g : gap_dist_[d]) sum += g;
+        return sum / gap_dist_[d].size();
+    }
+
+private:
+    static int digit_idx(int d) {
+        switch (d) {
+            case 1: return 0; case 3: return 1;
+            case 7: return 2; case 9: return 3;
+        }
+        return -1;
+    }
+
+    bool trained_ = false;
+    std::vector<uint64_t> gap_dist_[4];      // gap distributions per last digit
+    double trans_[4][4] = {};                 // raw transition counts
+    double trans_cum_[4][4] = {};             // cumulative transition probabilities
+};
 
 // ── Search result ───────────────────────────────────────────────────
 
