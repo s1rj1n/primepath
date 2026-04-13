@@ -27,7 +27,7 @@ Grab the latest build from [Releases](https://github.com/s1rj1n/primepath/releas
 | Sexy primes | p, p+6 both prime | Infinite (conjectured) |
 | Emirps | p and reverse(p) both prime | ~10% of primes |
 
-CPU sieve keeps all cores busy generating candidates while GPU crunches the current batch. CPU tests use carry-chain hardware mulmod for 4-7x faster 128-bit modular arithmetic (toggle via CarryChain checkbox).
+CPU sieve keeps all cores busy generating candidates while GPU crunches the current batch. CPU tests use Nester Carry Chain hardware mulmod for 4-7x faster 128-bit modular arithmetic (toggle via NesterCarryChain checkbox). Auto-falls back to binary doubling for moduli > 96 bits.
 
 ## Test Catalog
 
@@ -46,6 +46,23 @@ Experimental. Classifies prime factors into seed types (TinyPrime, SmallPrime, T
 ## Pipeline Builder
 
 Build custom search pipelines by picking stages from five categories -- Sieve (Wheel-210, MatrixSieve, CRT, pseudoprime filter), Score (convergence, EvenShadow), Test (Miller-Rabin, GPU primality, Wieferich, Wilson, pair tests), Post (factoring, PinchFactor, Lucky7s, DivisorWeb), and Analysis (all the factor seed tools plus quadratic residue, Goldbach split, Euler totient). Each stage shows cost and rejection rate. Reorder and toggle as needed.
+
+## Nester Carry Chain
+
+Two division-free methods for modular arithmetic (S. Nester, 2026):
+
+**Carry-chain modular multiplication** -- computes (a * b) mod m for operands up to 128 bits using ARM64 MUL+UMULH partial products assembled through a 192-bit carry chain. 4-7x faster than binary doubling. Falls back automatically for moduli > 96 bits.
+
+**Streaming divisibility** -- tests whether an arbitrarily large number N is divisible by candidate divisors without division. Streams through N segment by segment, accumulating via Barrett reduction (precomputed reciprocal multiply). N-wide template batching processes up to 8 divisors per pass through the number. Up to 8x faster than scalar division on 2048-bit numbers. Over 10 million divisor tests per second on Apple Silicon.
+
+| Method | Speedup | Where used |
+|--------|---------|------------|
+| Carry-chain mulmod | 4-7x vs binary doubling | Wieferich, Wall-Sun-Sun, GIMPS CPU verify, Miller-Rabin |
+| Streaming 1x | 3x vs scalar divide | Single divisor trial division |
+| Streaming 8-wide | 8x vs scalar divide | Bulk trial division (RSA-2048, big numbers) |
+| Mersenne modpow | O(log p) | 2^p-1 divisibility without building the number |
+
+Benchmark accessible from the main toolbar ("Bench") and Markov Predict window ("Nester-CarryChain Test").
 
 ## GIMPS
 
@@ -110,7 +127,9 @@ CPU sieve pipeline          Metal GPU
 
 Three uint32 limbs with hardware `mulhi` for the multiply-and-reduce step. Each GPU thread does a complete modular exponentiation independently -- no shared memory, no sync. Unified memory means zero copy between CPU sieve output and GPU input.
 
-CPU-side 128-bit modular arithmetic uses a carry-chain approach: ARM64 `MUL`+`UMULH` for full 64×64→128-bit products, decomposed into a 192-bit intermediate, reduced via hardware `__int128` division in two 32-bit shifts. 4-7x faster than the binary shift-and-add method for moduli up to 95 bits.
+CPU-side 128-bit modular arithmetic uses the Nester Carry Chain: ARM64 `MUL`+`UMULH` for full 64x64->128-bit products, decomposed into a 192-bit intermediate, reduced via hardware `__int128` division in two 32-bit shifts. 4-7x faster than binary shift-and-add. Falls back to binary doubling automatically for moduli > 96 bits.
+
+For big-number trial division, the streaming divisibility engine tests candidates via Barrett reduction (precomputed reciprocal multiply, no UDIV) with N-wide template batching. 8x faster than scalar division at 2048 bits.
 
 | Layer | File | What it does |
 |-------|------|-------------|
@@ -119,7 +138,7 @@ CPU-side 128-bit modular arithmetic uses a carry-chain approach: ARM64 `MUL`+`UM
 | GPU dispatch | `MetalCompute.mm` | Ring-buffered command encoding, async pipelining |
 | Backend abstraction | `GPUBackend.hpp` | Metal / CPU fallback |
 | Search engine | `TaskManager.cpp` | CPU sieve, GPU batch dispatch, persistence |
-| Prime engine | `PrimeEngine.hpp` | Miller-Rabin, CRT, wheel sieve, Pollard rho |
+| Prime engine | `PrimeEngine.hpp` | Miller-Rabin, CRT, wheel sieve, Pollard rho, Nester Carry Chain streaming |
 | Analysis | `DataTools.hpp` | Factor seed prediction, Tonelli-Shanks |
 | App | `AppDelegate.mm` | UI, test catalog, pipeline builder, GIMPS panel |
 

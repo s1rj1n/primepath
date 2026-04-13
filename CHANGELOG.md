@@ -1,6 +1,35 @@
 # Changelog
 
-## v1.2.1 – AutoPrimeNet Interop & GPU Core Fix (2026-04-10)
+## v1.3 -- Nester Carry Chain Streaming Divisibility (2026-04-13)
+
+### New
+- **Nester Carry Chain streaming divisibility engine** -- tests whether arbitrarily large numbers are divisible by candidate divisors without ever dividing. Streams through the number segment by segment (MSB to LSB) using Barrett reduction (precomputed reciprocal multiply). No UDIV instruction executes in the hot loop.
+- **N-wide template batching** -- processes 1, 2, 4, 8, or 16 divisors per pass through the number. Each stream is independent so the CPU pipelines all multiply-accumulate chains in parallel. Compile-time template parameter enables full loop unrolling at -O2.
+- **Adaptive batch calibrator** -- times each batch width and picks the fastest for the given number size. 8-wide is optimal for most cases (2048+ bits).
+- **Nester-CarryChain benchmark** -- accessible from the Markov Predict window ("Nester-CarryChain Test" button) and the main toolbar ("Bench" button). Four tests: correctness (M127, 2^64-1), RSA-2048 (50K candidates), batch width scaling (128-8192 bits), and Mersenne modpow comparison.
+- **Carry-chain mulmod auto-fallback** -- moduli > 96 bits now automatically fall back to binary doubling instead of overflowing. No user-facing constraints remain.
+- **Markov Predict theory popup updated** -- added primality verification section (Miller-Rabin 12 witnesses, Nester Carry Chain mulmod, trial division, heuristic divisors, Pollard rho) and streaming divisibility section.
+- **Nester Carry Chain info popup** -- new combined documentation covering both methods (modular multiplication and streaming divisibility) with implementation notes.
+- **Prime Markov chain test script** (`prime_markov_test.py`) -- standalone Python script for testing whether prime structure can be reproduced from local conditional rules.
+
+### Performance
+- Up to **8x faster** than scalar division on RSA-2048 sized numbers (2048 bits, 32 limbs, 50K candidates)
+- Over **10 million divisor tests per second** on Apple Silicon
+- 8-wide batch consistently optimal across all bit widths (128-8192)
+- Mersenne modpow shortcut correctly dominates streaming for 2^p-1 forms
+
+### Fixed
+- **Popup window crashes** -- reopening Carry Chain Info, Theory, or Markov Predict popups caused SIGSEGV in `objc_setAssociatedObject`. Fixed by setting `releasedWhenClosed = NO` on all popup windows.
+- **Startup noise** -- all 300 discoveries were dumped to output on startup. Replaced with type-summary (e.g. "Discoveries: 300 total (General: 295, Wieferich: 2, Wilson: 3)").
+- **Toolbar layout overlap** -- NesterCarryChain checkbox, ?, and Bench buttons were overlapping From/To fields. Moved to own row.
+- **Benchmark dead-code elimination** -- compiler at -O2 was eliminating benchmark loops whose results were unused. Added volatile sinks.
+
+### Changed
+- All user-facing references renamed from "Blackjack" to "Nester Carry Chain" / "Nester-CC"
+- Checkbox renamed from "CarryChain" to "NesterCarryChain"
+- Version bumped to 1.3.0 across Info.plist, User-Agent, PrimeNet registration, and JSON output
+
+## v1.2.1 -- AutoPrimeNet Interop & GPU Core Fix (2026-04-10)
 
 ### New
 - **`worktodo.txt` reader** – PrimePath now reads the standard GIMPS `worktodo.txt` file used by AutoPrimeNet and mfaktc/mfakto. Supported line format: `Factor=<AID>,<exponent>,<bitlo>,<bithi>` (AID optional). Blank lines, `#`, `;`, and `//` comments are ignored.
