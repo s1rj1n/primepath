@@ -4739,11 +4739,132 @@ static std::string u128_to_str(unsigned __int128 v) {
         log([NSString stringWithFormat:@"    (Stream would need ~1.2M limbs = %d MB -- modpow is the only option here)",
              (int)(82589933 / 64 * 8 / 1024 / 1024)]);
 
+        // --- Test 5: Gear Shift Crossover Detection ---
+        log(@"TEST 5: Gear Shift Crossover (CPU-1 vs CPU-MT vs GPU)");
+        log(@"  Finding the sweet spot for each gear...");
+        log(@"");
+
+        MetalCompute *mc = [[MetalCompute alloc] init];
+        bool gpu_ok = [mc available];
+
+        int test_bits[]   = {128, 512, 2048, 8192, 32768};
+        int test_divs[]   = {100, 1000, 10000, 50000, 200000};
+        int ncpu = (int)std::thread::hardware_concurrency();
+
+        log([NSString stringWithFormat:@"  CPU cores: %d, GPU: %@", ncpu,
+             gpu_ok ? @"available" : @"not available"]);
+        log(@"");
+        log(@"  bits   | divs    | gear1(us) | gear2(us) | gear3(us) | winner | speedup | auto");
+        log(@"  -------|---------|-----------|-----------|-----------|--------|--------");
+
+        volatile uint64_t gsink = 0;
+
+        for (int bits : test_bits) {
+            int nlimbs = bits / 64;
+            prime::BigNum num;
+            num.limbs.resize(nlimbs, 0xA5A5A5A5A5A5A5A5ULL);
+            num.limbs[0] = 0xDEADBEEFCAFEBABEULL;
+
+            for (int nd : test_divs) {
+                // Build divisor set
+                std::vector<uint64_t> divs64;
+                std::vector<uint32_t> divs32;
+                for (int i = 0; i < nd; i++) {
+                    uint64_t d = 3 + 2 * i;
+                    divs64.push_back(d);
+                    divs32.push_back((uint32_t)d);
+                }
+
+                // Gear 1: CPU single-thread
+                auto g1t0 = std::chrono::steady_clock::now();
+                auto g1res = prime::stream_find_divisors(num, divs64.data(), divs64.size());
+                auto g1t1 = std::chrono::steady_clock::now();
+                double g1_us = std::chrono::duration<double, std::micro>(g1t1 - g1t0).count();
+                gsink += g1res.divisors.size();
+
+                // Gear 2: CPU multi-thread
+                auto g2t0 = std::chrono::steady_clock::now();
+                auto g2res = prime::stream_find_divisors_mt(num, divs64.data(), divs64.size());
+                auto g2t1 = std::chrono::steady_clock::now();
+                double g2_us = std::chrono::duration<double, std::micro>(g2t1 - g2t0).count();
+                gsink += g2res.divisors.size();
+
+                // Gear 3: GPU
+                double g3_us = 99999999;
+                int g3_hits = -1;
+                if (gpu_ok) {
+                    auto g3t0 = std::chrono::steady_clock::now();
+                    NSData *g3data = [mc runNesterCCStream:num.limbs.data()
+                                                 numLimbs:(uint32_t)num.limbs.size()
+                                                 divisors:divs32.data()
+                                                  numDivs:(uint32_t)divs32.size()];
+                    auto g3t1 = std::chrono::steady_clock::now();
+                    g3_us = std::chrono::duration<double, std::micro>(g3t1 - g3t0).count();
+                    if (g3data) {
+                        const uint8_t *r = (const uint8_t *)g3data.bytes;
+                        g3_hits = 0;
+                        for (int i = 0; i < nd; i++) if (r[i]) g3_hits++;
+                    }
+                }
+
+                // Auto-dispatch test
+                MetalCompute *mcCapture = mc;
+                bool gpuCapture = gpu_ok;
+                prime::GpuDispatchFn gpuFn = nullptr;
+                if (gpuCapture) {
+                    gpuFn = [mcCapture](const uint64_t* limbs, uint32_t nLimbs,
+                                        const uint32_t* divs, uint32_t nDivs) -> std::vector<uint64_t> {
+                        NSData *data = [mcCapture runNesterCCStream:limbs numLimbs:nLimbs
+                                                           divisors:divs numDivs:nDivs];
+                        std::vector<uint64_t> hits;
+                        if (data) {
+                            const uint8_t *r = (const uint8_t *)data.bytes;
+                            for (uint32_t i = 0; i < nDivs; i++)
+                                if (r[i]) hits.push_back((uint64_t)divs[i]);
+                        }
+                        return hits;
+                    };
+                }
+                auto autoRes = prime::stream_find_divisors_auto(num, divs64.data(), divs64.size(), gpuFn);
+                int autoGear = autoRes.batch_size == -3 ? 3 :
+                               (autoRes.elapsed_us > 0 && divs64.size() >= 1000 ? 2 : 1);
+                gsink += autoRes.divisors.size();
+
+                // Cross-check: all gears should find same number of divisors
+                int g1_hits = (int)g1res.divisors.size();
+                int g2_hits = (int)g2res.divisors.size();
+                int auto_hits = (int)autoRes.divisors.size();
+                NSString *check = @"";
+                if (g1_hits != g2_hits || (g3_hits >= 0 && g1_hits != g3_hits) || g1_hits != auto_hits)
+                    check = [NSString stringWithFormat:@" MISMATCH(%d/%d/%d/%d)", g1_hits, g2_hits, g3_hits, auto_hits];
+
+                // Find winner
+                double best = g1_us;
+                const char *winner = "gear1";
+                if (g2_us < best) { best = g2_us; winner = "gear2"; }
+                if (g3_us < best) { best = g3_us; winner = "gear3"; }
+                double speedup = g1_us / best;
+
+                // Which gear did auto pick?
+                int pickedInt = (int)prime::select_gear(num.limbs.size(), divs64.size(), gpu_ok);
+
+                log([NSString stringWithFormat:@"  %5d  | %6d  | %9.0f | %9.0f | %9.0f | %6s | %.1fx | auto=%d%@",
+                     bits, nd, g1_us, g2_us,
+                     gpu_ok ? g3_us : 0.0,
+                     winner, speedup, pickedInt, check]);
+            }
+        }
+
+        log(@"");
+        log(@"  Gear 1 = CPU single-thread 8-wide Barrett");
+        log([NSString stringWithFormat:@"  Gear 2 = CPU %d-thread, each 8-wide Barrett", ncpu]);
+        log(@"  Gear 3 = GPU Metal, one thread per divisor");
+
         log(@"");
         log(@"====================================================");
         log(@"  Nester-CarryChain rules: HIT (under) / BUST (reduce) / MATCH (divides)");
         log(@"  For Mersenne numbers, modpow shortcut avoids building the number.");
-        log(@"  For general big numbers, Nester-CC streams up to 8 divisors/pass.");
+        log(@"  For general big numbers, Nester-CC auto-selects gear by work volume.");
         log(@"====================================================");
     });
 }

@@ -56,4 +56,11 @@
             sievePrimes:(const uint64_t *)primes
              numPrimes:(uint32_t)numPrimes;
 
+// Nester Carry Chain streaming divisibility (Gear 3: GPU)
+// Tests which divisors divide a big number. Returns NSData of uint8 results.
+- (NSData *)runNesterCCStream:(const uint64_t *)limbs
+                     numLimbs:(uint32_t)numLimbs
+                     divisors:(const uint32_t *)divisors
+                      numDivs:(uint32_t)numDivs;
+
 @end

@@ -477,6 +477,156 @@ inline bool stream_divides(const BigNum& n, uint64_t d) {
     return stream_mod_scalar(n.limbs.data(), n.limbs.size(), d) == 0;
 }
 
+// ═══════════════════════════════════════════════════════════════════════
+// GEAR SHIFT ENGINE (S. Nester, 2026)
+// ═══════════════════════════════════════════════════════════════════════
+//
+// Three gears, auto-selected like a transmission:
+//   Gear 1: CPU single-thread N-wide (existing, low overhead)
+//   Gear 2: CPU multi-thread (divisors split across cores)
+//   Gear 3: GPU Metal kernel (one thread per divisor)
+//
+// Gear selection based on work volume = limbs x divisors.
+// Small jobs stay on one core. Medium jobs fan out to CPU threads.
+// Large jobs go to GPU where thousands of threads run in parallel.
+
+enum class StreamGear { CPU_SINGLE = 1, CPU_MULTI = 2, GPU = 3 };
+
+// Gear selection uses two rules per transition, calibrated from
+// benchmark data across 128-32768 bit numbers and 100-200K divisors:
+//
+// Gear 2 (CPU multi-thread) wins when there are enough divisors to
+// amortize thread-spawn overhead (~100us). For very large numbers
+// (512+ limbs), even 50 divisors justify multi-threading.
+//
+// Gear 3 (GPU) wins at 50K+ divisors (GPU dispatch overhead ~400us
+// is amortized by massive parallelism), or at 1K+ divisors when the
+// number has 256+ limbs (large per-divisor work fills GPU occupancy).
+
+inline StreamGear select_gear(size_t num_limbs, size_t num_divisors,
+                               bool gpu_available) {
+    // Gear 3: GPU
+    if (gpu_available) {
+        if (num_divisors >= 50000)
+            return StreamGear::GPU;
+        if (num_limbs >= 256 && num_divisors >= 1000)
+            return StreamGear::GPU;
+    }
+
+    // Gear 2: CPU multi-thread
+    if (num_divisors >= 5000)
+        return StreamGear::CPU_MULTI;
+    if (num_limbs >= 256 && num_divisors >= 50)
+        return StreamGear::CPU_MULTI;
+
+    return StreamGear::CPU_SINGLE;
+}
+
+// ── Gear 2: CPU multi-thread ─────────────────────────────────────────
+// Split divisors across available cores. Each thread independently
+// streams through all limbs (read-only, no contention).
+
+inline StreamResult stream_find_divisors_mt(
+    const BigNum& n,
+    const uint64_t* candidates, size_t ndiv,
+    int nthreads = 0)
+{
+    if (nthreads <= 0)
+        nthreads = (int)std::thread::hardware_concurrency();
+    if (nthreads < 2) nthreads = 2;
+    if ((size_t)nthreads > ndiv) nthreads = (int)ndiv;
+
+    StreamResult res;
+    res.bits = n.bit_width();
+    auto t0 = std::chrono::high_resolution_clock::now();
+
+    // Per-thread results
+    struct ThreadResult {
+        std::vector<uint64_t> divisors;
+        size_t tested = 0;
+    };
+    std::vector<ThreadResult> thread_results(nthreads);
+    std::vector<std::thread> threads;
+
+    size_t chunk = ndiv / nthreads;
+    size_t remainder = ndiv % nthreads;
+
+    for (int t = 0; t < nthreads; t++) {
+        size_t start = t * chunk + std::min((size_t)t, remainder);
+        size_t count = chunk + (t < (int)remainder ? 1 : 0);
+
+        threads.emplace_back([&, t, start, count]() {
+            auto& tr = thread_results[t];
+            // Use single-thread gear 1 for this chunk
+            auto partial = stream_find_divisors(n, candidates + start, count);
+            tr.divisors = std::move(partial.divisors);
+            tr.tested = partial.tested;
+            if (t == 0) res.batch_size = partial.batch_size;
+        });
+    }
+
+    for (auto& t : threads) t.join();
+
+    // Merge results
+    for (auto& tr : thread_results) {
+        for (auto d : tr.divisors) res.divisors.push_back(d);
+        res.tested += tr.tested;
+    }
+
+    auto t1 = std::chrono::high_resolution_clock::now();
+    res.elapsed_us = std::chrono::duration<double, std::micro>(t1 - t0).count();
+    return res;
+}
+
+// ── Auto gear selector: picks the right gear and dispatches ──────────
+// Pass gpu_dispatch = nullptr if GPU is not available.
+// If provided, gpu_dispatch receives (limbs, num_limbs, divisors, num_divs)
+// and returns a vector of divisors that divide N.
+
+using GpuDispatchFn = std::function<std::vector<uint64_t>(
+    const uint64_t* limbs, uint32_t num_limbs,
+    const uint32_t* divisors, uint32_t num_divs)>;
+
+inline StreamResult stream_find_divisors_auto(
+    const BigNum& n,
+    const uint64_t* candidates, size_t ndiv,
+    GpuDispatchFn gpu_dispatch = nullptr)
+{
+    bool gpu_ok = (gpu_dispatch != nullptr);
+    StreamGear gear = select_gear(n.limbs.size(), ndiv, gpu_ok);
+
+    if (gear == StreamGear::GPU && gpu_dispatch) {
+        // Build uint32 divisor list for GPU (GPU kernel uses uint32)
+        std::vector<uint32_t> divs32;
+        divs32.reserve(ndiv);
+        for (size_t i = 0; i < ndiv; i++) {
+            if (candidates[i] > 1 && candidates[i] < (1ULL << 32))
+                divs32.push_back((uint32_t)candidates[i]);
+        }
+
+        StreamResult res;
+        res.bits = n.bit_width();
+        res.batch_size = -3; // indicates GPU gear
+        auto t0 = std::chrono::high_resolution_clock::now();
+
+        auto hits = gpu_dispatch(n.limbs.data(), (uint32_t)n.limbs.size(),
+                                  divs32.data(), (uint32_t)divs32.size());
+        res.divisors = std::move(hits);
+        res.tested = divs32.size();
+
+        auto t1 = std::chrono::high_resolution_clock::now();
+        res.elapsed_us = std::chrono::duration<double, std::micro>(t1 - t0).count();
+        return res;
+    }
+
+    if (gear == StreamGear::CPU_MULTI) {
+        return stream_find_divisors_mt(n, candidates, ndiv);
+    }
+
+    // Gear 1: single-thread
+    return stream_find_divisors(n, candidates, ndiv);
+}
+
 // ── Mersenne streaming: is 2^p - 1 divisible by f? ──────────────────
 // Instead of building the full 2^p-1 in memory, we compute
 // (2^p - 1) mod f directly: (2^p mod f) == 1 means f | (2^p - 1).

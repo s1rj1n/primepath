@@ -1066,3 +1066,55 @@ kernel void primality_batch(
     if (gid >= count) return;
     results[gid] = gpu_is_prime(candidates[gid]) ? 1 : 0;
 }
+
+// ═══════════════════════════════════════════════════════════════════════
+// Nester Carry Chain: GPU streaming divisibility (Gear 3)
+// ═══════════════════════════════════════════════════════════════════════
+//
+// Each thread tests one divisor d against a big number stored as limbs.
+// Streams MSB to LSB, accumulating via Barrett reduction (no division).
+// All threads read the same limbs (broadcast from cache), so memory
+// access is uniform across the SIMD group.
+
+// Barrett mod on GPU: x mod d using precomputed inv = floor(2^64 / d)
+inline ulong ncc_barrett_mod(ulong x, uint d, ulong inv) {
+    ulong q = mulhi(x, inv);
+    ulong r = x - q * (ulong)d;
+    if (r >= d) { r -= d; if (r >= d) r -= d; }
+    return r;
+}
+
+kernel void nester_cc_stream(
+    device const ulong *limbs      [[buffer(0)]],  // BigNum limbs (big-endian)
+    device const uint  *divisors   [[buffer(1)]],  // candidate divisors (uint32)
+    device uchar       *results    [[buffer(2)]],  // 1 if d divides N, 0 otherwise
+    constant uint      &num_limbs  [[buffer(3)]],
+    constant uint      &num_divs   [[buffer(4)]],
+    uint gid [[thread_position_in_grid]])
+{
+    if (gid >= num_divs) return;
+
+    uint d = divisors[gid];
+    if (d <= 1) { results[gid] = 0; return; }
+
+    // Precompute inverse: floor(2^64 / d)
+    ulong inv = 0xFFFFFFFFFFFFFFFFUL / (ulong)d;
+
+    // Precompute pow64 = 2^64 mod d via doubling (no division)
+    ulong pow64 = 1;
+    for (int i = 0; i < 64; i++) {
+        pow64 <<= 1;
+        if (pow64 >= d) pow64 -= d;
+    }
+
+    // Stream through all limbs
+    ulong rem = 0;
+    for (uint i = 0; i < num_limbs; i++) {
+        ulong shifted = ncc_barrett_mod(rem * pow64, d, inv);
+        ulong limb_r  = ncc_barrett_mod(limbs[i], d, inv);
+        rem = shifted + limb_r;
+        if (rem >= d) rem -= d;
+    }
+
+    results[gid] = (rem == 0) ? 1 : 0;
+}

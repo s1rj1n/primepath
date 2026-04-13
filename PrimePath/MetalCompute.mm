@@ -23,6 +23,7 @@ static const uint32_t MAX_BATCH = 262144; // 256K max batch
     id<MTLComputePipelineState> _fermatFactorPSO;
     id<MTLComputePipelineState> _mersenneFusedPSO;
     id<MTLComputePipelineState> _gpuSieveMarkPSO;
+    id<MTLComputePipelineState> _nesterCCStreamPSO;
 
     // Pre-allocated ring buffers
     id<MTLBuffer> _ringInput[RING_SIZE];
@@ -93,6 +94,7 @@ static const uint32_t MAX_BATCH = 262144; // 256K max batch
     _fermatFactorPSO  = [self psoForFunction:@"fermat_factor_batch"];
     _mersenneFusedPSO = [self psoForFunction:@"mersenne_fused_sieve"];
     _gpuSieveMarkPSO  = [self psoForFunction:@"gpu_sieve_mark"];
+    _nesterCCStreamPSO = [self psoForFunction:@"nester_cc_stream"];
 
     // Pre-allocate ring buffers for max batch size
     for (int i = 0; i < RING_SIZE; i++) {
@@ -638,6 +640,49 @@ static const uint32_t MAX_BATCH = 262144; // 256K max batch
     _statsStart = [NSDate date];
     _windowGpuSec = 0;
     _windowStart = [NSDate date];
+}
+
+// ── Nester Carry Chain streaming divisibility (Gear 3: GPU) ──────────
+
+- (NSData *)runNesterCCStream:(const uint64_t *)limbs
+                     numLimbs:(uint32_t)numLimbs
+                     divisors:(const uint32_t *)divisors
+                      numDivs:(uint32_t)numDivs
+{
+    if (!_device || !_nesterCCStreamPSO || numDivs == 0 || numLimbs == 0)
+        return nil;
+
+    // Create buffers
+    id<MTLBuffer> limbsBuf = [_device newBufferWithBytes:limbs
+        length:numLimbs * sizeof(uint64_t) options:MTLResourceStorageModeShared];
+    id<MTLBuffer> divsBuf = [_device newBufferWithBytes:divisors
+        length:numDivs * sizeof(uint32_t) options:MTLResourceStorageModeShared];
+    id<MTLBuffer> resultsBuf = [_device newBufferWithLength:numDivs
+        options:MTLResourceStorageModeShared];
+    id<MTLBuffer> nlimbsBuf = [_device newBufferWithBytes:&numLimbs
+        length:sizeof(uint32_t) options:MTLResourceStorageModeShared];
+    id<MTLBuffer> ndivsBuf = [_device newBufferWithBytes:&numDivs
+        length:sizeof(uint32_t) options:MTLResourceStorageModeShared];
+
+    id<MTLCommandBuffer> cmdBuf = [_queue commandBuffer];
+    id<MTLComputeCommandEncoder> enc = [cmdBuf computeCommandEncoder];
+    [enc setComputePipelineState:_nesterCCStreamPSO];
+    [enc setBuffer:limbsBuf   offset:0 atIndex:0];
+    [enc setBuffer:divsBuf    offset:0 atIndex:1];
+    [enc setBuffer:resultsBuf offset:0 atIndex:2];
+    [enc setBuffer:nlimbsBuf  offset:0 atIndex:3];
+    [enc setBuffer:ndivsBuf   offset:0 atIndex:4];
+
+    NSUInteger threadWidth = _nesterCCStreamPSO.threadExecutionWidth;
+    MTLSize grid = MTLSizeMake(numDivs, 1, 1);
+    MTLSize group = MTLSizeMake(MIN(threadWidth, (NSUInteger)numDivs), 1, 1);
+    [enc dispatchThreads:grid threadsPerThreadgroup:group];
+    [enc endEncoding];
+
+    [cmdBuf commit];
+    [cmdBuf waitUntilCompleted];
+
+    return [NSData dataWithBytes:resultsBuf.contents length:numDivs];
 }
 
 @end

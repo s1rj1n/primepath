@@ -1,12 +1,18 @@
 # Changelog
 
-## v1.3 -- Nester Carry Chain Streaming Divisibility (2026-04-13)
+## v1.3 -- Nester Carry Chain Three-Gear Engine (2026-04-13)
 
 ### New
 - **Nester Carry Chain streaming divisibility engine** -- tests whether arbitrarily large numbers are divisible by candidate divisors without ever dividing. Streams through the number segment by segment (MSB to LSB) using Barrett reduction (precomputed reciprocal multiply). No UDIV instruction executes in the hot loop.
+- **Three-gear auto-shifting engine** -- automatically selects the fastest execution path based on work volume:
+  - **Gear 1** (CPU single-thread, 8-wide Barrett) -- best for < 5K divisors
+  - **Gear 2** (CPU multi-thread, 10 cores each 8-wide) -- best for 5K-50K divisors
+  - **Gear 3** (GPU Metal, one thread per divisor) -- best for 50K+ divisors, up to 7x over single-thread
+  - Crossover points calibrated from a 5x5 matrix benchmark (128-32768 bits x 100-200K divisors). Auto selector matches the fastest gear in 25/25 test cases.
+- **GPU streaming divisibility kernel** -- Metal compute shader for Gear 3. One GPU thread per divisor, all threads stream the same limbs from cache. Barrett reduction with hardware `mulhi` on GPU.
 - **N-wide template batching** -- processes 1, 2, 4, 8, or 16 divisors per pass through the number. Each stream is independent so the CPU pipelines all multiply-accumulate chains in parallel. Compile-time template parameter enables full loop unrolling at -O2.
 - **Adaptive batch calibrator** -- times each batch width and picks the fastest for the given number size. 8-wide is optimal for most cases (2048+ bits).
-- **Nester-CarryChain benchmark** -- accessible from the Markov Predict window ("Nester-CarryChain Test" button) and the main toolbar ("Bench" button). Four tests: correctness (M127, 2^64-1), RSA-2048 (50K candidates), batch width scaling (128-8192 bits), and Mersenne modpow comparison.
+- **Gear shift benchmark (Test 5)** -- 5x5 matrix of bit sizes (128-32768) and divisor counts (100-200K), times all three gears, cross-checks results, reports winner and speedup. Accessible from the Bench button.
 - **Carry-chain mulmod auto-fallback** -- moduli > 96 bits now automatically fall back to binary doubling instead of overflowing. No user-facing constraints remain.
 - **Markov Predict theory popup updated** -- added primality verification section (Miller-Rabin 12 witnesses, Nester Carry Chain mulmod, trial division, heuristic divisors, Pollard rho) and streaming divisibility section.
 - **Nester Carry Chain info popup** -- new combined documentation covering both methods (modular multiplication and streaming divisibility) with implementation notes.
@@ -14,7 +20,8 @@
 
 ### Performance
 - Up to **8x faster** than scalar division on RSA-2048 sized numbers (2048 bits, 32 limbs, 50K candidates)
-- Over **10 million divisor tests per second** on Apple Silicon
+- GPU Gear 3 up to **7x faster** than single-thread CPU at 200K divisors
+- Over **10 million divisor tests per second** on Apple Silicon (single-thread)
 - 8-wide batch consistently optimal across all bit widths (128-8192)
 - Mersenne modpow shortcut correctly dominates streaming for 2^p-1 forms
 

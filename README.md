@@ -49,17 +49,25 @@ Build custom search pipelines by picking stages from five categories -- Sieve (W
 
 ## Nester Carry Chain
 
-Two division-free methods for modular arithmetic (S. Nester, 2026):
+Two division-free methods for modular arithmetic (S. Nester, 2026), with a three-gear auto-shifting engine that picks the fastest execution path.
 
 **Carry-chain modular multiplication** -- computes (a * b) mod m for operands up to 128 bits using ARM64 MUL+UMULH partial products assembled through a 192-bit carry chain. 4-7x faster than binary doubling. Falls back automatically for moduli > 96 bits.
 
-**Streaming divisibility** -- tests whether an arbitrarily large number N is divisible by candidate divisors without division. Streams through N segment by segment, accumulating via Barrett reduction (precomputed reciprocal multiply). N-wide template batching processes up to 8 divisors per pass through the number. Up to 8x faster than scalar division on 2048-bit numbers. Over 10 million divisor tests per second on Apple Silicon.
+**Streaming divisibility** -- tests whether an arbitrarily large number N is divisible by candidate divisors without division. Streams through N segment by segment, accumulating via Barrett reduction (precomputed reciprocal multiply). N-wide template batching processes up to 8 divisors per pass through the number. Three gears auto-selected by work volume:
+
+| Gear | Engine | Best for | Speedup vs single-thread |
+|------|--------|----------|--------------------------|
+| 1 | CPU single-thread, 8-wide Barrett | < 5K divisors | baseline (8x vs scalar divide) |
+| 2 | CPU 10-thread, each 8-wide Barrett | 5K-50K divisors | up to 4x |
+| 3 | GPU Metal, one thread per divisor | 50K+ divisors | up to 7x |
+
+Gear selection is calibrated from a 5x5 benchmark matrix (128-32768 bit numbers, 100-200K divisors). The auto selector matches the actual fastest gear in all 25 test cases. For very large numbers (32768+ bits), GPU wins starting at 1K divisors.
 
 | Method | Speedup | Where used |
 |--------|---------|------------|
 | Carry-chain mulmod | 4-7x vs binary doubling | Wieferich, Wall-Sun-Sun, GIMPS CPU verify, Miller-Rabin |
-| Streaming 1x | 3x vs scalar divide | Single divisor trial division |
 | Streaming 8-wide | 8x vs scalar divide | Bulk trial division (RSA-2048, big numbers) |
+| Three-gear auto | up to 7x over single CPU | Large-scale divisibility testing |
 | Mersenne modpow | O(log p) | 2^p-1 divisibility without building the number |
 
 Benchmark accessible from the main toolbar ("Bench") and Markov Predict window ("Nester-CarryChain Test").
@@ -129,7 +137,7 @@ Three uint32 limbs with hardware `mulhi` for the multiply-and-reduce step. Each 
 
 CPU-side 128-bit modular arithmetic uses the Nester Carry Chain: ARM64 `MUL`+`UMULH` for full 64x64->128-bit products, decomposed into a 192-bit intermediate, reduced via hardware `__int128` division in two 32-bit shifts. 4-7x faster than binary shift-and-add. Falls back to binary doubling automatically for moduli > 96 bits.
 
-For big-number trial division, the streaming divisibility engine tests candidates via Barrett reduction (precomputed reciprocal multiply, no UDIV) with N-wide template batching. 8x faster than scalar division at 2048 bits.
+For big-number trial division, the three-gear streaming engine auto-selects CPU single-thread (Gear 1), CPU multi-thread (Gear 2), or GPU Metal (Gear 3) based on divisor count and number size. All gears use Barrett reduction (precomputed reciprocal multiply, no UDIV). Up to 8x over scalar on CPU, up to 7x more on GPU for large workloads.
 
 | Layer | File | What it does |
 |-------|------|-------------|
