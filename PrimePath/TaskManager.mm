@@ -2780,6 +2780,45 @@ void TaskManager::run_mersenne_trial(SearchTask& task) {
                         }
 
                         if (!is_known) {
+                            // Attempt to split composite factors (trial + Pollard rho)
+                            // TF factors fit in uint64, so factor_u64 works directly
+                            uint64_t factor_val = 0;
+                            try { factor_val = std::stoull(new_factor); } catch (...) {}
+                            if (factor_val > 1 && !prime::is_prime(factor_val)) {
+                                log("Mersenne TF: factor " + new_factor + " is composite, attempting split...");
+                                auto parts = prime::factor_u64(factor_val);
+                                if (parts.size() > 1) {
+                                    std::string split_str;
+                                    for (size_t pi = 0; pi < parts.size(); pi++) {
+                                        if (pi > 0) split_str += " x ";
+                                        split_str += std::to_string(parts[pi]);
+                                    }
+                                    log("Mersenne TF: split " + new_factor + " = " + split_str);
+                                    // Report individual prime factors instead of composite
+                                    std::set<uint64_t> unique_parts(parts.begin(), parts.end());
+                                    for (uint64_t p : unique_parts) {
+                                        // Skip known factors
+                                        bool p_known = false;
+                                        for (auto& kf : task.known_factors) {
+                                            if (kf == std::to_string(p)) { p_known = true; break; }
+                                        }
+                                        if (!p_known) {
+                                            new_factor = std::to_string(p);
+                                            total_hits++;
+                                            task.found_count++;
+                                            log("*** MERSENNE FACTOR (split): 2^" + std::to_string(exponent) +
+                                                " - 1 has prime factor " + new_factor + " ***");
+                                            save_discovery({TaskType::MersenneTrial, p, exponent,
+                                                PrimeClass::Composite, k_pos, new_factor, timestamp()});
+                                        }
+                                    }
+                                    // Skip the normal reporting below
+                                    goto next_candidate;
+                                } else {
+                                    log("Mersenne TF: could not split " + new_factor + ", reporting as-is");
+                                }
+                            }
+
                             total_hits++;
                             task.found_count++;
                             if (verify_ran && cpu_verified) {
@@ -2802,6 +2841,7 @@ void TaskManager::run_mersenne_trial(SearchTask& task) {
                         }
                     }
                 }
+                next_candidate:
 
                 summary_tested += chunk;
                 task.tested_count += chunk;
