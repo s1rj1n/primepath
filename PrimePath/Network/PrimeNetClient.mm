@@ -529,8 +529,9 @@ std::string PrimeNetClient::build_result_json(const TFResult& result) {
            << ",\"cpu_e_cores\":" << eff_cores;
     if (gpu_cores > 0)
         js << ",\"gpu_cores\":" << gpu_cores;
+    // Apple Silicon uses unified memory -- report cpu_ram_gb only,
+    // omit gpu_ram_gb since it's the same pool (per James's guidance)
     js << ",\"cpu_ram_gb\":" << ram_gb
-       << ",\"gpu_ram_gb\":" << ram_gb
        << "}";
 
     // CRC32 checksum (anti-tampering)

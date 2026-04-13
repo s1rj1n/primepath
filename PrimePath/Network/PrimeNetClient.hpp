@@ -73,6 +73,7 @@ public:
     const std::string& username() const { return _state.username; }
     bool is_registered() const { return _state.registered; }
     const ClientState& state() const { return _state; }
+    ClientState& mutable_state() { return _state; }
 
     // ── PrimeNet v5 API operations ──────────────────────────────────
 

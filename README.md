@@ -74,22 +74,18 @@ Benchmark accessible from the main toolbar ("Bench") and Markov Predict window (
 
 ## GIMPS
 
-Talks directly to [mersenne.org](https://www.mersenne.org) over the PrimeNet v5 API. Register your machine, pull trial factoring assignments, run them on Metal GPU, and submit results back. GPU-found factors are independently verified on CPU using carry-chain modular exponentiation before submission. Reports system specs (chip, CPU/GPU cores, RAM) in results.
+All server communication with [mersenne.org](https://www.mersenne.org) is routed through [AutoPrimeNet](https://github.com/tdulcet/AutoPrimeNet), the recommended assignment handler used by all major third-party GIMPS clients (Mlucas, GpuOwl, PRPLL, mfaktc, mfakto, etc.). PrimePath does not talk to the PrimeNet API directly. AutoPrimeNet handles assignment management, result submission, email notifications, log rotation, proxy support, stall monitoring, and version checking.
 
-Result submissions use the PrimeNet JSON format (single-line JSON in the `&m=` parameter) with fields for timestamp (UTC), exponent, worktype, status, bit range, factors, program info, OS info, user, computer, AID, and hardware details. Local `results.json.txt` matches the submitted JSON exactly. First Metal GPU client for GIMPS.
+GPU-found factors are independently verified on CPU using carry-chain modular exponentiation before reporting. Results use the PrimeNet JSON format with CRC32 checksum, and support known-factor lists (composite factor stripping, continue-after-factor).
 
-### AutoPrimeNet
+### Setup
 
-PrimePath also interoperates with [AutoPrimeNet](https://github.com/tdulcet/AutoPrimeNet), the recommended assignment handler used by all major third-party GIMPS clients (Mlucas, GpuOwl, PRPLL, mfaktc, mfakto, etc.). AutoPrimeNet handles the full PrimeNet v5 API (10,000+ lines of it) plus email notifications, log rotation, proxy support, stall monitoring, and automatic version checking.
-
-To use AutoPrimeNet with PrimePath:
-
-1. Install AutoPrimeNet and configure it as if running `mfaktc` or `mfakto` for TF assignments.
+1. Install AutoPrimeNet and configure it for TF assignments.
 2. Point AutoPrimeNet at PrimePath's data directory (`~/Library/Application Support/PrimePath/`). It will populate `worktodo.txt` with `Factor=<AID>,<exponent>,<bitlo>,<bithi>` lines.
-3. Run PrimePath. It will read assignments from `worktodo.txt`, run them on the Metal GPU, append JSON results to `results.json.txt`, and atomically remove completed lines from `worktodo.txt`.
-4. AutoPrimeNet picks up `results.json.txt` and submits it to mersenne.org.
+3. Run PrimePath. It reads assignments from `worktodo.txt`, runs them on the Metal GPU, appends JSON results to `results.json.txt`, and atomically removes completed lines from `worktodo.txt`.
+4. AutoPrimeNet picks up `results.json.txt` and submits to mersenne.org.
 
-No PrimeNet registration on the PrimePath side is required in this mode. If you also register directly, both the in-memory assignment state and the `worktodo.txt` entry are cleaned up on successful submit (hybrid mode).
+Known-factor support: `Factor=AID,exp,lo,hi,"factor1,factor2"`. If a discovered factor is composed entirely of known primes it is discarded. Composite factors have known components stripped before reporting. The default is to always complete the full bitlevel (configurable).
 
 ### JSON Result Editor
 

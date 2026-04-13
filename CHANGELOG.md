@@ -32,6 +32,8 @@
 - **Benchmark dead-code elimination** -- compiler at -O2 was eliminating benchmark loops whose results were unused. Added volatile sinks.
 
 ### Changed
+- **PrimeNet API removed** -- all server communication now routes through AutoPrimeNet. Register, Get Work, and Submit Results buttons replaced with AutoPrimeNet-only workflow (worktodo.txt in, results.json.txt out). Direct v5 API calls removed from the UI per GIMPS admin recommendation.
+- **JSON hardware format** -- removed `gpu_ram_gb` from default output (Apple Silicon uses unified memory, `cpu_ram_gb` is sufficient). Optional checkbox to re-enable.
 - All user-facing references renamed from "Blackjack" to "Nester Carry Chain" / "Nester-CC"
 - Checkbox renamed from "CarryChain" to "NesterCarryChain"
 - Version bumped to 1.3.0 across Info.plist, User-Agent, PrimeNet registration, and JSON output

@@ -5274,53 +5274,35 @@ static std::string u128_to_str(unsigned __int128 v) {
     userField.autoresizingMask = NSViewMinYMargin;
     [cv addSubview:userField];
 
-    // Status indicator
-    NSTextField *statusLbl = [[NSTextField alloc] initWithFrame:NSMakeRect(270, y - 16, 200, 14)];
-    statusLbl.font = [NSFont systemFontOfSize:10];
-    statusLbl.bezeled = NO; statusLbl.editable = NO; statusLbl.drawsBackground = NO;
-    statusLbl.autoresizingMask = NSViewMinYMargin;
-    if (_primenet->is_registered()) {
-        statusLbl.stringValue = @"Registered";
-        statusLbl.textColor = [NSColor colorWithSRGBRed:0.2 green:0.7 blue:0.2 alpha:1.0];
-    } else {
-        statusLbl.stringValue = @"Not registered";
-        statusLbl.textColor = [NSColor secondaryLabelColor];
-    }
-    statusLbl.tag = 8010;
-    [cv addSubview:statusLbl];
+    // AutoPrimeNet notice
+    NSTextField *apnNote = [[NSTextField alloc] initWithFrame:NSMakeRect(270, y - 16, 280, 14)];
+    apnNote.stringValue = @"All server communication via AutoPrimeNet (worktodo.txt / results.json.txt)";
+    apnNote.font = [NSFont systemFontOfSize:9];
+    apnNote.textColor = [NSColor secondaryLabelColor];
+    apnNote.bezeled = NO; apnNote.editable = NO; apnNote.drawsBackground = NO;
+    apnNote.autoresizingMask = NSViewMinYMargin | NSViewWidthSizable;
+    [cv addSubview:apnNote];
 
     y -= 28;
 
-    // Buttons row
-    NSButton *registerBtn = [self buttonAt:NSMakeRect(14, y - 24, 100, 24)
-        title:@"Register" action:@selector(gimpsRegister:)];
-    registerBtn.font = [NSFont systemFontOfSize:10];
-    registerBtn.autoresizingMask = NSViewMinYMargin;
-    [cv addSubview:registerBtn];
-
-    NSButton *getWorkBtn = [self buttonAt:NSMakeRect(120, y - 24, 110, 24)
-        title:@"Get Work" action:@selector(gimpsGetWork:)];
-    getWorkBtn.font = [NSFont boldSystemFontOfSize:10];
-    getWorkBtn.autoresizingMask = NSViewMinYMargin;
-    [cv addSubview:getWorkBtn];
-
-    NSButton *runWorkBtn = [self buttonAt:NSMakeRect(236, y - 24, 120, 24)
+    // Buttons row: Run / Stop (local only) + AutoPrimeNet Settings
+    NSButton *runWorkBtn = [self buttonAt:NSMakeRect(14, y - 24, 120, 24)
         title:@"Run Assignment" action:@selector(gimpsRunAssignment:)];
     runWorkBtn.font = [NSFont boldSystemFontOfSize:10];
     runWorkBtn.autoresizingMask = NSViewMinYMargin;
     [cv addSubview:runWorkBtn];
 
-    NSButton *stopBtn = [self buttonAt:NSMakeRect(362, y - 24, 50, 24)
+    NSButton *stopBtn = [self buttonAt:NSMakeRect(140, y - 24, 50, 24)
         title:@"Stop" action:@selector(gimpsStopAssignment:)];
     stopBtn.font = [NSFont boldSystemFontOfSize:10];
     stopBtn.autoresizingMask = NSViewMinYMargin;
     [cv addSubview:stopBtn];
 
-    NSButton *submitBtn = [self buttonAt:NSMakeRect(418, y - 24, 110, 24)
-        title:@"Submit Results" action:@selector(gimpsSubmitResults:)];
-    submitBtn.font = [NSFont systemFontOfSize:10];
-    submitBtn.autoresizingMask = NSViewMinYMargin;
-    [cv addSubview:submitBtn];
+    NSButton *apnBtn = [self buttonAt:NSMakeRect(210, y - 24, 150, 24)
+        title:@"AutoPrimeNet Settings" action:@selector(showAutoPrimeNetPanel:)];
+    apnBtn.font = [NSFont systemFontOfSize:10];
+    apnBtn.autoresizingMask = NSViewMinYMargin;
+    [cv addSubview:apnBtn];
 
     y -= 30;
 
@@ -5331,20 +5313,13 @@ static std::string u128_to_str(unsigned __int128 v) {
     jsonBtn.autoresizingMask = NSViewMinYMargin;
     [cv addSubview:jsonBtn];
 
-    NSTextField *jsonHint = [[NSTextField alloc] initWithFrame:NSMakeRect(150, y - 22, 200, 14)];
-    jsonHint.stringValue = @"Build and preview JSON result lines.";
+    NSTextField *jsonHint = [[NSTextField alloc] initWithFrame:NSMakeRect(150, y - 22, 280, 14)];
+    jsonHint.stringValue = @"Build and preview JSON result lines (local only, not submitted).";
     jsonHint.font = [NSFont systemFontOfSize:9];
     jsonHint.textColor = [NSColor secondaryLabelColor];
     jsonHint.bezeled = NO; jsonHint.editable = NO; jsonHint.drawsBackground = NO;
     jsonHint.autoresizingMask = NSViewMinYMargin;
     [cv addSubview:jsonHint];
-
-    // AutoPrimeNet Settings button (same row)
-    NSButton *apnBtn = [self buttonAt:NSMakeRect(370, y - 24, 150, 24)
-        title:@"AutoPrimeNet Settings" action:@selector(showAutoPrimeNetPanel:)];
-    apnBtn.font = [NSFont systemFontOfSize:10];
-    apnBtn.autoresizingMask = NSViewMinYMargin;
-    [cv addSubview:apnBtn];
 
     y -= 30;
 
@@ -5579,7 +5554,18 @@ static std::string u128_to_str(unsigned __int128 v) {
     abortNote.bezeled = NO; abortNote.editable = NO; abortNote.drawsBackground = NO;
     abortNote.autoresizingMask = NSViewMinYMargin | NSViewWidthSizable;
     [cv addSubview:abortNote];
-    y -= 42;
+    y -= 22;
+
+    // Factor remaining composites before reporting
+    NSButton *factorCompCheck = [[NSButton alloc] initWithFrame:NSMakeRect(14, y - 18, 350, 18)];
+    factorCompCheck.buttonType = NSButtonTypeSwitch;
+    factorCompCheck.title = @"Factor remaining composites before reporting (trial division)";
+    factorCompCheck.font = [NSFont systemFontOfSize:10];
+    factorCompCheck.state = NSControlStateValueOff;
+    factorCompCheck.tag = 8041;
+    factorCompCheck.autoresizingMask = NSViewMinYMargin;
+    [cv addSubview:factorCompCheck];
+    y -= 22;
 
     NSBox *sep2 = [[NSBox alloc] initWithFrame:NSMakeRect(14, y, W - 28, 1)];
     sep2.boxType = NSBoxSeparator;
@@ -6107,7 +6093,7 @@ static std::string u128_to_str(unsigned __int128 v) {
             [js appendFormat:@",\"cpu_p_cores\":%d,\"cpu_e_cores\":%d", perf, eff];
         if (gpu_cores > 0)
             [js appendFormat:@",\"gpu_cores\":%d", gpu_cores];
-        [js appendFormat:@",\"cpu_ram_gb\":%d,\"gpu_ram_gb\":%d}", ram_gb, ram_gb];
+        [js appendFormat:@",\"cpu_ram_gb\":%d}", ram_gb];
     }
 
     // CRC32 checksum
@@ -6703,73 +6689,15 @@ static std::string u128_to_str(unsigned __int128 v) {
 
 // ── GIMPS Actions ────────────────────────────────────────────────────
 
-- (void)gimpsRegister:(id)sender {
-    NSWindow *win = [sender window];
-    NSView *cv = win.contentView;
-    NSTextField *userField = [cv viewWithTag:8001];
-    NSTextField *statusLbl = [cv viewWithTag:8010];
-
-    if (userField) {
-        std::string user = userField.stringValue.UTF8String;
-        if (!user.empty()) {
-            _primenet->set_username(user);
-        }
-    }
-
-    __weak AppDelegate *weakSelf = self;
-    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
-        @autoreleasepool {
-            AppDelegate *s = weakSelf;
-            if (!s) return;
-            bool ok = s->_primenet->register_machine();
-            if (ok) {
-                s->_primenet->set_work_preference();
-            }
-            dispatch_async(dispatch_get_main_queue(), ^{
-                if (statusLbl) {
-                    if (s->_primenet->is_registered()) {
-                        statusLbl.stringValue = @"Registered";
-                        statusLbl.textColor = [NSColor colorWithSRGBRed:0.2 green:0.7 blue:0.2 alpha:1.0];
-                    } else {
-                        statusLbl.stringValue = @"Registration failed";
-                        statusLbl.textColor = [NSColor colorWithSRGBRed:0.8 green:0.2 blue:0.2 alpha:1.0];
-                    }
-                }
-            });
-        }
-    });
-}
-
-- (void)gimpsGetWork:(id)sender {
-    NSWindow *win = [sender window];
-    NSView *cv = win.contentView;
-    NSTextField *assignInfo = [cv viewWithTag:8020];
-
-    __weak AppDelegate *weakSelf = self;
-    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
-        @autoreleasepool {
-            AppDelegate *s = weakSelf;
-            if (!s) return;
-            auto assignment = s->_primenet->fetch_work();
-            dispatch_async(dispatch_get_main_queue(), ^{
-                if (assignInfo && assignment.valid) {
-                    NSMutableString *astr = [NSMutableString string];
-                    for (auto& a : s->_primenet->state().assignments) {
-                        [astr appendFormat:@"M%llu  TF %d-%d bits  [%s]\n",
-                            a.exponent, (int)a.bit_lo, (int)a.bit_hi,
-                            a.key.c_str()];
-                    }
-                    assignInfo.stringValue = astr;
-                    assignInfo.textColor = [NSColor labelColor];
-                }
-            });
-        }
-    });
-}
+// gimpsRegister and gimpsGetWork removed -- all API communication now
+// routes through AutoPrimeNet. Assignments come from worktodo.txt,
+// results go to results.json.txt. AutoPrimeNet handles server comms.
 
 - (void)gimpsRunAssignment:(id)sender {
-    if (_primenet->pending_count() == 0) {
-        [self appendText:@"GIMPS: no assignments to run. Get work first.\n"];
+    // Read assignments from worktodo.txt (AutoPrimeNet workflow)
+    auto worktodo = _primenet->read_worktodo();
+    if (worktodo.empty()) {
+        [self appendText:@"GIMPS: no assignments in worktodo.txt. Use AutoPrimeNet to get work.\n"];
         return;
     }
 
@@ -6788,7 +6716,10 @@ static std::string u128_to_str(unsigned __int128 v) {
         }
     }
 
-    auto& assignment = _primenet->state().assignments.front();
+    auto& assignment = worktodo.front();
+    // Store assignment in primenet state so submit handler can find it
+    _primenet->mutable_state().assignments.clear();
+    _primenet->mutable_state().assignments.push_back(assignment);
     uint64_t exponent = assignment.exponent;
 
     // Configure the Mersenne TF task with this exponent
@@ -6838,7 +6769,7 @@ static std::string u128_to_str(unsigned __int128 v) {
     auto it = tasks.find(prime::TaskType::MersenneTrial);
     if (it == tasks.end()) return;
 
-    if (_primenet->pending_count() == 0) {
+    if (_primenet->state().assignments.empty()) {
         [self appendText:@"GIMPS: no assignments to submit results for.\n"];
         return;
     }
@@ -6937,29 +6868,34 @@ static std::string u128_to_str(unsigned __int128 v) {
         }
     }
 
+    // Write result to results.json.txt for AutoPrimeNet to pick up
     __weak AppDelegate *weakSelf = self;
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
         @autoreleasepool {
             AppDelegate *s = weakSelf;
             if (!s) return;
-            bool ok = s->_primenet->submit_result(result);
+            // Build JSON and append to results.json.txt
+            std::string json = s->_primenet->build_result_json(result);
+            std::string path = std::string(DATA_DIR.UTF8String) + "/results.json.txt";
+            std::ofstream f(path, std::ios::app);
+            bool ok = false;
+            if (f.is_open()) {
+                f << json << "\n";
+                f.close();
+                ok = true;
+            }
+            // Remove completed line from worktodo.txt
+            if (ok && !s->_primenet->mutable_state().assignments.empty()) {
+                s->_primenet->remove_worktodo(s->_primenet->mutable_state().assignments.front());
+            }
             dispatch_async(dispatch_get_main_queue(), ^{
                 if (ok) {
-                    [s appendText:@"GIMPS: result submitted to mersenne.org successfully.\n"];
-                    NSAlert *alert = [[NSAlert alloc] init];
-                    alert.messageText = @"Result Submitted";
-                    alert.informativeText = @"Your result was submitted to mersenne.org successfully.";
-                    alert.alertStyle = NSAlertStyleInformational;
-                    [alert addButtonWithTitle:@"OK"];
-                    [alert runModal];
+                    [s appendText:[NSString stringWithFormat:
+                        @"GIMPS: result written to results.json.txt. AutoPrimeNet will submit to mersenne.org.\n"]];
+                    // Clear from in-memory state
+                    s->_primenet->mutable_state().assignments.clear();
                 } else {
-                    [s appendText:@"GIMPS: FAILED to submit result — see log above for server response.\n"];
-                    NSAlert *alert = [[NSAlert alloc] init];
-                    alert.messageText = @"Submission Failed";
-                    alert.informativeText = @"Could not submit to mersenne.org. Check the log for details (server response is logged above).";
-                    alert.alertStyle = NSAlertStyleCritical;
-                    [alert addButtonWithTitle:@"OK"];
-                    [alert runModal];
+                    [s appendText:@"GIMPS: FAILED to write results.json.txt.\n"];
                 }
             });
         }
