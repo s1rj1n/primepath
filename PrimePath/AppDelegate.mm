@@ -6093,7 +6093,7 @@ static std::string u128_to_str(unsigned __int128 v) {
             [js appendFormat:@",\"cpu_p_cores\":%d,\"cpu_e_cores\":%d", perf, eff];
         if (gpu_cores > 0)
             [js appendFormat:@",\"gpu_cores\":%d", gpu_cores];
-        [js appendFormat:@",\"cpu_ram_gb\":%d}", ram_gb];
+        [js appendFormat:@",\"cpu_ram_gb\":\"%d (Unified)\",\"gpu_ram_gb\":\"%d (Unified)\"}", ram_gb, ram_gb];
     }
 
     // CRC32 checksum
