@@ -76,7 +76,7 @@ Benchmark accessible from the main toolbar ("Bench") and Markov Predict window (
 
 All server communication with [mersenne.org](https://www.mersenne.org) is routed through [AutoPrimeNet](https://github.com/tdulcet/AutoPrimeNet), the recommended assignment handler used by all major third-party GIMPS clients (Mlucas, GpuOwl, PRPLL, mfaktc, mfakto, etc.). PrimePath does not talk to the PrimeNet API directly. AutoPrimeNet handles assignment management, result submission, email notifications, log rotation, proxy support, stall monitoring, and version checking.
 
-GPU-found factors are independently verified on CPU using carry-chain modular exponentiation before reporting. Results use the PrimeNet JSON format with CRC32 checksum, and support known-factor lists (composite factor stripping, continue-after-factor).
+GPU-found factors are independently verified on CPU using carry-chain modular exponentiation before reporting. Composite factors are automatically split via trial division + Pollard rho before submission. Results use the PrimeNet JSON format with CRC32 checksum, and support known-factor lists (composite factor stripping, continue-after-factor).
 
 ### Setup
 
@@ -98,6 +98,29 @@ Built-in GUI editor for building, validating, and testing PrimeNet JSON results.
 - **Auto-Fill** – populates fields from system info, current assignment, and discoveries
 - **Send to Server** – configurable server URL and credentials string, sends the JSON in the `&m=` parameter with full confirmation before submission
 - Dual-pane output with editable JSON text and validation/server log
+- **JSON sample button** -- generates real JSON from `build_result_json` for format verification
+
+### JSON Format
+
+Hardware fields adapt to the system architecture:
+
+| System | chip field | core fields | RAM field |
+|--------|-----------|-------------|-----------|
+| Unified SoC (Apple Silicon) | `chip` | `cpu_p_cores`, `cpu_e_cores`, `gpu_cores` | `ram_gb` |
+| Discrete GPU | `cpu_chip`, `gpu_chip` | `cpu_cores`, `gpu_cores` | `cpu_ram_gb`, `gpu_ram_gb` |
+
+Example (factor found, Apple M5):
+```json
+{"timestamp":"2026-04-13 23:45:29","exponent":67,"worktype":"TF","status":"F",
+ "bitlo":27,"bithi":28,"rangecomplete":false,"factors":["193707721"],
+ "program":{"name":"PrimePath","version":"1.3.0","kernel":"Metal96bit"},
+ "os":{"os":"macOS","version":"25.3.0","architecture":"ARM_64"},
+ "user":"s1rj1n","computer":"Sergeis-MacBook-Pro.local",
+ "aid":"A1B2C3D4E5F6A1B2C3D4E5F6A1B2C3D4",
+ "hardware":{"chip":"Apple M5","cpu_p_cores":4,"cpu_e_cores":6,
+  "gpu_cores":10,"ram_gb":24},
+ "checksum":{"version":1,"checksum":"5EF5EF6C"}}
+```
 
 ## Distributed Search
 

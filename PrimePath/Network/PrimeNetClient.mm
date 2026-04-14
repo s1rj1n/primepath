@@ -522,15 +522,15 @@ std::string PrimeNetClient::build_result_json(const TFResult& result) {
         js << ",\"aid\":\"" << result.assignment_key << "\"";
     }
 
-    js << ",\"hardware\":{\"chip\":\"" << chip_str << "\""
-       << ",\"cpu_cores\":" << ncpu;
+    js << ",\"hardware\":{\"chip\":\"" << chip_str << "\"";
     if (perf_cores > 0)
         js << ",\"cpu_p_cores\":" << perf_cores
            << ",\"cpu_e_cores\":" << eff_cores;
+    else
+        js << ",\"cpu_cores\":" << ncpu;
     if (gpu_cores > 0)
         js << ",\"gpu_cores\":" << gpu_cores;
-    js << ",\"cpu_ram_gb\":\"" << ram_gb << " (Unified)\""
-       << ",\"gpu_ram_gb\":\"" << ram_gb << " (Unified)\""
+    js << ",\"ram_gb\":" << ram_gb
        << "}";
 
     // CRC32 checksum (anti-tampering)

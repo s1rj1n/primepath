@@ -821,6 +821,13 @@ static const int EQ_HISTORY = 32; // number of vertical bars (time history)
     ccBenchBtn.toolTip = @"Run Nester Carry Chain benchmark";
     ccBenchBtn.autoresizingMask = NSViewMinYMargin;
     [cv addSubview:ccBenchBtn];
+
+    NSButton *jsonSampleBtn = [self buttonAt:NSMakeRect(M + 222, y - 19, 42, 18)
+        title:@"JSON" action:@selector(runJSONSample:)];
+    jsonSampleBtn.font = [NSFont systemFontOfSize:8];
+    jsonSampleBtn.toolTip = @"Output JSON result samples from build_result_json";
+    jsonSampleBtn.autoresizingMask = NSViewMinYMargin;
+    [cv addSubview:jsonSampleBtn];
     y -= 22;
 
     // From field
@@ -3955,17 +3962,65 @@ static const int EQ_HISTORY = 32; // number of vertical bars (time history)
 
         @"GIMPS / PRIMENET\n"
         @"----------------\n"
-        @"Click 'GIMPS' to connect to the Great Internet Mersenne Prime Search.\n"
-        @"PrimePath submits trial factoring results to mersenne.org via PrimeNet v5.\n\n"
+        @"Click 'GIMPS' to open the Great Internet Mersenne Prime Search panel.\n"
+        @"PrimePath routes all server communication through AutoPrimeNet.\n"
+        @"It does not talk to the PrimeNet API directly.\n\n"
 
-        @"  1. Enter your mersenne.org username and click Register.\n"
-        @"  2. Click 'Get Assignment' to fetch a trial factoring range.\n"
-        @"  3. Click 'Start TF' to begin GPU trial factoring of 2^p-1.\n"
-        @"  4. When the assigned bit range is complete, click 'Submit'.\n\n"
+        @"  1. Click 'Start TF' to run trial factoring from worktodo.txt.\n"
+        @"  2. Results are appended to results.json.txt automatically.\n"
+        @"  3. Completed lines are removed from worktodo.txt.\n"
+        @"  4. AutoPrimeNet picks up results.json.txt and submits to mersenne.org.\n\n"
 
-        @"  Factor-found results are submitted immediately.\n"
-        @"  No-factor results require the full range to be exhausted first.\n"
-        @"  Results are also saved to results.json.txt in the data directory.\n\n"
+        @"  GPU-found factors are verified on CPU before reporting.\n"
+        @"  Composite factors are split via trial division + Pollard rho.\n"
+        @"  Results use PrimeNet JSON format with CRC32 checksum.\n\n"
+
+        @"HOW TO USE AUTOPRIMENET\n"
+        @"----------------------\n"
+        @"AutoPrimeNet is the recommended assignment handler for all major GIMPS\n"
+        @"clients (Mlucas, GpuOwl, PRPLL, mfaktc, mfakto, PrimePath). It handles\n"
+        @"registration, assignment fetching, result submission, email notifications,\n"
+        @"log rotation, proxy support, stall monitoring, and version checking.\n\n"
+
+        @"  Step 1: Install AutoPrimeNet\n"
+        @"    git clone https://github.com/tdulcet/AutoPrimeNet.git\n"
+        @"    cd AutoPrimeNet\n"
+        @"    pip install -r requirements.txt\n\n"
+
+        @"  Step 2: Run the setup wizard\n"
+        @"    python3 autoprimenet.py --setup\n"
+        @"    - Enter your mersenne.org username and password.\n"
+        @"    - Select work type: Trial Factoring (TF).\n"
+        @"    - Set the working directory to PrimePath's data directory:\n"
+        @"      ~/Library/Application Support/PrimePath/\n"
+        @"    - The wizard creates a local.ini config file.\n\n"
+
+        @"  Step 3: Start AutoPrimeNet\n"
+        @"    python3 autoprimenet.py\n"
+        @"    It registers your machine with mersenne.org, fetches TF assignments,\n"
+        @"    and writes them to worktodo.txt in the working directory.\n\n"
+
+        @"  Step 4: Run PrimePath\n"
+        @"    Open PrimePath, click GIMPS, click Start TF.\n"
+        @"    PrimePath reads worktodo.txt, runs assignments on the GPU,\n"
+        @"    writes results to results.json.txt, and removes completed lines.\n\n"
+
+        @"  Step 5: AutoPrimeNet submits results\n"
+        @"    AutoPrimeNet monitors results.json.txt and submits completed\n"
+        @"    results to mersenne.org automatically. Keep it running alongside\n"
+        @"    PrimePath.\n\n"
+
+        @"  File locations:\n"
+        @"    worktodo.txt       Assignments from AutoPrimeNet (input)\n"
+        @"    results.json.txt   Completed results (output)\n"
+        @"    local.ini          AutoPrimeNet configuration\n"
+        @"    All in: ~/Library/Application Support/PrimePath/\n\n"
+
+        @"  Tips:\n"
+        @"    - Run AutoPrimeNet in a terminal tab alongside PrimePath.\n"
+        @"    - AutoPrimeNet refills worktodo.txt when it gets low.\n"
+        @"    - Check mersenne.org/results/ to confirm submissions.\n"
+        @"    - Use --help for all AutoPrimeNet options.\n\n"
 
         @"EXPRESSION MODE\n"
         @"---------------\n"
@@ -4252,6 +4307,79 @@ static std::string u128_to_str(unsigned __int128 v) {
     char buf[40]; int pos = 39; buf[pos] = 0;
     while (v > 0) { buf[--pos] = '0' + (int)(v % 10); v /= 10; }
     return &buf[pos];
+}
+
+- (void)runJSONSample:(id)sender {
+    _activeLogTab = 2;
+    [self.logTabView selectTabViewItemAtIndex:2];
+
+    __weak AppDelegate *weakSelf = self;
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        AppDelegate *ss = weakSelf;
+        if (!ss) return;
+
+        auto log = [ss](NSString *s) {
+            dispatch_async(dispatch_get_main_queue(), ^{
+                [ss appendText:[s stringByAppendingString:@"\n"]];
+            });
+        };
+
+        // Sample 1: Factor found -- M67 has factor 193707721
+        {
+            primenet::TFResult r;
+            r.exponent = 67;
+            r.bit_lo = 27;
+            r.bit_hi = 28;
+            r.factor_found = true;
+            r.factors = {"193707721"};
+            r.assignment_key = "A1B2C3D4E5F6A1B2C3D4E5F6A1B2C3D4";
+            r.range_complete = false;
+            std::string json = ss->_primenet->build_result_json(r);
+            log([NSString stringWithUTF8String:json.c_str()]);
+        }
+
+        // Sample 2: No factor, range complete
+        {
+            primenet::TFResult r;
+            r.exponent = 82589933;
+            r.bit_lo = 77;
+            r.bit_hi = 78;
+            r.factor_found = false;
+            r.assignment_key = "A1B2C3D4E5F6A1B2C3D4E5F6A1B2C3D4";
+            r.range_complete = true;
+            std::string json = ss->_primenet->build_result_json(r);
+            log([NSString stringWithUTF8String:json.c_str()]);
+        }
+
+        // Sample 3: Factor found with known-factors -- M67
+        // 193707721 and 761838257287 are both real factors of M67
+        {
+            primenet::TFResult r;
+            r.exponent = 67;
+            r.bit_lo = 27;
+            r.bit_hi = 40;
+            r.factor_found = true;
+            r.factors = {"761838257287"};
+            r.assignment_key = "A1B2C3D4E5F6A1B2C3D4E5F6A1B2C3D4";
+            r.range_complete = true;
+            r.known_factors = {"193707721"};
+            std::string json = ss->_primenet->build_result_json(r);
+            log([NSString stringWithUTF8String:json.c_str()]);
+        }
+
+        // Sample 4: N/A assignment (no AID)
+        {
+            primenet::TFResult r;
+            r.exponent = 82589933;
+            r.bit_lo = 78;
+            r.bit_hi = 79;
+            r.factor_found = false;
+            r.assignment_key = "";
+            r.range_complete = true;
+            std::string json = ss->_primenet->build_result_json(r);
+            log([NSString stringWithUTF8String:json.c_str()]);
+        }
+    });
 }
 
 - (void)carryChainToggled:(id)sender {
@@ -6088,12 +6216,14 @@ static std::string u128_to_str(unsigned __int128 v) {
             IOObjectRelease(iter);
         }
 
-        [js appendFormat:@",\"hardware\":{\"chip\":\"%@\",\"cpu_cores\":%d", chipStr, ncpu];
+        [js appendFormat:@",\"hardware\":{\"chip\":\"%@\"", chipStr];
         if (perf > 0)
             [js appendFormat:@",\"cpu_p_cores\":%d,\"cpu_e_cores\":%d", perf, eff];
+        else
+            [js appendFormat:@",\"cpu_cores\":%d", ncpu];
         if (gpu_cores > 0)
             [js appendFormat:@",\"gpu_cores\":%d", gpu_cores];
-        [js appendFormat:@",\"cpu_ram_gb\":\"%d (Unified)\",\"gpu_ram_gb\":\"%d (Unified)\"}", ram_gb, ram_gb];
+        [js appendFormat:@",\"ram_gb\":%d}", ram_gb];
     }
 
     // CRC32 checksum

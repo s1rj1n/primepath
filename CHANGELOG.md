@@ -27,13 +27,17 @@
 
 ### Fixed
 - **Popup window crashes** -- reopening Carry Chain Info, Theory, or Markov Predict popups caused SIGSEGV in `objc_setAssociatedObject`. Fixed by setting `releasedWhenClosed = NO` on all popup windows.
+- **JSON button crash** -- SIGSEGV in `runJSONSample:` from dangling reference in async dispatch lambda. Fixed by capturing AppDelegate pointer by value instead of by reference.
 - **Startup noise** -- all 300 discoveries were dumped to output on startup. Replaced with type-summary (e.g. "Discoveries: 300 total (General: 295, Wieferich: 2, Wilson: 3)").
 - **Toolbar layout overlap** -- NesterCarryChain checkbox, ?, and Bench buttons were overlapping From/To fields. Moved to own row.
 - **Benchmark dead-code elimination** -- compiler at -O2 was eliminating benchmark loops whose results were unused. Added volatile sinks.
 
 ### Changed
 - **PrimeNet API removed** -- all server communication now routes through AutoPrimeNet. Register, Get Work, and Submit Results buttons replaced with AutoPrimeNet-only workflow (worktodo.txt in, results.json.txt out). Direct v5 API calls removed from the UI per GIMPS admin recommendation.
-- **JSON hardware format** -- removed `gpu_ram_gb` from default output (Apple Silicon uses unified memory, `cpu_ram_gb` is sufficient). Optional checkbox to re-enable.
+- **JSON hardware format revised** -- per GIMPS admin feedback: `chip` for unified SoC (Apple Silicon), `cpu_chip`/`gpu_chip` for discrete GPU systems. `cpu_p_cores`/`cpu_e_cores` when breakdown is known, `cpu_cores` as fallback. `ram_gb` as plain integer for unified memory, `cpu_ram_gb`/`gpu_ram_gb` for discrete.
+- **Composite factor splitting** -- discovered factors that are composite are automatically split via trial division + Pollard-Brent rho before reporting. Known prime components are stripped; only new prime factors are submitted.
+- **JSON sample button** -- toolbar button generates four real JSON result samples from `build_result_json` (factor found, no factor, known-factors, N/A assignment) for format verification.
+- **AutoPrimeNet help section** -- in-app help now includes step-by-step AutoPrimeNet setup guide (install, setup wizard, file locations, workflow).
 - All user-facing references renamed from "Blackjack" to "Nester Carry Chain" / "Nester-CC"
 - Checkbox renamed from "CarryChain" to "NesterCarryChain"
 - Version bumped to 1.3.0 across Info.plist, User-Agent, PrimeNet registration, and JSON output
