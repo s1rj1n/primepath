@@ -1,5 +1,16 @@
 # Changelog
 
+## v1.4 -- AutoPrimeNet Checkpoint Support (2026-04-16)
+
+### New
+- **Mersenne TF checkpoint file** (`mersenne_tf_checkpoint.txt`) -- written every 30 seconds with all fields AutoPrimeNet needs for progress reporting: exponent, bit range (bit_lo/bit_hi), current k-value, tested count, cumulative elapsed time, assignment key, and timestamp. AutoPrimeNet reads this to calculate percentage, speed, and ETA.
+- **Cumulative elapsed time tracking** -- wall time is accumulated across save intervals and persisted across app restarts. Both GPU and CPU code paths track elapsed time, including the final interval when the worker stops.
+- **JSON sample button** now outputs a complete sample `mersenne_tf_checkpoint.txt` with field descriptions and progress calculation formulas.
+
+### Changed
+- Help text and data file listings updated to document `mersenne_tf_checkpoint.txt`.
+- Version bumped to 1.4.0 across Info.plist, User-Agent, PrimeNet registration, JSON output, and About panel.
+
 ## v1.3 -- Nester Carry Chain Three-Gear Engine (2026-04-13)
 
 ### New

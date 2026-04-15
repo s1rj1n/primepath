@@ -223,6 +223,30 @@ void TaskManager::load_state() {
         }
     }
 
+    // Load Mersenne TF checkpoint (elapsed time, bit range, assignment key)
+    {
+        std::string tf_path = _data_dir + "/mersenne_tf_checkpoint.txt";
+        std::ifstream tf(tf_path);
+        if (tf.is_open()) {
+            auto it = _tasks.find(TaskType::MersenneTrial);
+            if (it != _tasks.end()) {
+                std::string tline;
+                while (std::getline(tf, tline)) {
+                    if (tline.empty()) continue;
+                    std::istringstream tiss(tline);
+                    std::string field;
+                    tiss >> field;
+                    if (field == "elapsed_sec") tiss >> it->second.elapsed_sec;
+                    else if (field == "bit_lo") tiss >> it->second.bit_lo;
+                    else if (field == "bit_hi") tiss >> it->second.bit_hi;
+                    else if (field == "assignment_key") tiss >> it->second.assignment_key;
+                }
+                log("Restored Mersenne TF checkpoint (elapsed=" +
+                    std::to_string((int)it->second.elapsed_sec) + "s)");
+            }
+        }
+    }
+
     // Load discoveries from journal (authoritative) or fall back to .txt
     // Preserve pre-loaded discoveries from init_defaults()
     auto preloaded = _discoveries;
@@ -319,6 +343,22 @@ void TaskManager::save_state() {
               << task.start_pos << "\n";
         }
         f << "# saved: " << timestamp() << "\n";
+
+        // Write Mersenne TF checkpoint for AutoPrimeNet progress reporting
+        auto mt = _tasks.find(TaskType::MersenneTrial);
+        if (mt != _tasks.end() && mt->second.end_pos > 0) {
+            auto& t = mt->second;
+            std::string tf_path = _data_dir + "/mersenne_tf_checkpoint.txt";
+            std::ofstream tf(tf_path);
+            tf << "exponent " << t.end_pos << "\n"
+               << "bit_lo " << (int)t.bit_lo << "\n"
+               << "bit_hi " << (int)t.bit_hi << "\n"
+               << "current_k " << t.current_pos << "\n"
+               << "tested " << t.tested_count << "\n"
+               << "elapsed_sec " << std::fixed << std::setprecision(1) << t.elapsed_sec << "\n"
+               << "assignment_key " << t.assignment_key << "\n"
+               << "timestamp " << timestamp() << "\n";
+        }
     }
     // Rewrite all .txt files from memory — recovers from editor clobbering
     flush_all_files();
@@ -2853,6 +2893,7 @@ void TaskManager::run_mersenne_trial(SearchTask& task) {
             auto now = std::chrono::steady_clock::now();
             double elapsed = std::chrono::duration<double>(now - last_save).count();
             if (elapsed > SAVE_INTERVAL_SEC) {
+                task.elapsed_sec += elapsed;
                 // Summary log only on save intervals (~30s)
                 double rate = summary_tested / elapsed;
                 log("Mersenne TF: " + std::to_string(task.tested_count / 1000000) +
@@ -2951,7 +2992,9 @@ void TaskManager::run_mersenne_trial(SearchTask& task) {
             task.current_pos = k_end;
 
             auto now = std::chrono::steady_clock::now();
-            if (std::chrono::duration<double>(now - last_save).count() > SAVE_INTERVAL_SEC) {
+            double cpu_elapsed = std::chrono::duration<double>(now - last_save).count();
+            if (cpu_elapsed > SAVE_INTERVAL_SEC) {
+                task.elapsed_sec += cpu_elapsed;
                 save_scan_summary(TaskType::MersenneTrial, summary_start, task.current_pos,
                                   summary_tested, summary_hits);
                 save_state();
@@ -2963,6 +3006,10 @@ void TaskManager::run_mersenne_trial(SearchTask& task) {
           } // @autoreleasepool
         }
     }
+
+    // Capture any remaining elapsed time since last save
+    auto stop_time = std::chrono::steady_clock::now();
+    task.elapsed_sec += std::chrono::duration<double>(stop_time - last_save).count();
 
     gpu_owner.store(-1);
     if (summary_tested > 0)

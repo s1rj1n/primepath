@@ -115,6 +115,10 @@ struct SearchTask {
     double bit_lo = 0;
     double bit_hi = 0;
 
+    // Mersenne TF: cumulative wall time and assignment ID for AutoPrimeNet
+    double elapsed_sec = 0;
+    std::string assignment_key;
+
     SearchTask() = default;
     SearchTask(TaskType t, uint64_t start, uint64_t end = 0)
         : type(t), start_pos(start), current_pos(start), end_pos(end) {}
@@ -125,7 +129,8 @@ struct SearchTask {
           current_pos(o.current_pos), end_pos(o.end_pos),
           found_count(o.found_count), tested_count(o.tested_count),
           rate(o.rate), known_factors(std::move(o.known_factors)),
-          bit_lo(o.bit_lo), bit_hi(o.bit_hi) {
+          bit_lo(o.bit_lo), bit_hi(o.bit_hi),
+          elapsed_sec(o.elapsed_sec), assignment_key(std::move(o.assignment_key)) {
         should_run.store(o.should_run.load());
     }
 };

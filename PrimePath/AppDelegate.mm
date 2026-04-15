@@ -3852,8 +3852,8 @@ static const int EQ_HISTORY = 32; // number of vertical bars (time history)
     NSDictionary *opts = @{
         @"ApplicationName": @"PrimePath",
         @"Copyright": @"Development by Sergei Nester\nSuper smart coding by Claude\nsnester@viewbuild.com",
-        @"ApplicationVersion": @"1.3.0",
-        @"Version": @"1.3.0",
+        @"ApplicationVersion": @"1.4.0",
+        @"Version": @"1.4.0",
     };
     [[NSApplication sharedApplication] orderFrontStandardAboutPanelWithOptions:opts];
 }
@@ -4011,9 +4011,10 @@ static const int EQ_HISTORY = 32; // number of vertical bars (time history)
         @"    PrimePath.\n\n"
 
         @"  File locations:\n"
-        @"    worktodo.txt       Assignments from AutoPrimeNet (input)\n"
-        @"    results.json.txt   Completed results (output)\n"
-        @"    local.ini          AutoPrimeNet configuration\n"
+        @"    worktodo.txt                  Assignments from AutoPrimeNet (input)\n"
+        @"    results.json.txt              Completed results (output)\n"
+        @"    mersenne_tf_checkpoint.txt    Live progress for AutoPrimeNet (every 30s)\n"
+        @"    local.ini                     AutoPrimeNet configuration\n"
         @"    All in: ~/Library/Application Support/PrimePath/\n\n"
 
         @"  Tips:\n"
@@ -4110,11 +4111,13 @@ static const int EQ_HISTORY = 32; // number of vertical bars (time history)
         @"----------\n"
         @"All state is saved to: ~/Documents/primes/primelocations/\n\n"
 
-        @"  search_progress.txt   Task positions, status, counts. Auto-saved every 30s.\n"
-        @"  discoveries.txt       All prime discoveries with timestamps.\n"
-        @"  primenet_state.txt    PrimeNet registration, assignments, machine GUID.\n"
-        @"  results.json.txt     Trial factoring results (mfaktc-compatible format).\n"
-        @"  TestCatalog.txt       Custom test catalog (editable, reloadable from UI).\n\n"
+        @"  search_progress.txt          Task positions, status, counts. Auto-saved every 30s.\n"
+        @"  mersenne_tf_checkpoint.txt   Mersenne TF progress for AutoPrimeNet (k-pos, bit range,\n"
+        @"                               elapsed time, assignment key). Written every 30s.\n"
+        @"  discoveries.txt              All prime discoveries with timestamps.\n"
+        @"  primenet_state.txt           PrimeNet registration, assignments, machine GUID.\n"
+        @"  results.json.txt             Trial factoring results (mfaktc-compatible format).\n"
+        @"  TestCatalog.txt              Custom test catalog (editable, reloadable from UI).\n\n"
 
         @"  Progress is restored automatically on relaunch.\n\n"
 
@@ -4379,6 +4382,55 @@ static std::string u128_to_str(unsigned __int128 v) {
             std::string json = ss->_primenet->build_result_json(r);
             log([NSString stringWithUTF8String:json.c_str()]);
         }
+
+        // ── Checkpoint file sample for AutoPrimeNet ──
+        log(@"\n═══════════════════════════════════════════════════════");
+        log(@"  mersenne_tf_checkpoint.txt  (for AutoPrimeNet)");
+        log(@"═══════════════════════════════════════════════════════");
+        log(@"");
+        log(@"Written every 30s to ~/Library/Application Support/PrimePath/");
+        log(@"One key-value pair per line, space separated.");
+        log(@"");
+
+        // Compute realistic k values for the sample
+        uint64_t sample_exp = 193707721;
+        int sample_blo = 77, sample_bhi = 78;
+        double q_min = pow(2.0, sample_blo);
+        double q_max = pow(2.0, sample_bhi);
+        uint64_t k_start = (uint64_t)(q_min / (2.0 * (double)sample_exp));
+        uint64_t k_end   = (uint64_t)(q_max / (2.0 * (double)sample_exp));
+        uint64_t k_cur   = k_start + (k_end - k_start) * 37 / 100;
+
+        log(@"--- BEGIN FILE ---");
+        log([NSString stringWithFormat:@"exponent %llu", sample_exp]);
+        log([NSString stringWithFormat:@"bit_lo %d", sample_blo]);
+        log([NSString stringWithFormat:@"bit_hi %d", sample_bhi]);
+        log([NSString stringWithFormat:@"current_k %llu", k_cur]);
+        log(@"tested 847293156");
+        log(@"elapsed_sec 3847.2");
+        log(@"assignment_key A1B2C3D4E5F6A7B8C9D0E1F2A3B4C5D6");
+        log(@"timestamp 2026-04-16 12:30:00");
+        log(@"--- END FILE ---");
+
+        log(@"");
+        log(@"Fields:");
+        log(@"  exponent       Mersenne exponent p (M_p = 2^p - 1)");
+        log(@"  bit_lo/bit_hi  Assigned factor search range in bits");
+        log(@"  current_k      Current k-value (factor candidate q = 2kp + 1)");
+        log(@"  tested         Total candidates tested (post-sieve)");
+        log(@"  elapsed_sec    Cumulative wall time in seconds, persisted across restarts");
+        log(@"  assignment_key 32-char hex PrimeNet assignment ID");
+        log(@"  timestamp      When this checkpoint was last written");
+
+        log(@"");
+        log(@"Progress calculation:");
+        log([NSString stringWithFormat:@"  k_start = 2^bit_lo / (2 * exponent) = %llu", k_start]);
+        log([NSString stringWithFormat:@"  k_end   = 2^bit_hi / (2 * exponent) = %llu", k_end]);
+        double pct = 100.0 * (k_cur - k_start) / (k_end - k_start);
+        log([NSString stringWithFormat:@"  pct     = (current_k - k_start) / (k_end - k_start) = %.1f%%", pct]);
+        log(@"  speed   = tested / elapsed_sec (candidates/sec)");
+        log(@"  ETA     = elapsed_sec / pct * (1 - pct)");
+        log(@"");
     });
 }
 
@@ -6005,7 +6057,7 @@ static std::string u128_to_str(unsigned __int128 v) {
     y -= 8;
 
     addRow(@"Program:", 9010, @"PrimePath", @"PrimePath");
-    addRow(@"Version:", 9011, @"1.3.0", @"1.3.0");
+    addRow(@"Version:", 9011, @"1.4.0", @"1.4.0");
     addRow(@"Kernel:", 9012, @"Metal96bit (optional)", @"Metal96bit");
 
     // ── PrimeNet connection ──
@@ -6485,7 +6537,7 @@ static std::string u128_to_str(unsigned __int128 v) {
     }
 
     ((NSTextField *)[cv viewWithTag:9010]).stringValue = @"PrimePath";
-    ((NSTextField *)[cv viewWithTag:9011]).stringValue = @"1.3.0";
+    ((NSTextField *)[cv viewWithTag:9011]).stringValue = @"1.4.0";
     ((NSTextField *)[cv viewWithTag:9012]).stringValue = @"Metal96bit";
 
     [self jsonEditorLog:win message:@"Auto-filled from system and current assignment."];
@@ -6519,7 +6571,7 @@ static std::string u128_to_str(unsigned __int128 v) {
         ((NSTextField *)[cv viewWithTag:9007]).stringValue =
             [NSString stringWithUTF8String:_primenet->username().c_str()];
     ((NSTextField *)[cv viewWithTag:9010]).stringValue = @"PrimePath";
-    ((NSTextField *)[cv viewWithTag:9011]).stringValue = @"1.3.0";
+    ((NSTextField *)[cv viewWithTag:9011]).stringValue = @"1.4.0";
     ((NSTextField *)[cv viewWithTag:9012]).stringValue = @"Metal96bit";
 
     // Generate the JSON
@@ -6737,7 +6789,7 @@ static std::string u128_to_str(unsigned __int128 v) {
             NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:reqURL];
             req.HTTPMethod = @"GET";
             req.timeoutInterval = 45.0;
-            [req setValue:@"PrimePath/1.3.0" forHTTPHeaderField:@"User-Agent"];
+            [req setValue:@"PrimePath/1.4.0" forHTTPHeaderField:@"User-Agent"];
 
             dispatch_semaphore_t sem = dispatch_semaphore_create(0);
             __block NSData *respData = nil;
@@ -6864,6 +6916,8 @@ static std::string u128_to_str(unsigned __int128 v) {
         it->second.bit_lo = assignment.bit_lo;
         it->second.bit_hi = assignment.bit_hi;
         it->second.known_factors = assignment.known_factors;
+        it->second.assignment_key = assignment.key;
+        it->second.elapsed_sec = 0;  // reset for new assignment
 
         // Calculate starting k for bit_lo: q = 2kp + 1 >= 2^bit_lo
         // k >= (2^bit_lo - 1) / (2 * p)
