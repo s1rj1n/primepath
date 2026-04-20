@@ -6,6 +6,7 @@
 #include <deque>
 #include <future>
 #include <pthread.h>
+#include <dirent.h>
 #include <arm_neon.h>
 
 // GPU compute is accessed via the abstract GPUBackend interface (GPUBackend.hpp)
@@ -209,14 +210,16 @@ void TaskManager::load_state() {
         if (line.empty() || line[0] == '#') continue;
         std::istringstream iss(line);
         std::string key;
-        uint64_t cur, found, tested;
+        uint64_t cur, found, tested, spos = 0;
         if (iss >> key >> cur >> found >> tested) {
+            iss >> spos;  // start_pos (optional, backwards-compatible)
             TaskType t = task_from_key(key);
             auto it = _tasks.find(t);
             if (it != _tasks.end()) {
                 it->second.current_pos = cur;
                 it->second.found_count = found;
                 it->second.tested_count = tested;
+                if (spos > 0) it->second.start_pos = spos;
                 log("Restored " + std::string(task_name(t)) +
                     " at position " + std::to_string(cur));
             }
@@ -224,25 +227,39 @@ void TaskManager::load_state() {
     }
 
     // Load Mersenne TF checkpoint (elapsed time, bit range, assignment key)
+    // Scan for mersenne_tf_checkpoint_M*.txt files (exponent in filename)
     {
-        std::string tf_path = _data_dir + "/mersenne_tf_checkpoint.txt";
-        std::ifstream tf(tf_path);
-        if (tf.is_open()) {
-            auto it = _tasks.find(TaskType::MersenneTrial);
-            if (it != _tasks.end()) {
-                std::string tline;
-                while (std::getline(tf, tline)) {
-                    if (tline.empty()) continue;
-                    std::istringstream tiss(tline);
-                    std::string field;
-                    tiss >> field;
-                    if (field == "elapsed_sec") tiss >> it->second.elapsed_sec;
-                    else if (field == "bit_lo") tiss >> it->second.bit_lo;
-                    else if (field == "bit_hi") tiss >> it->second.bit_hi;
-                    else if (field == "assignment_key") tiss >> it->second.assignment_key;
+        auto it = _tasks.find(TaskType::MersenneTrial);
+        if (it != _tasks.end()) {
+            DIR *dir = opendir(_data_dir.c_str());
+            if (dir) {
+                struct dirent *entry;
+                while ((entry = readdir(dir)) != nullptr) {
+                    std::string name(entry->d_name);
+                    if (name.find("mersenne_tf_checkpoint_M") == 0 &&
+                        name.find(".txt") == name.size() - 4) {
+                        std::string tf_path = _data_dir + "/" + name;
+                        std::ifstream tf(tf_path);
+                        if (tf.is_open()) {
+                            std::string tline;
+                            while (std::getline(tf, tline)) {
+                                if (tline.empty()) continue;
+                                std::istringstream tiss(tline);
+                                std::string field;
+                                tiss >> field;
+                                if (field == "exponent") tiss >> it->second.end_pos;
+                                else if (field == "elapsed_sec") tiss >> it->second.elapsed_sec;
+                                else if (field == "bit_lo") tiss >> it->second.bit_lo;
+                                else if (field == "bit_hi") tiss >> it->second.bit_hi;
+                                else if (field == "assignment_key") tiss >> it->second.assignment_key;
+                            }
+                            log("Restored Mersenne TF checkpoint from " + name +
+                                " (elapsed=" + std::to_string((int)it->second.elapsed_sec) + "s)");
+                        }
+                        break;  // load first matching checkpoint
+                    }
                 }
-                log("Restored Mersenne TF checkpoint (elapsed=" +
-                    std::to_string((int)it->second.elapsed_sec) + "s)");
+                closedir(dir);
             }
         }
     }
@@ -348,7 +365,8 @@ void TaskManager::save_state() {
         auto mt = _tasks.find(TaskType::MersenneTrial);
         if (mt != _tasks.end() && mt->second.end_pos > 0) {
             auto& t = mt->second;
-            std::string tf_path = _data_dir + "/mersenne_tf_checkpoint.txt";
+            std::string tf_path = _data_dir + "/mersenne_tf_checkpoint_M" +
+                                  std::to_string(t.end_pos) + ".txt";
             std::ofstream tf(tf_path);
             tf << "exponent " << t.end_pos << "\n"
                << "bit_lo " << (int)t.bit_lo << "\n"

@@ -4013,7 +4013,7 @@ static const int EQ_HISTORY = 32; // number of vertical bars (time history)
         @"  File locations:\n"
         @"    worktodo.txt                  Assignments from AutoPrimeNet (input)\n"
         @"    results.json.txt              Completed results (output)\n"
-        @"    mersenne_tf_checkpoint.txt    Live progress for AutoPrimeNet (every 30s)\n"
+        @"    mersenne_tf_checkpoint_M*.txt  Live progress for AutoPrimeNet (every 30s)\n"
         @"    local.ini                     AutoPrimeNet configuration\n"
         @"    All in: ~/Library/Application Support/PrimePath/\n\n"
 
@@ -4112,8 +4112,9 @@ static const int EQ_HISTORY = 32; // number of vertical bars (time history)
         @"All state is saved to: ~/Documents/primes/primelocations/\n\n"
 
         @"  search_progress.txt          Task positions, status, counts. Auto-saved every 30s.\n"
-        @"  mersenne_tf_checkpoint.txt   Mersenne TF progress for AutoPrimeNet (k-pos, bit range,\n"
-        @"                               elapsed time, assignment key). Written every 30s.\n"
+        @"  mersenne_tf_checkpoint_M*.txt  Mersenne TF progress for AutoPrimeNet (k-pos, bit range,\n"
+        @"                                 elapsed time, assignment key). Written every 30s.\n"
+        @"                                 Exponent in filename for multi-assignment support.\n"
         @"  discoveries.txt              All prime discoveries with timestamps.\n"
         @"  primenet_state.txt           PrimeNet registration, assignments, machine GUID.\n"
         @"  results.json.txt             Trial factoring results (mfaktc-compatible format).\n"
@@ -4385,11 +4386,12 @@ static std::string u128_to_str(unsigned __int128 v) {
 
         // ── Checkpoint file sample for AutoPrimeNet ──
         log(@"\n═══════════════════════════════════════════════════════");
-        log(@"  mersenne_tf_checkpoint.txt  (for AutoPrimeNet)");
+        log(@"  mersenne_tf_checkpoint_M{exp}.txt  (for AutoPrimeNet)");
         log(@"═══════════════════════════════════════════════════════");
         log(@"");
         log(@"Written every 30s to ~/Library/Application Support/PrimePath/");
-        log(@"One key-value pair per line, space separated.");
+        log(@"Exponent is in the filename for multi-assignment support.");
+        log(@"One key-value pair per line, space separated. Unix line endings (\\n).");
         log(@"");
 
         // Compute realistic k values for the sample
@@ -4401,7 +4403,7 @@ static std::string u128_to_str(unsigned __int128 v) {
         uint64_t k_end   = (uint64_t)(q_max / (2.0 * (double)sample_exp));
         uint64_t k_cur   = k_start + (k_end - k_start) * 37 / 100;
 
-        log(@"--- BEGIN FILE ---");
+        log([NSString stringWithFormat:@"--- BEGIN mersenne_tf_checkpoint_M%llu.txt ---", sample_exp]);
         log([NSString stringWithFormat:@"exponent %llu", sample_exp]);
         log([NSString stringWithFormat:@"bit_lo %d", sample_blo]);
         log([NSString stringWithFormat:@"bit_hi %d", sample_bhi]);
@@ -4410,7 +4412,7 @@ static std::string u128_to_str(unsigned __int128 v) {
         log(@"elapsed_sec 3847.2");
         log(@"assignment_key A1B2C3D4E5F6A7B8C9D0E1F2A3B4C5D6");
         log(@"timestamp 2026-04-16 12:30:00");
-        log(@"--- END FILE ---");
+        log(@"--- END ---");
 
         log(@"");
         log(@"Fields:");
@@ -6912,25 +6914,39 @@ static std::string u128_to_str(unsigned __int128 v) {
             [self appendText:@"GIMPS: Mersenne TF is already running. Stop it first.\n"];
             return;
         }
+        // Detect resume vs new assignment
+        bool same_assignment = (it->second.end_pos == exponent &&
+                                (int)it->second.bit_lo == (int)assignment.bit_lo &&
+                                (int)it->second.bit_hi == (int)assignment.bit_hi);
+
         it->second.end_pos = exponent;
         it->second.bit_lo = assignment.bit_lo;
         it->second.bit_hi = assignment.bit_hi;
         it->second.known_factors = assignment.known_factors;
         it->second.assignment_key = assignment.key;
-        it->second.elapsed_sec = 0;  // reset for new assignment
 
-        // Calculate starting k for bit_lo: q = 2kp + 1 >= 2^bit_lo
-        // k >= (2^bit_lo - 1) / (2 * p)
-        // Use double for the 2^bit_lo calculation since bit_lo can be 76+
+        // Calculate k_start for this bit range
         double q_min = pow(2.0, assignment.bit_lo);
         uint64_t k_start = (uint64_t)(q_min / (2.0 * (double)exponent));
         if (k_start < 1) k_start = 1;
-        it->second.current_pos = k_start;
 
-        [self appendText:[NSString stringWithFormat:
-            @"GIMPS: starting M%llu TF from %d to %d bits, k=%llu (assignment %s)\n",
-            exponent, (int)assignment.bit_lo, (int)assignment.bit_hi,
-            k_start, assignment.key.c_str()]];
+        if (same_assignment && it->second.current_pos > k_start) {
+            // Resume: keep saved position, elapsed time, and tested count
+            [self appendText:[NSString stringWithFormat:
+                @"GIMPS: resuming M%llu TF from %d to %d bits, k=%llu (elapsed %.0fs, assignment %s)\n",
+                exponent, (int)assignment.bit_lo, (int)assignment.bit_hi,
+                it->second.current_pos, it->second.elapsed_sec, assignment.key.c_str()]];
+        } else {
+            // New assignment: reset everything
+            it->second.current_pos = k_start;
+            it->second.elapsed_sec = 0;
+            it->second.tested_count = 0;
+            it->second.found_count = 0;
+            [self appendText:[NSString stringWithFormat:
+                @"GIMPS: starting M%llu TF from %d to %d bits, k=%llu (assignment %s)\n",
+                exponent, (int)assignment.bit_lo, (int)assignment.bit_hi,
+                k_start, assignment.key.c_str()]];
+        }
 
         _taskMgr->start_task(prime::TaskType::MersenneTrial);
     }
