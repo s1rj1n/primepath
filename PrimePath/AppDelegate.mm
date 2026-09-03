@@ -24,7 +24,31 @@
 #include <sys/sysctl.h>
 #import <objc/runtime.h>
 
-static NSString *const DATA_DIR = @"/Users/sergeinester/Documents/primes/primelocations";
+static NSString *PrimePathDataDirectory(void) {
+    static NSString *dataDirectory;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        NSString *applicationSupport = NSSearchPathForDirectoriesInDomains(
+            NSApplicationSupportDirectory, NSUserDomainMask, YES).firstObject;
+        if (applicationSupport.length == 0) {
+            applicationSupport = [NSHomeDirectory()
+                stringByAppendingPathComponent:@"Library/Application Support"];
+        }
+
+        dataDirectory =
+            [applicationSupport stringByAppendingPathComponent:@"PrimePath"];
+        NSError *error = nil;
+        if (![[NSFileManager defaultManager]
+                createDirectoryAtPath:dataDirectory
+           withIntermediateDirectories:YES
+                            attributes:nil
+                                 error:&error]) {
+            NSLog(@"PrimePath: failed to create data directory %@: %@",
+                  dataDirectory, error.localizedDescription);
+        }
+    });
+    return dataDirectory;
+}
 
 // Defined in TaskManager.mm (inside namespace prime) — carry-chain mulmod toggle
 namespace prime { extern volatile bool g_use_carry_chain; }
@@ -359,7 +383,8 @@ static const int EQ_HISTORY = 32; // number of vertical bars (time history)
     _gpu = prime::create_best_backend();
 
     // Init Task Manager
-    _taskMgr = new prime::TaskManager(DATA_DIR.UTF8String);
+    NSString *dataDirectory = PrimePathDataDirectory();
+    _taskMgr = new prime::TaskManager(dataDirectory.UTF8String);
     _taskMgr->init_defaults();
     _taskMgr->set_gpu(_gpu);
 
@@ -401,7 +426,7 @@ static const int EQ_HISTORY = 32; // number of vertical bars (time history)
 
     // Init GIMPS / PrimeNet client
     _primenet = new primenet::PrimeNetClient(
-        std::string(DATA_DIR.UTF8String),
+        std::string(dataDirectory.UTF8String),
         [weakSelf](const std::string& msg) {
             NSString *s = [NSString stringWithFormat:@"%@\n",
                 [NSString stringWithUTF8String:msg.c_str()]];
@@ -993,7 +1018,7 @@ static const int EQ_HISTORY = 32; // number of vertical bars (time history)
     [self appendStatus:@"PrimePath v0.5.0 — Status & Network\n"];
     [self appendText:@"PrimePath v0.5.0 -- Metal GPU Prime Discovery Engine\n"];
     [self appendText:[NSString stringWithFormat:@"GPU: %@ | Data: %@\n",
-        [NSString stringWithUTF8String:_gpu->name().c_str()], DATA_DIR]];
+        [NSString stringWithUTF8String:_gpu->name().c_str()], PrimePathDataDirectory()]];
 
     auto& kdb = prime::known_db();
     [self appendText:[NSString stringWithFormat:
@@ -2916,7 +2941,8 @@ static const int EQ_HISTORY = 32; // number of vertical bars (time history)
 
     // If no prime list loaded, try auto-loading known_primes.txt
     if (_markovPrimeList.empty()) {
-        NSString *autoPath = @"/Users/sergeinester/Documents/primes/primelocations/known_primes.txt";
+        NSString *autoPath = [PrimePathDataDirectory()
+            stringByAppendingPathComponent:@"known_primes.txt"];
         NSString *contents = [NSString stringWithContentsOfFile:autoPath
             encoding:NSUTF8StringEncoding error:nil];
         if (contents) {
@@ -5664,8 +5690,7 @@ static std::string u128_to_str(unsigned __int128 v) {
     NSView *cv = win.contentView;
     CGFloat y = H - 10;
 
-    NSString *DATA_DIR = [NSSearchPathForDirectoriesInDomains(NSApplicationSupportDirectory,
-        NSUserDomainMask, YES).firstObject stringByAppendingPathComponent:@"PrimePath"];
+    NSString *dataDirectory = PrimePathDataDirectory();
 
     // ── Header ───────────────────────────────────────────────────────
     NSTextField *header = [[NSTextField alloc] initWithFrame:NSMakeRect(14, y - 20, W - 28, 18)];
@@ -5696,7 +5721,7 @@ static std::string u128_to_str(unsigned __int128 v) {
     [cv addSubview:dirLbl];
 
     NSTextField *dirPath = [[NSTextField alloc] initWithFrame:NSMakeRect(110, y - 14, W - 124, 14)];
-    dirPath.stringValue = DATA_DIR;
+    dirPath.stringValue = dataDirectory;
     dirPath.font = [NSFont monospacedSystemFontOfSize:9 weight:NSFontWeightRegular];
     dirPath.textColor = [NSColor labelColor];
     dirPath.bezeled = NO; dirPath.editable = NO; dirPath.drawsBackground = NO; dirPath.selectable = YES;
@@ -5833,14 +5858,12 @@ static std::string u128_to_str(unsigned __int128 v) {
     [win makeKeyAndOrderFront:nil];
 
     // Load initial data
-    [self apnRefreshWindow:win dataDir:DATA_DIR];
+    [self apnRefreshWindow:win dataDir:dataDirectory];
 }
 
 - (void)apnRefresh:(id)sender {
     NSWindow *win = [sender window];
-    NSString *DATA_DIR = [NSSearchPathForDirectoriesInDomains(NSApplicationSupportDirectory,
-        NSUserDomainMask, YES).firstObject stringByAppendingPathComponent:@"PrimePath"];
-    [self apnRefreshWindow:win dataDir:DATA_DIR];
+    [self apnRefreshWindow:win dataDir:PrimePathDataDirectory()];
 }
 
 - (void)apnRefreshWindow:(NSWindow *)win dataDir:(NSString *)dataDir {
@@ -7037,7 +7060,8 @@ static std::string u128_to_str(unsigned __int128 v) {
 
     // Write pre-submission verification to live log
     {
-        std::string logpath = std::string(DATA_DIR.UTF8String) + "/mersenne_tf_live.log";
+        std::string logpath =
+            std::string([PrimePathDataDirectory() UTF8String]) + "/mersenne_tf_live.log";
         std::ofstream lf(logpath, std::ios::app);
         if (lf.is_open()) {
             auto now = std::chrono::system_clock::now();
@@ -7076,7 +7100,8 @@ static std::string u128_to_str(unsigned __int128 v) {
             if (!s) return;
             // Build JSON and append to results.json.txt
             std::string json = s->_primenet->build_result_json(result);
-            std::string path = std::string(DATA_DIR.UTF8String) + "/results.json.txt";
+            std::string path =
+                std::string([PrimePathDataDirectory() UTF8String]) + "/results.json.txt";
             std::ofstream f(path, std::ios::app);
             bool ok = false;
             if (f.is_open()) {
@@ -8476,7 +8501,7 @@ static const int kNumPipelineStages = sizeof(kPipelineStages) / sizeof(kPipeline
 - (void)loadTestCatalog {
     _testCatalog.clear();
     _selectedTestIdx = -1;
-    NSString *path = [DATA_DIR stringByAppendingPathComponent:@"TestCatalog.txt"];
+    NSString *path = [PrimePathDataDirectory() stringByAppendingPathComponent:@"TestCatalog.txt"];
     NSString *content = [NSString stringWithContentsOfFile:path encoding:NSUTF8StringEncoding error:nil];
     if (!content) return;
 
@@ -8628,7 +8653,8 @@ static const int kNumPipelineStages = sizeof(kPipelineStages) / sizeof(kPipeline
     [cv addSubview:reloadBtn];
 
     NSTextField *fileLbl = [self labelAt:NSMakeRect(M + 96, 16, 400, 13)
-        text:[NSString stringWithFormat:@"Catalog: %@/TestCatalog.txt", DATA_DIR] bold:NO size:8.5];
+        text:[NSString stringWithFormat:@"Catalog: %@/TestCatalog.txt",
+            PrimePathDataDirectory()] bold:NO size:8.5];
     fileLbl.textColor = [NSColor secondaryLabelColor];
     fileLbl.autoresizingMask = NSViewMaxYMargin | NSViewWidthSizable;
     [cv addSubview:fileLbl];
@@ -9635,7 +9661,8 @@ static const int kNumPipelineStages = sizeof(kPipelineStages) / sizeof(kPipeline
             return;
         }
 
-        _carriage = new prime::CarriageClient(DATA_DIR.UTF8String);
+        _carriage = new prime::CarriageClient(
+            [PrimePathDataDirectory() UTF8String]);
         __weak AppDelegate *weakSelf = self;
         _carriage->set_status_callback([weakSelf](const std::string& status) {
             NSString *msg = [NSString stringWithFormat:@"[Network] %s\n",
@@ -9666,7 +9693,8 @@ static const int kNumPipelineStages = sizeof(kPipelineStages) / sizeof(kPipeline
     NSButton *cb = (NSButton *)sender;
     if (cb.state == NSControlStateValueOn) {
         if (!_carriage) {
-            _carriage = new prime::CarriageClient(DATA_DIR.UTF8String);
+            _carriage = new prime::CarriageClient(
+                [PrimePathDataDirectory() UTF8String]);
             __weak AppDelegate *weakSelf = self;
             _carriage->set_status_callback([weakSelf](const std::string& status) {
                 NSString *msg = [NSString stringWithFormat:@"[Network] %s\n", status.c_str()];

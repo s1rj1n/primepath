@@ -350,16 +350,20 @@ void TaskManager::save_state() {
         std::lock_guard<std::mutex> lock(_save_mutex);
         std::string path = _data_dir + "/search_progress.txt";
         std::ofstream f(path);
-        f << "# PrimePath Search Progress — all numbers full precision (u64)\n";
-        f << "# task_key current_pos found_count tested_count start_pos\n";
-        for (auto& [type, task] : _tasks) {
-            f << task_key(type) << " "
-              << task.current_pos << " "
-              << task.found_count << " "
-              << task.tested_count << " "
-              << task.start_pos << "\n";
+        if (!f.is_open()) {
+            log("ERROR: failed to save search progress to " + path);
+        } else {
+            f << "# PrimePath Search Progress — all numbers full precision (u64)\n";
+            f << "# task_key current_pos found_count tested_count start_pos\n";
+            for (auto& [type, task] : _tasks) {
+                f << task_key(type) << " "
+                  << task.current_pos << " "
+                  << task.found_count << " "
+                  << task.tested_count << " "
+                  << task.start_pos << "\n";
+            }
+            f << "# saved: " << timestamp() << "\n";
         }
-        f << "# saved: " << timestamp() << "\n";
 
         // Write Mersenne TF checkpoint for AutoPrimeNet progress reporting
         auto mt = _tasks.find(TaskType::MersenneTrial);
