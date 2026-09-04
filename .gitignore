@@ -25,3 +25,7 @@ test_engine
 
 # Distribution
 dist/
+
+# Release artifacts (published to GitHub Releases, not tracked)
+*.zip
+*.dmg
