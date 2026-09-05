@@ -217,7 +217,11 @@ Where help is needed most:
 - **ECM on Metal** -- elliptic curve method with Montgomery arithmetic
 - **Factor seed research** -- does seed classification actually predict anything?
 
-Issues and PRs welcome.
+PrimePath is open to anyone who wants it, and any change that improves it is welcome -- issues and pull requests both.
+
+## Credits
+
+- **Niles Turner** ([@turnerniles](https://github.com/turnerniles)) -- per-user data directory, so PrimePath persists state on any machine ([#3](https://github.com/s1rj1n/primepath/pull/3))
 
 ## License
 

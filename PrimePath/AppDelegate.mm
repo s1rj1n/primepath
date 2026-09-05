@@ -2254,7 +2254,7 @@ static const int EQ_HISTORY = 32; // number of vertical bars (time history)
 //
 // Prime list file: one prime per line (decimal). Lines starting with #
 // are comments. Loaded via "Load Primes" button or from
-// ~/Documents/primes/primelocations/known_primes.txt automatically.
+// ~/Library/Application Support/PrimePath/known_primes.txt automatically.
 //
 // The "From" field selects which prime in the list to start from.
 // The "Window" field is how many predictions to chain forward.
@@ -4135,7 +4135,7 @@ static const int EQ_HISTORY = 32; // number of vertical bars (time history)
 
         @"DATA FILES\n"
         @"----------\n"
-        @"All state is saved to: ~/Documents/primes/primelocations/\n\n"
+        @"All state is saved to: ~/Library/Application Support/PrimePath/\n\n"
 
         @"  search_progress.txt          Task positions, status, counts. Auto-saved every 30s.\n"
         @"  mersenne_tf_checkpoint_M*.txt  Mersenne TF progress for AutoPrimeNet (k-pos, bit range,\n"

@@ -1,5 +1,17 @@
 # Changelog
 
+PrimePath is open to anyone who wants it, and any change that improves it is welcome -- issues and pull requests both.
+
+## Unreleased
+
+### Fixed
+- **Per-user data directory** -- state is now stored in `~/Library/Application Support/PrimePath/` instead of a hard-coded developer path, so persistence works on any machine rather than only the original developer's. The directory is created before persistence initializes, and is used consistently across search, AutoPrimeNet, Markov, and distributed-compute features. A failure to write `search_progress.txt` is now reported instead of failing silently. Thanks to **Niles Turner** ([@turnerniles](https://github.com/turnerniles)) for finding and fixing this ([#3](https://github.com/s1rj1n/primepath/pull/3)).
+- In-app help text and code comments updated to name the new data location.
+
+### Upgrading
+Data from earlier builds is **not** migrated automatically. If you have existing results, copy them into `~/Library/Application Support/PrimePath/` before running this version.
+
+
 ## v1.4 -- AutoPrimeNet Checkpoint Support (2026-04-20)
 
 ### New
