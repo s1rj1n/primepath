@@ -9124,7 +9124,7 @@ static const int kNumPipelineStages = sizeof(kPipelineStages) / sizeof(kPipeline
             double dt = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
             if (f > 0) {
                 log([NSString stringWithFormat:@"  Factor found: %llu x %llu  (%.4f s)\n", f, n / f, dt]);
-                log([NSString stringWithFormat:@"  p-1 = %llu, factors: %s\n", f - 1,
+                log([NSString stringWithFormat:@"  p-1 = %llu, factors: %@\n", f - 1,
                     [NSString stringWithUTF8String:prime::factors_string(f - 1).c_str()]]);
             } else {
                 log([NSString stringWithFormat:@"  No factor found with B=%llu (%.4f s). Try larger B.\n", B, dt]);
