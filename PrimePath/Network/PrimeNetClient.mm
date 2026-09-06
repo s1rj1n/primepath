@@ -1,6 +1,7 @@
 #import <Foundation/Foundation.h>
 #import <IOKit/IOKitLib.h>
 #include "PrimeNetClient.hpp"
+#import "../Version.h"
 #include <fstream>
 #include <sstream>
 #include <random>
@@ -105,7 +106,8 @@ bool PrimeNetClient::register_machine() {
         "&g=" + _state.guid +
         "&hg=" + hw_guid +
         "&wg="
-        "&a=" + url_encode("macOS,PrimePath,1.4.1 (github.com/s1rj1n/primepath)") +
+        "&a=" + url_encode("macOS,PrimePath," + PrimePathVersionUTF8() +
+                          " (github.com/s1rj1n/primepath)") +
         "&c=" + url_encode(chip_name + " (Metal GPU)") +
         "&f=" + url_encode("Metal,NEON,AES") +
         "&L1=192&L2=4096&L3=0"
@@ -507,7 +509,8 @@ std::string PrimeNetClient::build_result_json(const TFResult& result) {
         js << "]";
     }
 
-    js << ",\"program\":{\"name\":\"PrimePath\",\"version\":\"1.4.1\",\"kernel\":\"Metal96bit\"}"
+    js << ",\"program\":{\"name\":\"PrimePath\",\"version\":\"" << PrimePathVersionUTF8()
+       << "\",\"kernel\":\"Metal96bit\"}"
        << ",\"os\":{\"os\":\"macOS\",\"version\":\"" << un.release << "\",\"architecture\":\"ARM_64\"}"
        << ",\"user\":\"" << _state.username << "\""
        << ",\"computer\":\"" << _state.computer_name << "\"";
@@ -557,7 +560,7 @@ std::string PrimeNetClient::build_result_json(const TFResult& result) {
            << (result.range_complete ? "1" : "0") << ";"
            << ";" // fft-length (empty for TF)
            << ";" // error-code (empty for TF)
-           << "PrimePath;1.4.1;Metal96bit;"
+           << "PrimePath;" << PrimePathVersionUTF8() << ";Metal96bit;"
            << ";" // program.details (empty)
            << "macOS;ARM_64;"
            << ts;
@@ -865,7 +868,8 @@ std::string PrimeNetClient::http_get(const std::string& url) {
         NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:reqURL];
         req.HTTPMethod = @"GET";
         req.timeoutInterval = 45.0;  // Longer than semaphore so NSURLSession always finishes first
-        [req setValue:@"PrimePath/1.4.1" forHTTPHeaderField:@"User-Agent"];
+        [req setValue:[NSString stringWithFormat:@"PrimePath/%@", PrimePathVersion()]
+                forHTTPHeaderField:@"User-Agent"];
 
         // Use heap-allocated storage so the completion handler is safe even if
         // the semaphore times out (shouldn't happen since request timeout < sem timeout)
@@ -955,7 +959,7 @@ std::string PrimeNetClient::machine_description() {
     int gpu_cores = detect_gpu_core_count();
 
     std::ostringstream desc;
-    desc << "PrimePath/1.4.1 | " << chip_str
+    desc << "PrimePath/" << PrimePathVersionUTF8() << " | " << chip_str
          << " | " << ncpu << " CPU";
     if (perf_cores > 0)
         desc << " (" << perf_cores << "P+" << eff_cores << "E)";

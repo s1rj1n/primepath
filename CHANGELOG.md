@@ -2,6 +2,11 @@
 
 PrimePath is open to anyone who wants it, and any change that improves it is welcome -- issues and pull requests both.
 
+## Unreleased
+
+### Changed
+- **Version string unified** -- the version was hard-coded in 12 places across three files, which is how the title bar drifted to v0.5 for four releases. All sites now read `CFBundleShortVersionString` via `PrimePath/Version.h`, so `Info.plist` is the single source of truth and a release bump is a one-line change.
+
 ## v1.4.1 -- Per-User Data Directory (2026-09-07)
 
 ### Fixed

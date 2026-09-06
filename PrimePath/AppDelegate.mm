@@ -1,4 +1,5 @@
 #import "AppDelegate.h"
+#import "Version.h"
 #import "MetalCompute.h"
 #import "PrimeEngine.hpp"
 #import "TaskManager.hpp"
@@ -477,7 +478,8 @@ static const int EQ_HISTORY = 32; // number of vertical bars (time history)
         styleMask:(NSWindowStyleMaskTitled | NSWindowStyleMaskClosable |
                    NSWindowStyleMaskMiniaturizable | NSWindowStyleMaskResizable)
         backing:NSBackingStoreBuffered defer:NO];
-    [self.mainWindow setTitle:@"PrimePath v1.4.1 -- Metal GPU Prime Discovery"];
+    [self.mainWindow setTitle:[NSString stringWithFormat:
+        @"PrimePath v%@ -- Metal GPU Prime Discovery", PrimePathVersion()]];
     [self.mainWindow setMinSize:NSMakeSize(720, 400)];
     [self.mainWindow center]; // standard macOS centering
 
@@ -1015,8 +1017,10 @@ static const int EQ_HISTORY = 32; // number of vertical bars (time history)
     [cv addSubview:self.logTabView];
 
     // Welcome text
-    [self appendStatus:@"PrimePath v1.4.1 — Status & Network\n"];
-    [self appendText:@"PrimePath v1.4.1 -- Metal GPU Prime Discovery Engine\n"];
+    [self appendStatus:[NSString stringWithFormat:
+        @"PrimePath v%@ — Status & Network\n", PrimePathVersion()]];
+    [self appendText:[NSString stringWithFormat:
+        @"PrimePath v%@ -- Metal GPU Prime Discovery Engine\n", PrimePathVersion()]];
     [self appendText:[NSString stringWithFormat:@"GPU: %@ | Data: %@\n",
         [NSString stringWithUTF8String:_gpu->name().c_str()], PrimePathDataDirectory()]];
 
@@ -3878,8 +3882,8 @@ static const int EQ_HISTORY = 32; // number of vertical bars (time history)
     NSDictionary *opts = @{
         @"ApplicationName": @"PrimePath",
         @"Copyright": @"Development by Sergei Nester\nSuper smart coding by Claude\nsnester@viewbuild.com",
-        @"ApplicationVersion": @"1.4.1",
-        @"Version": @"1.4.1",
+        @"ApplicationVersion": PrimePathVersion(),
+        @"Version": PrimePathVersion(),
     };
     [[NSApplication sharedApplication] orderFrontStandardAboutPanelWithOptions:opts];
 }
@@ -6082,7 +6086,7 @@ static std::string u128_to_str(unsigned __int128 v) {
     y -= 8;
 
     addRow(@"Program:", 9010, @"PrimePath", @"PrimePath");
-    addRow(@"Version:", 9011, @"1.4.1", @"1.4.1");
+    addRow(@"Version:", 9011, PrimePathVersion(), PrimePathVersion());
     addRow(@"Kernel:", 9012, @"Metal96bit (optional)", @"Metal96bit");
 
     // ── PrimeNet connection ──
@@ -6562,7 +6566,7 @@ static std::string u128_to_str(unsigned __int128 v) {
     }
 
     ((NSTextField *)[cv viewWithTag:9010]).stringValue = @"PrimePath";
-    ((NSTextField *)[cv viewWithTag:9011]).stringValue = @"1.4.1";
+    ((NSTextField *)[cv viewWithTag:9011]).stringValue = PrimePathVersion();
     ((NSTextField *)[cv viewWithTag:9012]).stringValue = @"Metal96bit";
 
     [self jsonEditorLog:win message:@"Auto-filled from system and current assignment."];
@@ -6596,7 +6600,7 @@ static std::string u128_to_str(unsigned __int128 v) {
         ((NSTextField *)[cv viewWithTag:9007]).stringValue =
             [NSString stringWithUTF8String:_primenet->username().c_str()];
     ((NSTextField *)[cv viewWithTag:9010]).stringValue = @"PrimePath";
-    ((NSTextField *)[cv viewWithTag:9011]).stringValue = @"1.4.1";
+    ((NSTextField *)[cv viewWithTag:9011]).stringValue = PrimePathVersion();
     ((NSTextField *)[cv viewWithTag:9012]).stringValue = @"Metal96bit";
 
     // Generate the JSON
@@ -6814,7 +6818,8 @@ static std::string u128_to_str(unsigned __int128 v) {
             NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:reqURL];
             req.HTTPMethod = @"GET";
             req.timeoutInterval = 45.0;
-            [req setValue:@"PrimePath/1.4.1" forHTTPHeaderField:@"User-Agent"];
+            [req setValue:[NSString stringWithFormat:@"PrimePath/%@", PrimePathVersion()]
+                forHTTPHeaderField:@"User-Agent"];
 
             dispatch_semaphore_t sem = dispatch_semaphore_create(0);
             __block NSData *respData = nil;
