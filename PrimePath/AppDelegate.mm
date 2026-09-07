@@ -130,6 +130,7 @@ static const int EQ_HISTORY = 32; // number of vertical bars (time history)
 
 - (void)drawRect:(NSRect)dirtyRect {
     NSRect b = self.bounds;
+    [NSBezierPath clipRect:b];
 
     // Dark background
     [[NSColor colorWithSRGBRed:0.08 green:0.08 blue:0.12 alpha:1.0] set];
@@ -470,6 +471,57 @@ static const int EQ_HISTORY = 32; // number of vertical bars (time history)
         }];
 }
 
+- (NSStackView *)buildResourceStatsRowAtFrame:(NSRect)frame {
+    CGFloat eqGap = 3;
+    CGFloat eqW = (frame.size.width - 4 * eqGap) / 5.0;
+    CGFloat eqH = frame.size.height;
+
+    NSColor *greenC = [NSColor colorWithSRGBRed:0.1 green:0.7 blue:0.3 alpha:1.0];
+    NSColor *blueC  = [NSColor colorWithSRGBRed:0.2 green:0.5 blue:0.9 alpha:1.0];
+    NSColor *cyanC  = [NSColor colorWithSRGBRed:0.1 green:0.7 blue:0.8 alpha:1.0];
+    NSColor *amberC = [NSColor colorWithSRGBRed:0.9 green:0.7 blue:0.1 alpha:1.0];
+    NSColor *magC   = [NSColor colorWithSRGBRed:0.7 green:0.3 blue:0.8 alpha:1.0];
+
+    NSStackView *statsRow = [[NSStackView alloc] initWithFrame:frame];
+    statsRow.orientation = NSUserInterfaceLayoutOrientationHorizontal;
+    statsRow.distribution = NSStackViewDistributionFillEqually;
+    statsRow.alignment = NSLayoutAttributeHeight;
+    statsRow.spacing = eqGap;
+    statsRow.autoresizingMask = NSViewMinYMargin | NSViewWidthSizable;
+
+    CGFloat ex = 0;
+    self.cpuEQ = [[EQBarView alloc] initWithFrame:NSMakeRect(ex, 0, eqW, eqH)
+        title:@"CPU" color:greenC];
+    self.cpuEQ.translatesAutoresizingMaskIntoConstraints = NO;
+    [statsRow addArrangedSubview:self.cpuEQ];
+    ex += eqW + eqGap;
+
+    self.gpuEQ = [[EQBarView alloc] initWithFrame:NSMakeRect(ex, 0, eqW, eqH)
+        title:@"GPU" color:blueC];
+    self.gpuEQ.translatesAutoresizingMaskIntoConstraints = NO;
+    [statsRow addArrangedSubview:self.gpuEQ];
+    ex += eqW + eqGap;
+
+    self.neonEQ = [[EQBarView alloc] initWithFrame:NSMakeRect(ex, 0, eqW, eqH)
+        title:@"NEON/SIMD" color:cyanC];
+    self.neonEQ.translatesAutoresizingMaskIntoConstraints = NO;
+    [statsRow addArrangedSubview:self.neonEQ];
+    ex += eqW + eqGap;
+
+    self.memEQ = [[EQBarView alloc] initWithFrame:NSMakeRect(ex, 0, eqW, eqH)
+        title:@"MEMORY" color:amberC];
+    self.memEQ.translatesAutoresizingMaskIntoConstraints = NO;
+    [statsRow addArrangedSubview:self.memEQ];
+    ex += eqW + eqGap;
+
+    self.diskEQ = [[EQBarView alloc] initWithFrame:NSMakeRect(ex, 0, eqW, eqH)
+        title:@"DISK I/O" color:magC];
+    self.diskEQ.translatesAutoresizingMaskIntoConstraints = NO;
+    [statsRow addArrangedSubview:self.diskEQ];
+
+    return statsRow;
+}
+
 - (void)buildUI {
     // Standard macOS window positioning - cascade from top-left
     NSRect frame = NSMakeRect(80, 100, 920, 760);
@@ -519,44 +571,7 @@ static const int EQ_HISTORY = 32; // number of vertical bars (time history)
 
     // ── EQ VISUALIZERS ────────────────────────────────────────────────
     CGFloat eqH = 44;  // height per EQ bar
-    CGFloat eqGap = 3;
-    CGFloat eqW = (CW - 4 * eqGap) / 5.0; // 5 bars across
-
-    NSColor *greenC = [NSColor colorWithSRGBRed:0.1 green:0.7 blue:0.3 alpha:1.0];
-    NSColor *blueC  = [NSColor colorWithSRGBRed:0.2 green:0.5 blue:0.9 alpha:1.0];
-    NSColor *cyanC  = [NSColor colorWithSRGBRed:0.1 green:0.7 blue:0.8 alpha:1.0];
-    NSColor *amberC = [NSColor colorWithSRGBRed:0.9 green:0.7 blue:0.1 alpha:1.0];
-    NSColor *magC   = [NSColor colorWithSRGBRed:0.7 green:0.3 blue:0.8 alpha:1.0];
-
-    CGFloat ex = M;
-    self.cpuEQ = [[EQBarView alloc] initWithFrame:NSMakeRect(ex, y - eqH, eqW, eqH)
-        title:@"CPU" color:greenC];
-    self.cpuEQ.autoresizingMask = NSViewMinYMargin | NSViewWidthSizable;
-    [cv addSubview:self.cpuEQ];
-    ex += eqW + eqGap;
-
-    self.gpuEQ = [[EQBarView alloc] initWithFrame:NSMakeRect(ex, y - eqH, eqW, eqH)
-        title:@"GPU" color:blueC];
-    self.gpuEQ.autoresizingMask = NSViewMinYMargin | NSViewWidthSizable;
-    [cv addSubview:self.gpuEQ];
-    ex += eqW + eqGap;
-
-    self.neonEQ = [[EQBarView alloc] initWithFrame:NSMakeRect(ex, y - eqH, eqW, eqH)
-        title:@"NEON/SIMD" color:cyanC];
-    self.neonEQ.autoresizingMask = NSViewMinYMargin | NSViewWidthSizable;
-    [cv addSubview:self.neonEQ];
-    ex += eqW + eqGap;
-
-    self.memEQ = [[EQBarView alloc] initWithFrame:NSMakeRect(ex, y - eqH, eqW, eqH)
-        title:@"MEMORY" color:amberC];
-    self.memEQ.autoresizingMask = NSViewMinYMargin | NSViewWidthSizable;
-    [cv addSubview:self.memEQ];
-    ex += eqW + eqGap;
-
-    self.diskEQ = [[EQBarView alloc] initWithFrame:NSMakeRect(ex, y - eqH, eqW, eqH)
-        title:@"DISK I/O" color:magC];
-    self.diskEQ.autoresizingMask = NSViewMinYMargin | NSViewWidthSizable;
-    [cv addSubview:self.diskEQ];
+    [cv addSubview:[self buildResourceStatsRowAtFrame:NSMakeRect(M, y - eqH, CW, eqH)]];
 
     self.disableVisualizerBtn = [NSButton checkboxWithTitle:@"Hide"
         target:self action:@selector(toggleVisualizer:)];
