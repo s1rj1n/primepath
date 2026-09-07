@@ -436,7 +436,7 @@ static const int EQ_HISTORY = 32; // number of vertical bars (time history)
                 [weakSelf appendText:s];
             });
         });
-    _primenet->set_username("s1rj1n");
+    _primenet->set_username("ANONYMOUS");
 
     [self loadTestCatalog];
     [self buildUI];
@@ -5453,6 +5453,8 @@ static std::string u128_to_str(unsigned __int128 v) {
         styleMask:(NSWindowStyleMaskTitled | NSWindowStyleMaskClosable | NSWindowStyleMaskResizable)
         backing:NSBackingStoreBuffered defer:NO];
     win.title = @"GIMPS / PrimeNet Integration";
+    win.identifier = @"gimpsPanel";
+    win.delegate = self;
     win.releasedWhenClosed = NO;
     win.minSize = NSMakeSize(480, 400);
 
@@ -5498,6 +5500,7 @@ static std::string u128_to_str(unsigned __int128 v) {
     userField.font = [NSFont monospacedSystemFontOfSize:11 weight:NSFontWeightRegular];
     userField.stringValue = [NSString stringWithUTF8String:_primenet->username().c_str()];
     userField.tag = 8001;
+    userField.delegate = self;
     userField.autoresizingMask = NSViewMinYMargin;
     [cv addSubview:userField];
 
@@ -5636,19 +5639,7 @@ static std::string u128_to_str(unsigned __int128 v) {
     assignInfo.autoresizingMask = NSViewMinYMargin | NSViewWidthSizable;
     [cv addSubview:assignInfo];
 
-    // Populate assignments
-    if (_primenet->pending_count() > 0) {
-        NSMutableString *astr = [NSMutableString string];
-        for (auto& a : _primenet->state().assignments) {
-            [astr appendFormat:@"M%llu  TF %d-%d bits  [%s]\n",
-                a.exponent, (int)a.bit_lo, (int)a.bit_hi,
-                a.key.c_str()];
-        }
-        assignInfo.stringValue = astr;
-    } else {
-        assignInfo.stringValue = @"No assignments. Click 'Get Work' to fetch from mersenne.org.";
-        assignInfo.textColor = [NSColor secondaryLabelColor];
-    }
+    [self refreshGIMPSAssignments:win];
 
     y -= 68;
 
@@ -5889,13 +5880,7 @@ static std::string u128_to_str(unsigned __int128 v) {
     // Read worktodo.txt
     NSString *wtPath = [dataDir stringByAppendingPathComponent:@"worktodo.txt"];
     NSString *wtContents = [NSString stringWithContentsOfFile:wtPath encoding:NSUTF8StringEncoding error:nil];
-    int wtCount = 0;
-    if (wtContents) {
-        for (NSString *line in [wtContents componentsSeparatedByString:@"\n"]) {
-            NSString *trimmed = [line stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
-            if ([trimmed hasPrefix:@"Factor="]) wtCount++;
-        }
-    }
+    int wtCount = (int) _primenet->read_worktodo().size();
 
     // Read last 10 lines of results.json.txt
     NSString *rjPath = [dataDir stringByAppendingPathComponent:@"results.json.txt"];
@@ -6920,11 +6905,35 @@ static std::string u128_to_str(unsigned __int128 v) {
 // routes through AutoPrimeNet. Assignments come from worktodo.txt,
 // results go to results.json.txt. AutoPrimeNet handles server comms.
 
+- (void)controlTextDidChange:(NSNotification *)notification {
+    NSTextField *field = notification.object;
+    if (field.tag == 8001 && _primenet) {
+        _primenet->set_username(field.stringValue.UTF8String);
+    }
+}
+
+- (void)refreshGIMPSAssignments:(NSWindow *)win {
+    NSTextField *info = [win.contentView viewWithTag:8020];
+    auto assignments = _primenet->read_worktodo();
+    NSMutableString *text = [NSMutableString string];
+    for (const auto& a : assignments) {
+        [text appendFormat:@"M%llu  TF %d-%d bits  [%s]\n",
+            a.exponent, (int)a.bit_lo, (int)a.bit_hi, a.key.c_str()];
+    }
+    info.stringValue = assignments.empty()
+        ? @"No TF assignments in worktodo.txt. Open AutoPrimeNet Settings to check the queue."
+        : text;
+    info.textColor = assignments.empty() ? NSColor.secondaryLabelColor : NSColor.labelColor;
+}
+
 - (void)gimpsRunAssignment:(id)sender {
+    [self refreshGIMPSAssignments:[sender window]];
     // Read assignments from worktodo.txt (AutoPrimeNet workflow)
     auto worktodo = _primenet->read_worktodo();
     if (worktodo.empty()) {
-        [self appendText:@"GIMPS: no assignments in worktodo.txt. Use AutoPrimeNet to get work.\n"];
+        [self appendText:[NSString stringWithFormat:
+            @"GIMPS: no assignments in %@/worktodo.txt. Use AutoPrimeNet to get work.\n",
+            PrimePathDataDirectory()]];
         return;
     }
 
@@ -9819,6 +9828,16 @@ static const int kNumPipelineStages = sizeof(kPipelineStages) / sizeof(kPipeline
 // ── Window delegate ──────────────────────────────────────────────────
 
 - (void)windowWillClose:(NSNotification *)notification {
+    NSWindow *window = notification.object;
+    if ([window.identifier isEqualToString:@"gimpsPanel"] && _primenet) {
+        NSTextField *field = [window.contentView viewWithTag:8001];
+        NSString *username = [field.stringValue stringByTrimmingCharactersInSet:
+            NSCharacterSet.whitespaceAndNewlineCharacterSet];
+        if (username.length == 0) {
+            field.stringValue = @"ANONYMOUS";
+            _primenet->set_username("ANONYMOUS");
+        }
+    }
     if (notification.object == self.networkWindow) {
         [self.networkRefreshTimer invalidate];
         self.networkRefreshTimer = nil;
