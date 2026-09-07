@@ -2881,7 +2881,7 @@ static const int EQ_HISTORY = 32; // number of vertical bars (time history)
 
 - (void)markovLoadPrimes:(id)sender {
     NSOpenPanel *panel = [NSOpenPanel openPanel];
-    panel.allowedFileTypes = @[@"txt", @"csv", @"dat"];
+    panel.allowedContentTypes = @[@"txt", @"csv", @"dat"];
     panel.title = @"Load Known Prime List";
     panel.message = @"One prime per line (decimal). Lines starting with # are ignored.";
     if ([panel runModal] != NSModalResponseOK || !panel.URL) return;
