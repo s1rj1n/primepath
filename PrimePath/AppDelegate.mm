@@ -130,6 +130,7 @@ static const int EQ_HISTORY = 32; // number of vertical bars (time history)
 
 - (void)drawRect:(NSRect)dirtyRect {
     NSRect b = self.bounds;
+    [NSBezierPath clipRect:b];
 
     // Dark background
     [[NSColor colorWithSRGBRed:0.08 green:0.08 blue:0.12 alpha:1.0] set];
@@ -435,7 +436,7 @@ static const int EQ_HISTORY = 32; // number of vertical bars (time history)
                 [weakSelf appendText:s];
             });
         });
-    _primenet->set_username("s1rj1n");
+    _primenet->set_username("ANONYMOUS");
 
     [self loadTestCatalog];
     [self buildUI];
@@ -468,6 +469,57 @@ static const int EQ_HISTORY = 32; // number of vertical bars (time history)
             }
             return event;
         }];
+}
+
+- (NSStackView *)buildResourceStatsRowAtFrame:(NSRect)frame {
+    CGFloat eqGap = 3;
+    CGFloat eqW = (frame.size.width - 4 * eqGap) / 5.0;
+    CGFloat eqH = frame.size.height;
+
+    NSColor *greenC = [NSColor colorWithSRGBRed:0.1 green:0.7 blue:0.3 alpha:1.0];
+    NSColor *blueC  = [NSColor colorWithSRGBRed:0.2 green:0.5 blue:0.9 alpha:1.0];
+    NSColor *cyanC  = [NSColor colorWithSRGBRed:0.1 green:0.7 blue:0.8 alpha:1.0];
+    NSColor *amberC = [NSColor colorWithSRGBRed:0.9 green:0.7 blue:0.1 alpha:1.0];
+    NSColor *magC   = [NSColor colorWithSRGBRed:0.7 green:0.3 blue:0.8 alpha:1.0];
+
+    NSStackView *statsRow = [[NSStackView alloc] initWithFrame:frame];
+    statsRow.orientation = NSUserInterfaceLayoutOrientationHorizontal;
+    statsRow.distribution = NSStackViewDistributionFillEqually;
+    statsRow.alignment = NSLayoutAttributeHeight;
+    statsRow.spacing = eqGap;
+    statsRow.autoresizingMask = NSViewMinYMargin | NSViewWidthSizable;
+
+    CGFloat ex = 0;
+    self.cpuEQ = [[EQBarView alloc] initWithFrame:NSMakeRect(ex, 0, eqW, eqH)
+        title:@"CPU" color:greenC];
+    self.cpuEQ.translatesAutoresizingMaskIntoConstraints = NO;
+    [statsRow addArrangedSubview:self.cpuEQ];
+    ex += eqW + eqGap;
+
+    self.gpuEQ = [[EQBarView alloc] initWithFrame:NSMakeRect(ex, 0, eqW, eqH)
+        title:@"GPU" color:blueC];
+    self.gpuEQ.translatesAutoresizingMaskIntoConstraints = NO;
+    [statsRow addArrangedSubview:self.gpuEQ];
+    ex += eqW + eqGap;
+
+    self.neonEQ = [[EQBarView alloc] initWithFrame:NSMakeRect(ex, 0, eqW, eqH)
+        title:@"NEON/SIMD" color:cyanC];
+    self.neonEQ.translatesAutoresizingMaskIntoConstraints = NO;
+    [statsRow addArrangedSubview:self.neonEQ];
+    ex += eqW + eqGap;
+
+    self.memEQ = [[EQBarView alloc] initWithFrame:NSMakeRect(ex, 0, eqW, eqH)
+        title:@"MEMORY" color:amberC];
+    self.memEQ.translatesAutoresizingMaskIntoConstraints = NO;
+    [statsRow addArrangedSubview:self.memEQ];
+    ex += eqW + eqGap;
+
+    self.diskEQ = [[EQBarView alloc] initWithFrame:NSMakeRect(ex, 0, eqW, eqH)
+        title:@"DISK I/O" color:magC];
+    self.diskEQ.translatesAutoresizingMaskIntoConstraints = NO;
+    [statsRow addArrangedSubview:self.diskEQ];
+
+    return statsRow;
 }
 
 - (void)buildUI {
@@ -519,44 +571,7 @@ static const int EQ_HISTORY = 32; // number of vertical bars (time history)
 
     // ── EQ VISUALIZERS ────────────────────────────────────────────────
     CGFloat eqH = 44;  // height per EQ bar
-    CGFloat eqGap = 3;
-    CGFloat eqW = (CW - 4 * eqGap) / 5.0; // 5 bars across
-
-    NSColor *greenC = [NSColor colorWithSRGBRed:0.1 green:0.7 blue:0.3 alpha:1.0];
-    NSColor *blueC  = [NSColor colorWithSRGBRed:0.2 green:0.5 blue:0.9 alpha:1.0];
-    NSColor *cyanC  = [NSColor colorWithSRGBRed:0.1 green:0.7 blue:0.8 alpha:1.0];
-    NSColor *amberC = [NSColor colorWithSRGBRed:0.9 green:0.7 blue:0.1 alpha:1.0];
-    NSColor *magC   = [NSColor colorWithSRGBRed:0.7 green:0.3 blue:0.8 alpha:1.0];
-
-    CGFloat ex = M;
-    self.cpuEQ = [[EQBarView alloc] initWithFrame:NSMakeRect(ex, y - eqH, eqW, eqH)
-        title:@"CPU" color:greenC];
-    self.cpuEQ.autoresizingMask = NSViewMinYMargin | NSViewWidthSizable;
-    [cv addSubview:self.cpuEQ];
-    ex += eqW + eqGap;
-
-    self.gpuEQ = [[EQBarView alloc] initWithFrame:NSMakeRect(ex, y - eqH, eqW, eqH)
-        title:@"GPU" color:blueC];
-    self.gpuEQ.autoresizingMask = NSViewMinYMargin | NSViewWidthSizable;
-    [cv addSubview:self.gpuEQ];
-    ex += eqW + eqGap;
-
-    self.neonEQ = [[EQBarView alloc] initWithFrame:NSMakeRect(ex, y - eqH, eqW, eqH)
-        title:@"NEON/SIMD" color:cyanC];
-    self.neonEQ.autoresizingMask = NSViewMinYMargin | NSViewWidthSizable;
-    [cv addSubview:self.neonEQ];
-    ex += eqW + eqGap;
-
-    self.memEQ = [[EQBarView alloc] initWithFrame:NSMakeRect(ex, y - eqH, eqW, eqH)
-        title:@"MEMORY" color:amberC];
-    self.memEQ.autoresizingMask = NSViewMinYMargin | NSViewWidthSizable;
-    [cv addSubview:self.memEQ];
-    ex += eqW + eqGap;
-
-    self.diskEQ = [[EQBarView alloc] initWithFrame:NSMakeRect(ex, y - eqH, eqW, eqH)
-        title:@"DISK I/O" color:magC];
-    self.diskEQ.autoresizingMask = NSViewMinYMargin | NSViewWidthSizable;
-    [cv addSubview:self.diskEQ];
+    [cv addSubview:[self buildResourceStatsRowAtFrame:NSMakeRect(M, y - eqH, CW, eqH)]];
 
     self.disableVisualizerBtn = [NSButton checkboxWithTitle:@"Hide"
         target:self action:@selector(toggleVisualizer:)];
@@ -2866,7 +2881,7 @@ static const int EQ_HISTORY = 32; // number of vertical bars (time history)
 
 - (void)markovLoadPrimes:(id)sender {
     NSOpenPanel *panel = [NSOpenPanel openPanel];
-    panel.allowedFileTypes = @[@"txt", @"csv", @"dat"];
+    panel.allowedContentTypes = @[@"txt", @"csv", @"dat"];
     panel.title = @"Load Known Prime List";
     panel.message = @"One prime per line (decimal). Lines starting with # are ignored.";
     if ([panel runModal] != NSModalResponseOK || !panel.URL) return;
@@ -5438,6 +5453,8 @@ static std::string u128_to_str(unsigned __int128 v) {
         styleMask:(NSWindowStyleMaskTitled | NSWindowStyleMaskClosable | NSWindowStyleMaskResizable)
         backing:NSBackingStoreBuffered defer:NO];
     win.title = @"GIMPS / PrimeNet Integration";
+    win.identifier = @"gimpsPanel";
+    win.delegate = self;
     win.releasedWhenClosed = NO;
     win.minSize = NSMakeSize(480, 400);
 
@@ -5483,6 +5500,7 @@ static std::string u128_to_str(unsigned __int128 v) {
     userField.font = [NSFont monospacedSystemFontOfSize:11 weight:NSFontWeightRegular];
     userField.stringValue = [NSString stringWithUTF8String:_primenet->username().c_str()];
     userField.tag = 8001;
+    userField.delegate = self;
     userField.autoresizingMask = NSViewMinYMargin;
     [cv addSubview:userField];
 
@@ -5621,19 +5639,7 @@ static std::string u128_to_str(unsigned __int128 v) {
     assignInfo.autoresizingMask = NSViewMinYMargin | NSViewWidthSizable;
     [cv addSubview:assignInfo];
 
-    // Populate assignments
-    if (_primenet->pending_count() > 0) {
-        NSMutableString *astr = [NSMutableString string];
-        for (auto& a : _primenet->state().assignments) {
-            [astr appendFormat:@"M%llu  TF %d-%d bits  [%s]\n",
-                a.exponent, (int)a.bit_lo, (int)a.bit_hi,
-                a.key.c_str()];
-        }
-        assignInfo.stringValue = astr;
-    } else {
-        assignInfo.stringValue = @"No assignments. Click 'Get Work' to fetch from mersenne.org.";
-        assignInfo.textColor = [NSColor secondaryLabelColor];
-    }
+    [self refreshGIMPSAssignments:win];
 
     y -= 68;
 
@@ -5874,13 +5880,7 @@ static std::string u128_to_str(unsigned __int128 v) {
     // Read worktodo.txt
     NSString *wtPath = [dataDir stringByAppendingPathComponent:@"worktodo.txt"];
     NSString *wtContents = [NSString stringWithContentsOfFile:wtPath encoding:NSUTF8StringEncoding error:nil];
-    int wtCount = 0;
-    if (wtContents) {
-        for (NSString *line in [wtContents componentsSeparatedByString:@"\n"]) {
-            NSString *trimmed = [line stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
-            if ([trimmed hasPrefix:@"Factor="]) wtCount++;
-        }
-    }
+    int wtCount = (int) _primenet->read_worktodo().size();
 
     // Read last 10 lines of results.json.txt
     NSString *rjPath = [dataDir stringByAppendingPathComponent:@"results.json.txt"];
@@ -6905,11 +6905,35 @@ static std::string u128_to_str(unsigned __int128 v) {
 // routes through AutoPrimeNet. Assignments come from worktodo.txt,
 // results go to results.json.txt. AutoPrimeNet handles server comms.
 
+- (void)controlTextDidChange:(NSNotification *)notification {
+    NSTextField *field = notification.object;
+    if (field.tag == 8001 && _primenet) {
+        _primenet->set_username(field.stringValue.UTF8String);
+    }
+}
+
+- (void)refreshGIMPSAssignments:(NSWindow *)win {
+    NSTextField *info = [win.contentView viewWithTag:8020];
+    auto assignments = _primenet->read_worktodo();
+    NSMutableString *text = [NSMutableString string];
+    for (const auto& a : assignments) {
+        [text appendFormat:@"M%llu  TF %d-%d bits  [%s]\n",
+            a.exponent, (int)a.bit_lo, (int)a.bit_hi, a.key.c_str()];
+    }
+    info.stringValue = assignments.empty()
+        ? @"No TF assignments in worktodo.txt. Open AutoPrimeNet Settings to check the queue."
+        : text;
+    info.textColor = assignments.empty() ? NSColor.secondaryLabelColor : NSColor.labelColor;
+}
+
 - (void)gimpsRunAssignment:(id)sender {
+    [self refreshGIMPSAssignments:[sender window]];
     // Read assignments from worktodo.txt (AutoPrimeNet workflow)
     auto worktodo = _primenet->read_worktodo();
     if (worktodo.empty()) {
-        [self appendText:@"GIMPS: no assignments in worktodo.txt. Use AutoPrimeNet to get work.\n"];
+        [self appendText:[NSString stringWithFormat:
+            @"GIMPS: no assignments in %@/worktodo.txt. Use AutoPrimeNet to get work.\n",
+            PrimePathDataDirectory()]];
         return;
     }
 
@@ -9804,6 +9828,16 @@ static const int kNumPipelineStages = sizeof(kPipelineStages) / sizeof(kPipeline
 // ── Window delegate ──────────────────────────────────────────────────
 
 - (void)windowWillClose:(NSNotification *)notification {
+    NSWindow *window = notification.object;
+    if ([window.identifier isEqualToString:@"gimpsPanel"] && _primenet) {
+        NSTextField *field = [window.contentView viewWithTag:8001];
+        NSString *username = [field.stringValue stringByTrimmingCharactersInSet:
+            NSCharacterSet.whitespaceAndNewlineCharacterSet];
+        if (username.length == 0) {
+            field.stringValue = @"ANONYMOUS";
+            _primenet->set_username("ANONYMOUS");
+        }
+    }
     if (notification.object == self.networkWindow) {
         [self.networkRefreshTimer invalidate];
         self.networkRefreshTimer = nil;

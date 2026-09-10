@@ -759,12 +759,23 @@ std::vector<Assignment> PrimeNetClient::read_worktodo() {
     std::vector<Assignment> out;
     std::string path = _data_dir + "/worktodo.txt";
     std::ifstream f(path);
-    if (!f.is_open()) return out;
-    std::string line;
-    while (std::getline(f, line)) {
-        Assignment a;
-        if (parse_worktodo_line(line, a)) out.push_back(a);
+    if (!f.is_open()) {
+        _log("PrimeNet: cannot open " + path);
+        return out;
     }
+    std::string line;
+    size_t line_number = 0;
+    while (std::getline(f, line)) {
+        ++line_number;
+        Assignment a;
+        if (parse_worktodo_line(line, a)) {
+            out.push_back(a);
+        } else if (trim(line).compare(0, 7, "Factor=") == 0) {
+            _log("PrimeNet: invalid TF assignment in " + path +
+                 " at line " + std::to_string(line_number));
+        }
+    }
+    if (f.bad()) _log("PrimeNet: error reading " + path);
     return out;
 }
 
