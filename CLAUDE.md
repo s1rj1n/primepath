@@ -41,7 +41,19 @@ display string, `User-Agent`, and PrimeNet report reads it through
 
 Never hard-code a version anywhere else. It used to live in 12 literals across three
 files, which is how the window title sat at v0.5 for four releases (issue #2).
-Bumping a release is now a one-line `Info.plist` edit.
+Bumping a release is now a two-line `Info.plist` edit -- `CFBundleVersion` and
+`CFBundleShortVersionString` are kept in lockstep.
+
+Bump it with `sed`, **not** `PlistBuddy -c Set`. PlistBuddy rewrites the entire file:
+it alphabetises every key and converts the 4-space indent to tabs, turning a two-line
+change into a 44-line diff that buries the actual edit.
+
+```bash
+sed -i '' 's|<string>1\.4\.2</string>|<string>1.4.3</string>|g' PrimePath/Info.plist
+```
+
+Both version keys share the same value, so one global substitution hits exactly the
+two lines -- check `git diff` to confirm nothing else matched.
 
 `Version.h` is header-only on purpose: a new `.mm` would have to be hand-added to
 `project.pbxproj` to join the build phase. Prefer inline headers for small shared
