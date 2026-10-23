@@ -664,6 +664,23 @@ static const uint32_t MAX_BATCH = 262144; // 256K max batch
     id<MTLBuffer> ndivsBuf = [_device newBufferWithBytes:&numDivs
         length:sizeof(uint32_t) options:MTLResourceStorageModeShared];
 
+    // Per-divisor Barrett constants, derived once here instead of inside
+    // every GPU thread. The kernel used to compute these itself, costing
+    // an emulated 64-bit divide plus a 64-iteration doubling loop per
+    // thread. Written straight into shared buffers (unified memory).
+    id<MTLBuffer> invBuf = [_device newBufferWithLength:numDivs * sizeof(uint64_t)
+        options:MTLResourceStorageModeShared];
+    id<MTLBuffer> powBuf = [_device newBufferWithLength:numDivs * sizeof(uint64_t)
+        options:MTLResourceStorageModeShared];
+    uint64_t *invTab = (uint64_t *)invBuf.contents;
+    uint64_t *powTab = (uint64_t *)powBuf.contents;
+    for (uint32_t i = 0; i < numDivs; i++) {
+        uint32_t d = divisors[i];
+        if (d <= 1) { invTab[i] = 0; powTab[i] = 0; continue; }
+        invTab[i] = UINT64_MAX / (uint64_t)d;        // matches kernel's old formula
+        powTab[i] = ((UINT64_MAX % d) + 1) % d;      // 2^64 mod d, no 128-bit math
+    }
+
     id<MTLCommandBuffer> cmdBuf = [_queue commandBuffer];
     id<MTLComputeCommandEncoder> enc = [cmdBuf computeCommandEncoder];
     [enc setComputePipelineState:_nesterCCStreamPSO];
@@ -672,6 +689,8 @@ static const uint32_t MAX_BATCH = 262144; // 256K max batch
     [enc setBuffer:resultsBuf offset:0 atIndex:2];
     [enc setBuffer:nlimbsBuf  offset:0 atIndex:3];
     [enc setBuffer:ndivsBuf   offset:0 atIndex:4];
+    [enc setBuffer:invBuf     offset:0 atIndex:5];
+    [enc setBuffer:powBuf     offset:0 atIndex:6];
 
     NSUInteger threadWidth = _nesterCCStreamPSO.threadExecutionWidth;
     MTLSize grid = MTLSizeMake(numDivs, 1, 1);

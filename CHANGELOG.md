@@ -2,10 +2,39 @@
 
 PrimePath is open to anyone who wants it, and any change that improves it is welcome -- issues and pull requests both.
 
-## Unreleased
+## v1.4.2 -- Gear 3 Setup Hoist (2026-10-23)
 
 ### Changed
+- **Gear 3 per-divisor setup moved to the CPU** -- `nester_cc_stream` derived its own
+  Barrett constants in every GPU thread: an emulated 64-bit divide for
+  `inv = floor((2^64 - 1) / d)` plus a 64-iteration doubling loop for `2^64 mod d`.
+  Both depend only on the divisor, so they are now computed once per divisor in
+  `runNesterCCStream` and passed in at buffers 5 and 6. Measured on M5, median of
+  41 interleaved runs after warm-up: **1.45x** at 32 limbs / 50K divisors (the
+  gear-3 crossover), 1.44x at 32 limbs / 200K divisors, 1.13x at 256 limbs / 1K
+  divisors, and 1.01x at 1024 limbs / 50K divisors -- the win shrinks to nothing
+  once the streaming loop dominates the setup it replaced. Results verified
+  bit-identical to the old kernel across all four shapes.
+- **Carry Chain documentation corrected** -- the README and the `distributed-compute`
+  skill described the carry-chain mulmod as division-free. It is not:
+  `CarryChainMulMod::mul` reduces with four `unsigned __int128` modulo operations,
+  which AArch64 lowers to `__umodti3` libcalls (verified against emitted assembly).
+  The 4-7x over binary doubling is real but comes from the hardware multiply, not
+  from avoiding division. The *streaming* engine is division-free, and the two
+  techniques were sharing one name and one claim. Documented separately now.
+- **Gear 3 Barrett bound documented** -- the two conditional subtractions in
+  `ncc_barrett_mod` are exactly sufficient and have no margin: `inv >= 2^64/d - 1`
+  bounds the quotient underestimate at 2, so `r < 3d`. Noted in the kernel, along
+  with the fact that widening `d` past 32 bits breaks both this bound and
+  `rem * pow64`.
 - **Version string unified** -- the version was hard-coded in 12 places across three files, which is how the title bar drifted to v0.5 for four releases. All sites now read `CFBundleShortVersionString` via `PrimePath/Version.h`, so `Info.plist` is the single source of truth and a release bump is a one-line change.
+
+### Known follow-up
+- The gear crossover thresholds in `select_gear` (50K divisors, or 1K at 256+ limbs)
+  were calibrated against the slower kernel and have **not** been re-derived. Gear 3
+  is now cheaper to enter, so the real Gear 2 -> Gear 3 boundary has moved down. That
+  needs the in-app 5x5 matrix benchmark across all three gears, not a GPU-only
+  measurement.
 
 ## v1.4.1 -- Per-User Data Directory (2026-09-07)
 
