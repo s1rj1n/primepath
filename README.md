@@ -49,9 +49,9 @@ Build custom search pipelines by picking stages from five categories -- Sieve (W
 
 ## Nester Carry Chain
 
-Two division-free methods for modular arithmetic (S. Nester, 2026), with a three-gear auto-shifting engine that picks the fastest execution path.
+Two methods for modular arithmetic (S. Nester, 2026), with a three-gear auto-shifting engine that picks the fastest execution path. The streaming method is genuinely division-free; the mulmod is not -- see below.
 
-**Carry-chain modular multiplication** -- computes (a * b) mod m for operands up to 128 bits using ARM64 MUL+UMULH partial products assembled through a 192-bit carry chain. 4-7x faster than binary doubling. Falls back automatically for moduli > 96 bits.
+**Carry-chain modular multiplication** -- computes (a * b) mod m for operands up to 128 bits using ARM64 MUL+UMULH partial products assembled through a 192-bit carry chain. 4-7x faster than binary doubling. The speedup comes from replacing ~128 shift-and-add iterations with hardware multiplies; the final reduction still uses 128-bit modulo, which AArch64 lowers to `__umodti3` libcalls rather than a divide instruction. Falls back automatically for moduli > 96 bits.
 
 **Streaming divisibility** -- tests whether an arbitrarily large number N is divisible by candidate divisors without division. Streams through N segment by segment, accumulating via Barrett reduction (precomputed reciprocal multiply). N-wide template batching processes up to 8 divisors per pass through the number. Three gears auto-selected by work volume:
 
@@ -154,7 +154,7 @@ CPU sieve pipeline          Metal GPU
 
 Three uint32 limbs with hardware `mulhi` for the multiply-and-reduce step. Each GPU thread does a complete modular exponentiation independently -- no shared memory, no sync. Unified memory means zero copy between CPU sieve output and GPU input.
 
-CPU-side 128-bit modular arithmetic uses the Nester Carry Chain: ARM64 `MUL`+`UMULH` for full 64x64->128-bit products, decomposed into a 192-bit intermediate, reduced via hardware `__int128` division in two 32-bit shifts. 4-7x faster than binary shift-and-add. Falls back to binary doubling automatically for moduli > 96 bits.
+CPU-side 128-bit modular arithmetic uses the Nester Carry Chain: ARM64 `MUL`+`UMULH` for full 64x64->128-bit products, decomposed into a 192-bit intermediate, then reduced with `unsigned __int128` modulo applied in two 32-bit shifts. AArch64 has no 128-bit divide instruction, so those reductions compile to `__umodti3` calls -- the 4-7x over binary shift-and-add comes from the hardware multiply, not from avoiding division. Falls back to binary doubling automatically for moduli > 96 bits.
 
 For big-number trial division, the three-gear streaming engine auto-selects CPU single-thread (Gear 1), CPU multi-thread (Gear 2), or GPU Metal (Gear 3) based on divisor count and number size. All gears use Barrett reduction (precomputed reciprocal multiply, no UDIV). Up to 8x over scalar on CPU, up to 7x more on GPU for large workloads.
 

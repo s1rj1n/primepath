@@ -60,13 +60,23 @@ LOCAL MACHINE (runs both Conductor + TaskManager)
 - Barrett reduction replaces division (O(8 muls) vs O(128 iterations))
 - GPU pacing: 2ms min gap between dispatches to avoid starving CPU
 - Mersenne TF kernel: fused sieve+modexp, 96-bit Barrett, one thread per candidate
+- `nester_cc_stream` (Gear 3) takes per-divisor `inv_tab`/`pow_tab` at buffers 5/6,
+  precomputed on the CPU in `runNesterCCStream`. Do not move that setup back into
+  the kernel: an emulated 64-bit divide plus a 64-iteration doubling loop per
+  thread cost 1.45x at the 50K-divisor crossover (M5, measured)
 
 ## CPU/NEON Specifics
 
-- Nester Carry Chain: modular multiplication without UDIV instruction
-  - `q = floor(x * inv_d / 2^64)` via ARM64 UMULH
-  - Precomputed reciprocal: `inv = UINT64_MAX / d`
-  - Streaming divisibility: processes number segment-by-segment MSB to LSB
+- Nester Carry Chain is two distinct techniques sharing one name -- keep them apart:
+  - **Streaming divisibility** (`PrimeEngine.hpp`, `accumulate_mod32`) -- genuinely
+    division-free. `q = floor(x * inv_d / 2^64)` via ARM64 UMULH, precomputed
+    reciprocal `inv = UINT64_MAX / d`, processes the number segment-by-segment
+    MSB to LSB. No UDIV in the hot loop.
+  - **Carry-chain mulmod** (`TaskManager.mm`, `CarryChainMulMod`) -- NOT
+    division-free. Assembles a 192-bit product from MUL/UMULH, then reduces with
+    four `unsigned __int128` modulo ops, which lower to `__umodti3` libcalls.
+    The 4-7x over binary doubling comes from the hardware multiply. Do not
+    describe this one as avoiding division.
 - NEON pre-filter: `uint64x2_t` lanes, 2 candidates at a time, ~30% survival rate
 - Template batching: 1/2/4/8/16 divisors per pass, compile-time unroll at -O2
 

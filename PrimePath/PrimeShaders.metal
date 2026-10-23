@@ -1075,8 +1075,19 @@ kernel void primality_batch(
 // Streams MSB to LSB, accumulating via Barrett reduction (no division).
 // All threads read the same limbs (broadcast from cache), so memory
 // access is uniform across the SIMD group.
+//
+// The per-divisor constants (inv, pow64) are precomputed on the CPU and
+// passed in. Deriving them here cost every thread an emulated 64-bit
+// divide plus a 64-iteration doubling loop, which for a 32-limb number
+// outweighed the streaming loop itself -- measured 1.45x on M5 at the
+// 50K-divisor gear-3 crossover, 1.01x once limbs dominate (1024 limbs).
 
-// Barrett mod on GPU: x mod d using precomputed inv = floor(2^64 / d)
+// Barrett mod on GPU: x mod d using precomputed inv = floor((2^64 - 1) / d).
+//
+// Bound: inv >= 2^64/d - 1, so q = mulhi(x, inv) underestimates
+// floor(x/d) by at most 2, leaving r < 3d. The two conditional
+// subtractions below are therefore exactly sufficient, with no margin.
+// Widening d past 32 bits breaks this and also overflows rem * pow64.
 inline ulong ncc_barrett_mod(ulong x, uint d, ulong inv) {
     ulong q = mulhi(x, inv);
     ulong r = x - q * (ulong)d;
@@ -1090,6 +1101,8 @@ kernel void nester_cc_stream(
     device uchar       *results    [[buffer(2)]],  // 1 if d divides N, 0 otherwise
     constant uint      &num_limbs  [[buffer(3)]],
     constant uint      &num_divs   [[buffer(4)]],
+    device const ulong *inv_tab    [[buffer(5)]],  // floor((2^64 - 1) / d) per divisor
+    device const ulong *pow_tab    [[buffer(6)]],  // 2^64 mod d per divisor
     uint gid [[thread_position_in_grid]])
 {
     if (gid >= num_divs) return;
@@ -1097,15 +1110,8 @@ kernel void nester_cc_stream(
     uint d = divisors[gid];
     if (d <= 1) { results[gid] = 0; return; }
 
-    // Precompute inverse: floor(2^64 / d)
-    ulong inv = 0xFFFFFFFFFFFFFFFFUL / (ulong)d;
-
-    // Precompute pow64 = 2^64 mod d via doubling (no division)
-    ulong pow64 = 1;
-    for (int i = 0; i < 64; i++) {
-        pow64 <<= 1;
-        if (pow64 >= d) pow64 -= d;
-    }
+    ulong inv   = inv_tab[gid];
+    ulong pow64 = pow_tab[gid];
 
     // Stream through all limbs
     ulong rem = 0;
